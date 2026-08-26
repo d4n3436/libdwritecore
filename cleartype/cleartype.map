@@ -1,0 +1,61 @@
+/*
+ * Export list for libcleartype.so.
+ *
+ * This library is loaded with LD_PRELOAD, which puts every symbol it
+ * exports at the front of the whole process's global lookup scope. Only
+ * the FreeType entry points it interposes belong there;
+ * anything else it happens to define would silently take precedence over
+ * the host application's own definition of the same name.
+ *
+ * libdwritecore.so's own exports come in behind this as a dependency and
+ * are unaffected - they are all DWC_/DWrite-prefixed and collide with
+ * nothing.
+ */
+{
+  global:
+    FT_Render_Glyph;
+    FT_New_Face;
+    FT_New_Memory_Face;
+    FT_Open_Face;
+    FT_Reference_Face;
+    FT_Done_Face;
+    FT_Done_FreeType;
+    FT_Set_Transform;
+    FT_Outline_Translate;
+    FT_Outline_Done;
+    FT_Done_Glyph;
+    FT_GlyphSlot_Embolden;
+    FT_GlyphSlot_Oblique;
+    FT_Outline_Embolden;
+    FT_Outline_EmboldenXY;
+    FT_Outline_Transform;
+    FT_Load_Glyph;
+    FT_Load_Char;
+    FT_Outline_Get_Bitmap;
+    FT_Outline_Get_CBox;
+    FT_Set_Char_Size;
+    FT_Get_Sfnt_Table;
+    FT_Set_Pixel_Sizes;
+    FT_Request_Size;
+
+    /* Not FreeType: the hook that notices libxul being loaded. */
+    dlopen;
+
+    /* Not FreeType: how a thread's name is learned, since asking for it with
+       prctl(PR_GET_NAME) is a seccomp violation in a content process. */
+    pthread_setname_np;
+
+    /* Not FreeType: the rendering settings Windows has no fontconfig for. */
+    FcPatternGetInteger;
+    FcPatternGetBool;
+    FcFontSort;
+    FcFontMatch;
+    FcConfigSubstitute;
+    FcPatternGet;
+
+    /* Not FreeType: the font list itself, so a page cannot name a family a
+       stock Windows does not have. */
+    FcConfigGetFonts;
+  local:
+    *;
+};

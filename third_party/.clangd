@@ -1,0 +1,10 @@
+# Vendored Microsoft SDK headers. Opening one in an editor otherwise reports
+# some eighty errors -- they are Windows headers being parsed on Linux with no
+# compile command, and every one of them is expected.
+#
+# Background: Skip keeps them out of the background index as well, so they
+# never turn up in workspace symbol search or as completion candidates.
+Diagnostics:
+  Suppress: '*'
+Index:
+  Background: Skip

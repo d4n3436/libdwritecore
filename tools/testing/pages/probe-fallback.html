@@ -1,0 +1,98 @@
+<!doctype html><meta charset="utf-8">
+<title>DirectWrite fallback probe</title>
+<!--
+  Why it exists: DWriteCore builds its fallback from the platform's font
+  collection, and on Linux there is none - GetSystemFontCollection returns
+  zero families and the shipped library contains no font family names at all.
+  The ordering has to come from a real Windows install. MOZ_LOG cannot
+  provide it either; a release Firefox has no per-character fallback logging
+  compiled in.
+
+  Method, and its deliberate limit. For each character this measures a
+  five-number metric tuple with the generic family, then with each installed
+  family named explicitly, and reports every family whose tuple matches.
+  That set contains the family Windows actually chose - and also every family
+  that lacks the character, because those fell back to the same font and so
+  measure identically.
+
+  Separating the two cannot be done in a browser: CSS has no way to disable
+  fallback, so a missing glyph is indistinguishable from a present one by
+  measurement alone. It does not need to be. The Linux side has the same font
+  files and can ask fontconfig which families really contain the character
+  (fc-list :charset=), so the decoys are filtered there. Each half uses the
+  tool that can actually answer.
+-->
+<style>
+ body{font:13px/1.5 "Segoe UI",sans-serif;margin:16px;background:#fff;color:#111}
+ table{border-collapse:collapse;font-size:12px} td,th{border:1px solid #ccc;padding:2px 6px;vertical-align:top}
+ th{background:#eee;text-align:left}
+ /* .miss is applied from cell() below, which the stylesheet cannot see -
+    see CssUnusedSymbol in .idea/inspectionProfiles/Project_Default.xml. */
+ .miss{color:#999}
+ pre{background:#f5f5f5;padding:10px;white-space:pre-wrap;font:11px/1.35 Consolas,monospace;max-height:300px;overflow:auto}
+</style>
+<h2>DirectWrite per-script fallback</h2>
+<p id=status>measuring...</p>
+<table id=out><tr><th>script<th>char<th>lang<th>sans-serif candidates<th>serif<th>monospace</tr></table>
+<h3>Copy everything below back</h3>
+<pre id=json></pre>
+<script>
+// Everything here is this page's own. Kept out of the global scope so that
+// nothing it defines reads as an export nobody uses.
+(function () {
+const CANDIDATES = ["맑은 고딕", "Arial", "Bahnschrift", "Calibri", "Cambria", "Cambria Math", "Candara", "Cascadia Code", "Cascadia Mono", "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New", "Ebrima", "Franklin Gothic", "Gabriola", "Gadugi", "Georgia", "Impact", "Ink Free", "Javanese Text", "Leelawadee UI", "Lucida Console", "Lucida Sans Unicode", "Malgun Gothic", "Marlett", "Microsoft Himalaya", "Microsoft JhengHei", "Microsoft JhengHei UI", "Microsoft New Tai Lue", "Microsoft PhagsPa", "Microsoft Sans Serif", "Microsoft Tai Le", "Microsoft YaHei", "Microsoft YaHei UI", "Microsoft Yi Baiti", "MingLiU-ExtB", "MingLiU_HKSCS-ExtB", "MingLiU_MSCS-ExtB", "Mongolian Baiti", "MS Gothic", "MS PGothic", "ＭＳ Ｐゴシック", "MS UI Gothic", "ＭＳ ゴシック", "MV Boli", "Myanmar Text", "Nirmala Text", "Nirmala UI", "NSimSun", "Palatino Linotype", "PMingLiU-ExtB", "Sans Serif Collection", "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe Print", "Segoe Script", "Segoe UI", "Segoe UI Emoji", "Segoe UI Historic", "Segoe UI Symbol", "Segoe UI Variable Display", "Segoe UI Variable Small", "Segoe UI Variable Text", "SimSun", "SimSun-ExtB", "SimSun-ExtG", "Sitka Banner", "Sitka Display", "Sitka Heading", "Sitka Small", "Sitka Subheading", "Sitka Text", "Sylfaen", "Symbol", "Tahoma", "Times New Roman", "Trebuchet MS", "Twemoji Mozilla", "Unispace", "Verdana", "Webdings", "Wingdings", "Yu Gothic", "Yu Gothic UI", "宋体", "微軟正黑體", "微软雅黑", "新宋体", "新細明體-ExtB", "游ゴシック", "細明體-ExtB", "細明體_HKSCS-ExtB", "細明體_MSCS-ExtB"];
+const SCRIPTS = [["Han (Simplified)", "一", "zh-CN"], ["Han (Traditional)", "萬", "zh-TW"], ["Hiragana", "あ", "ja"], ["Katakana", "ア", "ja"], ["Hangul", "가", "ko"], ["Cyrillic", "А", "x-cyrillic"], ["Greek", "Α", "el"], ["Devanagari", "क", "x-devanagari"], ["Bengali", "ক", "x-beng"], ["Gurmukhi", "ਕ", "x-guru"], ["Gujarati", "ક", "x-gujr"], ["Oriya", "କ", "x-orya"], ["Tamil", "க", "x-tamil"], ["Telugu", "క", "x-telu"], ["Kannada", "ಕ", "x-knda"], ["Malayalam", "ക", "x-mlym"], ["Sinhala", "ක", "x-sinh"], ["Thai", "ก", "th"], ["Khmer", "ក", "x-khmr"], ["Hebrew", "א", "he"], ["Arabic", "ا", "ar"], ["Armenian", "Ա", "x-armn"], ["Georgian", "Ⴀ", "x-geor"], ["Tibetan", "ཀ", "x-tibt"], ["Ethiopic", "ሀ", "x-ethi"], ["Canadian Syllabics", "ᐁ", "x-cans"], ["Emoji", "😀", "x-unicode"], ["Symbol", "☃", "x-unicode"], ["Math", "∑", "x-math"]];
+const q = f => '"' + f.replace(/"/g, '') + '"';
+
+// Measured on a real DOM node carrying lang=, not on a canvas.
+//
+// A canvas has no language context: ctx.font = '64px sans-serif' resolves the
+// generic through the browser's default language group no matter what text is
+// drawn. An earlier version of this page measured that way, and every script
+// came back with the answer for *unlabeled* text - which for CJK is the wrong
+// one. It reported Microsoft YaHei and SimSun, both Chinese, for Hiragana and
+// Katakana on a machine that has Yu Gothic and MS Gothic installed, because
+// unlabeled kana really does fall back to a Chinese font. Verified against
+// Firefox: canvas gives byte-identical results for lang ja, zh-CN and ko,
+// while the span below gives three different answers.
+const span = document.createElement('span');
+span.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;' +
+                     'white-space:pre;font-size:300px;line-height:normal';
+document.body.appendChild(span);
+function metrics(ch, family, lang) {
+  span.lang = lang;
+  span.style.fontFamily = family;
+  span.textContent = ch.repeat(10);
+  // Advance over ten glyphs at 300px, to 1/100 px: a five-digit number that
+  // two unrelated fonts rarely agree on.
+  //
+  // Width only. The line box height would be a second
+  // discriminator but it is measured from the *first available* family in the
+  // list, not from the font the glyph actually came from - so a generic that
+  // resolves to Times New Roman and then falls back to Nirmala UI for the
+  // glyph reports Times New Roman's height, which no direct naming of Nirmala
+  // UI can ever match, so including it excludes the correct answer. The
+  // advance width is the fallback font's own.
+  return String(Math.round(span.getBoundingClientRect().width * 100));
+}
+const result = {}, table = document.getElementById('out');
+for (const [name, ch, lang] of SCRIPTS) {
+  const row = {};
+  for (const g of ['sans-serif','serif','monospace']) {
+    const target = metrics(ch, g, lang);
+    row[g] = CANDIDATES.filter(f => metrics(ch, q(f), lang) === target);
+  }
+  const cp = 'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4,'0');
+  result[name] = { codepoint: cp, lang: lang, candidates: row };
+  const cell = a => '<td class="' + (a.length ? '' : 'miss') + '">' +
+    (a.length ? a.length + ': ' + a.slice(0,6).join(', ') + (a.length>6?', ...':'') : 'none');
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td>' + name + '<td>' + ch + ' ' + cp + '<td>' + lang +
+    cell(row['sans-serif']) + cell(row['serif']) + cell(row['monospace']);
+  table.appendChild(tr);
+}
+document.getElementById('status').textContent =
+  'done - ' + SCRIPTS.length + ' scripts against ' + CANDIDATES.length + ' installed families';
+document.getElementById('json').textContent = JSON.stringify(result);
+})();
+</script>

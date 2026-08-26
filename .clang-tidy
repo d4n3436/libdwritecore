@@ -1,0 +1,56 @@
+# Static-analysis profile for this repository.
+#
+# It lives here, versioned, so a clone behaves the same as this working copy
+# with no per-machine setup: clang-tidy, clangd and CLion all discover a
+# .clang-tidy by walking up from the file being analyzed. third_party/ carries
+# its own, which replaces this one wholesale for anything under it.
+#
+# clion-misra-* (218 rules) is left off; MISRA C2012 targets embedded C and has
+# nothing useful to say about a C++ COM shim. Those checks exist only in the
+# clang-tidy CLion bundles -- a stock LLVM build silently ignores the
+# clion-* names below, which is why they are listed out in full here.
+#
+# The trailing block of -checks turns off families that fire constantly here for
+# structural reasons, and not because anything is wrong: signed bitwise
+# arithmetic and int-to-pointer casts are what a rasterizer and a vtable shim do,
+# COM interfaces are public structs by definition, the exported entry points must
+# not become static, and DeprecatedOrUnsafeBufferHandling only wants the MSVC _s
+# functions, which do not exist on Linux.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  concurrency-*,
+  performance-*,
+  misc-*,
+  clion-argument-selection-defects,
+  clion-empty-decl-or-stmt,
+  clion-simplify,
+  clion-unconstrained-variable-type,
+  clion-virtual-call-in-ctor-or-dtor,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-use-anonymous-namespace,
+  -performance-enum-size,
+  -bugprone-signed-bitwise,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -concurrency-mt-unsafe,
+  -misc-const-correctness,
+  -misc-header-include-cycle,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-internal-linkage,
+  -performance-no-int-to-ptr
+
+WarningsAsErrors: ''
+# Diagnostics from any project header, but never from a vendored tree: a
+# .clang-tidy in third_party/ governs only direct runs against files there, not
+# what surfaces in those headers when a translation unit elsewhere includes one.
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '(third_party|third-party|external|vendor|vendored|node_modules|contrib|subprojects)/'
+FormatStyle: none

@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DWriteCore SVG text parity, as an object</title>
+<!--
+  The badge as a document in an <object>, the other element that can hold one.
+  It should track the <iframe>; where it does not, the difference is in the
+  embedding and not in the text.
+
+  One embed per page, for the reason svg-text.html gives about inline <svg>.
+-->
+<style>
+  html, body { margin: 0; background: #fff; }
+  body { width: 960px; }
+  object { display: block; border: 0; }
+</style>
+<object data="svg-text-badge.svg" type="image/svg+xml" width="900" height="44"></object>

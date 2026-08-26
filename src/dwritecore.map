@@ -1,0 +1,35 @@
+/*
+ * Export list for libdwritecore.so.
+ *
+ * The stock library exports two names. This one exports those two, plus the
+ * DWriteCreateFactory spelling Office's libdwriteshim.so provides and the
+ * one entry point retail has no equivalent for - see
+ * include/dwritecore_shim.h. Five in total, and nothing else.
+ *
+ * Without this the library would also export the ten dwc_blob_* markers that
+ * locate the embedded implementation, along with whatever weak template
+ * instantiations the C++ sources happened to emit. libcleartype.so is loaded
+ * with LD_PRELOAD and pulls this library in as a DT_NEEDED, so everything here
+ * lands at the front of the whole process's global lookup scope, where a name
+ * the host application also defines would bind to this copy instead of its own.
+ *
+ * The blob markers are referenced only by src/dwritecore_shim.cpp, inside
+ * this same library, so hiding them from the dynamic symbol table costs
+ * nothing: those references are resolved at link time.
+ */
+{
+  global:
+    DWriteCoreCreateFactory;
+    DWriteCoreSetFeatureStagingCallback;
+
+    /* The spelling libdwriteshim.so provides, so this one file can stand in
+       for both libraries. */
+    DWriteCreateFactory;
+    DWrite10Velocity_SetFeatureStagingCallback;
+
+    /* Not retail: loading the implementation is this build's problem, so
+       failing to do it needs somewhere to be reported. */
+    DWriteCoreShimGetLastLoadError;
+  local:
+    *;
+};

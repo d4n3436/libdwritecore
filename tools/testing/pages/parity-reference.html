@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DWriteCore parity reference</title>
+<!--
+  The page to screenshot on both sides of a Windows-11-versus-Linux
+  comparison. Everything about it exists to remove a variable.
+
+  Load it in Firefox on Windows 11 and in Firefox on Linux under the
+  interposer, screenshot each, and run tools/testing/compare_viewport.py over the two
+  PNGs. It finds the four corner marks, aligns on them, and diffs only the
+  region between - so the two windows can be different sizes, in different
+  positions, with completely different title bars, and the comparison is
+  still of the same pixels.
+
+  Why each choice:
+
+    fixed pixel sizes    A percentage or em size would resolve differently
+                         if either side's default font size differs.
+    pure #000 on #fff    Maximum subpixel fringing, and no chance of the two
+                         sides disagreeing about a color profile.
+    no images, no webfonts, no borders on text
+                         Nothing to decode, download, or antialias except
+                         glyphs.
+    corner marks in pure black, 12px
+                         Big enough to survive any compositing, small enough
+                         not to disturb layout. Their interior is exactly
+                         #000 even if the edges get antialiased, which is
+                         what the aligner keys on.
+    a fixed-width box    So a different window width cannot re-break a line.
+
+  Before trusting any diff, confirm on both machines:
+    - Firefox is the same version
+    - layout.css.devPixelsPerPx is 1.0 (no display scaling)
+    - the font files are the same revisions (tools/testing/compare_viewport.py --fonts)
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  #box {
+    position: relative;
+    width: 960px;
+    height: 620px;
+    margin: 0;
+    background: #fff;
+  }
+  .mark {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    background: #000;
+  }
+  #tl { left: 0;    top: 0; }
+  #tr { left: 948px; top: 0; }
+  #bl { left: 0;    top: 608px; }
+  #br { left: 948px; top: 608px; }
+
+  #text { position: absolute; left: 24px; top: 28px; width: 912px; color: #000; }
+  p { margin: 0 0 10px 0; }
+  .s9  { font: 9px  sans-serif; }
+  .s11 { font: 11px sans-serif; }
+  .s13 { font: 13px sans-serif; }
+  .s16 { font: 16px sans-serif; }
+  .s20 { font: 20px sans-serif; }
+  .s28 { font: 28px sans-serif; }
+  .sr  { font: 15px serif; }
+  .sm  { font: 15px monospace; }
+  .cjk { font: 16px sans-serif; }
+</style>
+
+<div id="box">
+  <div class="mark" id="tl"></div>
+  <div class="mark" id="tr"></div>
+  <div class="mark" id="bl"></div>
+  <div class="mark" id="br"></div>
+
+  <div id="text">
+    <p class="s9">9px — Hamburgefonstiv 0123456789 il1I O0o rn m</p>
+    <p class="s11">11px — Hamburgefonstiv 0123456789 il1I O0o rn m</p>
+    <p class="s13">13px — Hamburgefonstiv 0123456789 il1I O0o rn m</p>
+    <p class="s16">16px — Hamburgefonstiv 0123456789 il1I O0o rn m</p>
+    <p class="s20">20px — Hamburgefonstiv 0123456789</p>
+    <p class="s28">28px — Hamburgefonstiv 0123</p>
+
+    <p class="sr">serif 15px — The quick brown fox jumps over the lazy dog.</p>
+    <p class="sm">monospace 15px — The quick brown fox jumps 0123.</p>
+
+    <p class="s13"><b>bold 13px</b> — Hamburgefonstiv &nbsp;
+       <i>italic 13px</i> — Hamburgefonstiv</p>
+
+    <!-- lang= on every run, not decoration. Firefox keys font.name-list on
+         its own language group, so without it these lines never reach the
+         per-script prefs at all: both platforms fall through to OS-level
+         fallback instead, which is fontconfig here and DirectWrite there.
+         Measured, before this was added: the two sides picked different
+         fonts for these two lines, and the taller line boxes pushed
+         everything below them 4px out of alignment. -->
+    <p class="cjk"><span lang="ja">日本語のテキスト</span> &nbsp;
+       <span lang="ko">한국어 텍스트</span> &nbsp;
+       <span lang="zh-CN">简体中文</span> &nbsp;
+       <span lang="zh-TW">繁體中文</span></p>
+    <p class="cjk"><span lang="hi">देवनागरी</span> &nbsp;
+       <span lang="th">ไทย</span> &nbsp;
+       <span lang="he">עברית</span> &nbsp;
+       <span lang="ar">العربية</span> &nbsp;
+       <span lang="el">Ελληνικά</span> &nbsp;
+       <span lang="ru">Русский</span></p>
+
+    <p class="s13">Kerning pairs: AV To Ta We Yo LT PA — punctuation: .,;:!?'"()[]{}</p>
+    <p class="s13">Repeated i to expose accumulated subpixel drift:
+       iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii</p>
+  </div>
+</div>

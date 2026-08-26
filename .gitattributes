@@ -1,0 +1,19 @@
+# Line endings.
+*                            text=auto eol=lf
+
+# Vendored Microsoft material, byte-for-byte as shipped, CRLF included. Nothing
+# here is ever modified in place, and libdwritecore.so is binary besides.
+third_party/**               -text
+
+# The mirrored DirectWrite headers. tools/mirror_headers.py copies each one out
+# of third_party/windows-app-sdk preserving the newline it finds there, so these
+# six are CRLF, while everything else generated into include/ - the *_iids.h
+# files, and the Windows SDK subset from mirror_sdk_headers.py - is LF and is
+# deliberately not listed. Normalizing them would make every re-run of the
+# mirror rewrite the whole file.
+include/dwrite.h             -text
+include/dwrite_1.h           -text
+include/dwrite_2.h           -text
+include/dwrite_3.h           -text
+include/dwrite_core.h        -text
+include/DWriteExperimental.h -text

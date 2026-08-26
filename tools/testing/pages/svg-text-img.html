@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DWriteCore SVG text parity, as an image</title>
+<!--
+  The badge as an <img>, rasterized into an image surface, so its text takes
+  the consumer canvas text takes. This is how a badge renders inside a page.
+
+  One embed per page, for the reason svg-text.html gives about inline <svg>.
+-->
+<style>
+  html, body { margin: 0; background: #fff; }
+  body { width: 960px; }
+  img { display: block; border: 0; }
+</style>
+<img src="svg-text-badge.svg" width="900" height="44" alt="">

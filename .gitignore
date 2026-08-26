@@ -1,0 +1,27 @@
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+build/Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+CMakeUserPresets.json
+
+build/
+.cache/
+__pycache__/
+*.pyc
+build-stock/
+
+# A parity plan names a guest, its address and a local corpus.
+tools/testing/parity.plan
+
+# Written into the working directory by cleartype_sample, per the README.
+*.ppm
+
+# .idea folder
+.idea/

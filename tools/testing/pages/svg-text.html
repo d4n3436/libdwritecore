@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DWriteCore SVG text parity, light on dark</title>
+<!--
+  Firefox draws page text and canvas text through consumers that read the
+  system ClearType values, and SVG text through the blob rasterizer, which is
+  reached before gfxVars deliver them and answers with DWriteSettings' own
+  initialisers instead - gamma 2.2 where everything else gets 1.8. Nothing else
+  in a corpus of saved pages goes down that path.
+
+  One inline <svg> per page. Two on a page and Firefox stops blob-rasterizing
+  their text and pushes it as WebRender text items, which is a third consumer
+  with a gamma of its own, so the page stops measuring what it names. The
+  colors are split across pages for the same reason.
+
+  The curve is keyed on the text's luminance. Mid-gray sits where it is nearly
+  flat and agrees whatever the gamma is; the extremes are where a wrong one
+  shows.
+-->
+<style>
+  html, body { margin: 0; background: #fff; }
+  body { width: 960px; }
+  .label { font: 11px/16px monospace; color: #444; padding: 6px 0 2px 6px; }
+  svg, canvas { display: block; }
+  .html-row {
+    width: 900px; height: 44px; background: #000; color: #fff;
+    font: 24px/44px Verdana, sans-serif; padding-left: 6px; box-sizing: border-box;
+  }
+</style>
+
+<div class="label">svg text, #fff on #000</div>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="44">
+  <rect width="900" height="44" fill="#000"/>
+  <text x="6" y="33" font-family="Verdana" font-size="24" fill="#fff">Handgloves 0123 WAVE</text>
+</svg>
+
+<div class="label">canvas, #fff on #000 - the control that shares the mask</div>
+<canvas id="control" width="900" height="44"></canvas>
+
+<div class="label">page text, #fff on #000 - the control that is subpixel</div>
+<div class="html-row">Handgloves 0123 WAVE</div>
+
+<script>
+  const context = document.getElementById("control").getContext("2d");
+  context.fillStyle = "#000";
+  context.fillRect(0, 0, 900, 44);
+  context.fillStyle = "#fff";
+  context.font = "24px Verdana";
+  context.fillText("Handgloves 0123 WAVE", 6, 33);
+</script>

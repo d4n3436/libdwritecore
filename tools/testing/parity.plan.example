@@ -1,0 +1,42 @@
+# The comparison, written down. tools/testing/compare_pages.sh reads this.
+#
+# Copy it to parity.plan and fill in your own machines; the copy is
+# gitignored, because a plan names a guest, its address and a corpus that
+# only exists on the machine that saved it.
+#
+#   cp tools/testing/parity.plan.example tools/testing/parity.plan
+#   run_parity_firefox.sh start --port 2828
+#   run_parity_firefox.sh guest <domain> --port 2828 --no-prefs
+#   (cd <corpus-dir> && python3 -m http.server 8080 --bind 0.0.0.0)
+#   tools/testing/compare_pages.sh tools/testing/parity.plan
+#
+# --no-prefs on the guest side: the parity prefs carry Windows' own values, so
+# applying them there answers with what they say instead of with what Windows
+# does.
+#
+# The corpus is yours to assemble and is not in this repository. Save the pages
+# instead of pointing at live ones, so both machines get identical bytes;
+# tools/testing/save_page.py freezes a URL into a directory. Text-heavy pages
+# across many scripts are what the comparison is for.
+size 2200 1150
+
+# side <name> <backend> <host> <marionette-port> <base-url>
+#   backend is x11:<display> here, or libvirt:<domain> for a guest.
+side linux x11::99            127.0.0.1       2828 http://127.0.0.1:8080
+side win   libvirt:<domain>   <guest-ip>      2828 http://<host-ip>:8080
+
+# page <path-under-base-url> <scroll-offset>...
+page example/index.html       0
+page example-long/index.html  0 1000 4600
+
+# Not saved pages: tools/testing/pages/svg-text*.html and svg-text-badge.svg,
+# copied into the corpus together. Keep them in every plan - a saved-page
+# corpus has no SVG text, and SVG text is rasterized through a consumer of its
+# own. One color per page, because two inline <svg> on a page reroute the text
+# to WebRender.
+page svg-text/svg-text.html           0
+page svg-text/svg-text-inverse.html   0
+page svg-text/svg-text-gray.html      0
+page svg-text/svg-text-img.html       0
+page svg-text/svg-text-iframe.html    0
+page svg-text/svg-text-object.html    0

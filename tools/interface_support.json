@@ -1,0 +1,950 @@
+{
+ "IDWriteAsyncResult": {
+  "base": "IUnknown",
+  "evidence": [
+   "base-of:IDWriteAsyncResult1"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "ce25f8fd-863b-4d13-9651-c1f88dc73fe2",
+  "supported": true
+ },
+ "IDWriteAsyncResult1": {
+  "base": "IDWriteAsyncResult",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "DWriteExperimental.h",
+  "iid": "c50f19a9-b4ec-47db-9a66-c308c1e0045f",
+  "supported": true
+ },
+ "IDWriteBitmapRenderTarget": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "5e5a32a3-8dff-4773-9ff6-0696eab77267",
+  "supported": true
+ },
+ "IDWriteBitmapRenderTarget1": {
+  "base": "IDWriteBitmapRenderTarget",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "791e8298-3ef3-4230-9880-c9bdecc42064",
+  "supported": true
+ },
+ "IDWriteBitmapRenderTarget2": {
+  "base": "IDWriteBitmapRenderTarget1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "c553a742-fc01-44da-a66e-b8b9ed6c3995",
+  "supported": true
+ },
+ "IDWriteBitmapRenderTarget3": {
+  "base": "IDWriteBitmapRenderTarget2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "aeec37db-c337-40f1-8e2a-9a41b167b238",
+  "supported": true
+ },
+ "IDWriteCachedData": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "6189d808-1241-4cbb-9ab2-05e3e0a99c61",
+  "supported": true
+ },
+ "IDWriteColorGlyphRunEnumerator": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "d31fbe17-f157-41a2-8d24-cb779e0560e8",
+  "supported": true
+ },
+ "IDWriteColorGlyphRunEnumerator1": {
+  "base": "IDWriteColorGlyphRunEnumerator",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "7c5f86da-c7a1-4f05-b8e1-55a179fe5a35",
+  "supported": true
+ },
+ "IDWriteEventSink": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "app-implemented"
+  ],
+  "header": "dwrite_core.h",
+  "iid": "b2839dc9-5419-4223-a069-c792d2dc6ba0",
+  "supported": true
+ },
+ "IDWriteFactory": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "b859ee5a-d838-4b5b-a2e8-1adc7d93db48",
+  "supported": true
+ },
+ "IDWriteFactory1": {
+  "base": "IDWriteFactory",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "30572f99-dac6-41db-a16e-0486307e606a",
+  "supported": true
+ },
+ "IDWriteFactory2": {
+  "base": "IDWriteFactory1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "0439fc60-ca44-4994-8dee-3a9af7b732ec",
+  "supported": true
+ },
+ "IDWriteFactory3": {
+  "base": "IDWriteFactory2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "9a1b41c3-d3bb-466a-87fc-fe67556a3b65",
+  "supported": true
+ },
+ "IDWriteFactory4": {
+  "base": "IDWriteFactory3",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "4b0b5bd3-0797-4549-8ac5-fe915cc53856",
+  "supported": true
+ },
+ "IDWriteFactory5": {
+  "base": "IDWriteFactory4",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "958db99a-be2a-4f09-af7d-65189803d1d3",
+  "supported": true
+ },
+ "IDWriteFactory6": {
+  "base": "IDWriteFactory5",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "f3744d80-21f7-42eb-b35d-995bc72fc223",
+  "supported": true
+ },
+ "IDWriteFactory7": {
+  "base": "IDWriteFactory6",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "35d0e0b3-9076-4d2e-a016-a91b568a06b4",
+  "supported": true
+ },
+ "IDWriteFactory8": {
+  "base": "IDWriteFactory7",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "ee0a7fb5-def4-4c23-a454-c9c7dc878398",
+  "supported": true
+ },
+ "IDWriteFactory9": {
+  "base": "IDWriteFactory8",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "6b718546-8fb4-4889-b1f4-4da1a43bbdd9",
+  "supported": true
+ },
+ "IDWriteFileDownload": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "DWriteExperimental.h",
+  "iid": "fac87bfa-b85a-4fea-9fd5-d060962c297c",
+  "supported": true
+ },
+ "IDWriteFileDownloadList": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "DWriteExperimental.h",
+  "iid": "8ab33f0b-6724-47c6-a481-93b33aed6478",
+  "supported": true
+ },
+ "IDWriteFont": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "acd16696-8c14-4f5d-877e-fe3fc1d32737",
+  "supported": true
+ },
+ "IDWriteFont1": {
+  "base": "IDWriteFont",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "acd16696-8c14-4f5d-877e-fe3fc1d32738",
+  "supported": true
+ },
+ "IDWriteFont2": {
+  "base": "IDWriteFont1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "29748ed6-8c9c-4a6a-be0b-d912e8538944",
+  "supported": true
+ },
+ "IDWriteFont3": {
+  "base": "IDWriteFont2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "29748ed6-8c9c-4a6a-be0b-d912e8538944",
+  "supported": true
+ },
+ "IDWriteFontCollection": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "outbound-const"
+  ],
+  "header": "dwrite.h",
+  "iid": "a84cee02-3eea-4eee-a827-87c1a02a0fcc",
+  "supported": true
+ },
+ "IDWriteFontCollection1": {
+  "base": "IDWriteFontCollection",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "53585141-d9f8-4095-8321-d73cf6bd116c",
+  "supported": true
+ },
+ "IDWriteFontCollection2": {
+  "base": "IDWriteFontCollection1",
+  "evidence": [
+   "qi-registry",
+   "outbound-const"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "514039c6-4617-4064-bf8b-92ea83e506e0",
+  "supported": true
+ },
+ "IDWriteFontCollection3": {
+  "base": "IDWriteFontCollection2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "a4d055a6-f9e3-4e25-93b7-9e309f3af8e9",
+  "supported": true
+ },
+ "IDWriteFontCollectionLoader": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "cca920e4-52f0-492b-bfa8-29c72ee0a468",
+  "supported": true
+ },
+ "IDWriteFontDownloadListener": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "app-implemented"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "b06fe5b9-43ec-4393-881b-dbe4dc72fda7",
+  "supported": true
+ },
+ "IDWriteFontDownloadQueue": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "b71e6052-5aea-4fa3-832e-f60d431f7e91",
+  "supported": true
+ },
+ "IDWriteFontDownloadQueue1": {
+  "base": "IDWriteFontDownloadQueue",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "DWriteExperimental.h",
+  "iid": "96e1c125-3ab4-4728-aaba-e3c919b7f0d0",
+  "supported": true
+ },
+ "IDWriteFontFace": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "outbound-const"
+  ],
+  "header": "dwrite.h",
+  "iid": "5f49804d-7024-4d43-bfa9-d25984f53849",
+  "supported": true
+ },
+ "IDWriteFontFace1": {
+  "base": "IDWriteFontFace",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "a71efdb4-9fdb-4838-ad90-cfc3be8c3daf",
+  "supported": true
+ },
+ "IDWriteFontFace2": {
+  "base": "IDWriteFontFace1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "d8b768ff-64bc-4e66-982b-ec8e87f693f7",
+  "supported": true
+ },
+ "IDWriteFontFace3": {
+  "base": "IDWriteFontFace2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "d37d7598-09be-4222-a236-2081341cc1f2",
+  "supported": true
+ },
+ "IDWriteFontFace4": {
+  "base": "IDWriteFontFace3",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "27f2a904-4eb8-441d-9678-0563f53e3e2f",
+  "supported": true
+ },
+ "IDWriteFontFace5": {
+  "base": "IDWriteFontFace4",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "98eff3a5-b667-479a-b145-e2fa5b9fdc29",
+  "supported": true
+ },
+ "IDWriteFontFace6": {
+  "base": "IDWriteFontFace5",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "c4b1fe1b-6e84-47d5-b54c-a597981b06ad",
+  "supported": true
+ },
+ "IDWriteFontFace7": {
+  "base": "IDWriteFontFace6",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "3945b85b-bc95-40f7-b72c-8b73bfc7e13b",
+  "supported": true
+ },
+ "IDWriteFontFaceReference": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "5e7fa7ca-dde3-424c-89f0-9fcd6fed58cd",
+  "supported": true
+ },
+ "IDWriteFontFaceReference1": {
+  "base": "IDWriteFontFaceReference",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "c081fe77-2fd1-41ac-a5a3-34983c4ba61a",
+  "supported": true
+ },
+ "IDWriteFontFallback": {
+  "base": "IUnknown",
+  "evidence": [
+   "outbound-const"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "efa008f9-f7a1-48bf-b05c-f224713cc0ff",
+  "supported": true
+ },
+ "IDWriteFontFallback1": {
+  "base": "IDWriteFontFallback",
+  "evidence": [],
+  "header": "dwrite_3.h",
+  "iid": "2397599d-dd0d-4681-bd6a-f4f31eaade77",
+  "supported": false
+ },
+ "IDWriteFontFallbackBuilder": {
+  "base": "IUnknown",
+  "evidence": [
+   "rust-impl:rust/font_fallback/src/builder.rs"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "fd882d06-8aba-4fb8-b849-8be8b73e14de",
+  "supported": true
+ },
+ "IDWriteFontFamily": {
+  "base": "IDWriteFontList",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "da20d8ef-812a-4c43-9802-62ec4abd7add",
+  "supported": true
+ },
+ "IDWriteFontFamily1": {
+  "base": "IDWriteFontFamily",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "da20d8ef-812a-4c43-9802-62ec4abd7adf",
+  "supported": true
+ },
+ "IDWriteFontFamily2": {
+  "base": "IDWriteFontFamily1",
+  "evidence": [
+   "qi-registry",
+   "outbound-const"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "3ed49e77-a398-4261-b9cf-c126c2131ef3",
+  "supported": true
+ },
+ "IDWriteFontFile": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "739d886a-cef5-47dc-8769-1a8b41bebbb0",
+  "supported": true
+ },
+ "IDWriteFontFileEnumerator": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "72755049-5ff7-435d-8348-4be97cfa6c7c",
+  "supported": true
+ },
+ "IDWriteFontFileLoader": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "727cad4e-d6af-4c9e-8a08-d695b11caa49",
+  "supported": true
+ },
+ "IDWriteFontFileStream": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry",
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "6d4865fe-0ab8-4d91-8f62-5dd6be34a3e0",
+  "supported": true
+ },
+ "IDWriteFontList": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "1a0d8438-1d97-4ec1-aef9-a2fb86ed6acb",
+  "supported": true
+ },
+ "IDWriteFontList1": {
+  "base": "IDWriteFontList",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "da20d8ef-812a-4c43-9802-62ec4abd7ade",
+  "supported": true
+ },
+ "IDWriteFontList2": {
+  "base": "IDWriteFontList1",
+  "evidence": [
+   "qi-registry",
+   "outbound-const"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "c0763a34-77af-445a-b735-08c37b0a5bf5",
+  "supported": true
+ },
+ "IDWriteFontResource": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "1f803a76-6871-48e8-987f-b975551c50f2",
+  "supported": true
+ },
+ "IDWriteFontSet": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "53585141-d9f8-4095-8321-d73cf6bd116b",
+  "supported": true
+ },
+ "IDWriteFontSet1": {
+  "base": "IDWriteFontSet",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "7e9fda85-6c92-4053-bc47-7ae3530db4d3",
+  "supported": true
+ },
+ "IDWriteFontSet2": {
+  "base": "IDWriteFontSet1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "dc7ead19-e54c-43af-b2da-4e2b79ba3f7f",
+  "supported": true
+ },
+ "IDWriteFontSet3": {
+  "base": "IDWriteFontSet2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "7c073ef2-a7f4-4045-8c32-8ab8ae640f90",
+  "supported": true
+ },
+ "IDWriteFontSet4": {
+  "base": "IDWriteFontSet3",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "eec175fc-bea9-4c86-8b53-ccbdd7df0c82",
+  "supported": true
+ },
+ "IDWriteFontSet5": {
+  "base": "IDWriteFontSet4",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "a98f357c-5e4d-48f7-8287-085a74bb836c",
+  "supported": true
+ },
+ "IDWriteFontSetBuilder": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "2f642afe-9c68-4f40-b8be-457401afcb3d",
+  "supported": true
+ },
+ "IDWriteFontSetBuilder1": {
+  "base": "IDWriteFontSetBuilder",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "3ff7715f-3cdc-4dc6-9b72-ec5621dccafd",
+  "supported": true
+ },
+ "IDWriteFontSetBuilder2": {
+  "base": "IDWriteFontSetBuilder1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "ee5ba612-b131-463c-8f4f-3189b9401e45",
+  "supported": true
+ },
+ "IDWriteFontSetBuilderWithCache": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "d2719864-547b-449d-a3e9-e47c4e1e792f",
+  "supported": true
+ },
+ "IDWriteGdiInterop": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "1edd9491-9853-4299-898f-6432983b6f3a",
+  "supported": true
+ },
+ "IDWriteGdiInterop1": {
+  "base": "IDWriteGdiInterop",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "4556be70-3abd-4f70-90be-421780a6f515",
+  "supported": true
+ },
+ "IDWriteGlyphRunAnalysis": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "7d97dbf7-e085-42d4-81e3-6a883bded118",
+  "supported": true
+ },
+ "IDWriteInMemoryFontFileLoader": {
+  "base": "IDWriteFontFileLoader",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "dc102f47-a12d-4b1c-822d-9e117e33043f",
+  "supported": true
+ },
+ "IDWriteInlineObject": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "8339fde3-106f-47ab-8373-1c6295eb10b3",
+  "supported": true
+ },
+ "IDWriteLocalFontFileLoader": {
+  "base": "IDWriteFontFileLoader",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "b2d9f3ec-c9fe-4a11-a2ec-d86208f7c0a2",
+  "supported": true
+ },
+ "IDWriteLocalizedStrings": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "08256209-099a-4b34-b86d-c22b110e7771",
+  "supported": true
+ },
+ "IDWriteNumberSubstitution": {
+  "base": "IUnknown",
+  "evidence": [
+   "rust-impl:rust/unicode_analysis/src/number_substitution.rs"
+  ],
+  "header": "dwrite.h",
+  "iid": "14885cc9-bab0-4f90-b6ed-5c366a2cd03d",
+  "supported": true
+ },
+ "IDWritePaintReader": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "8128e912-3b97-42a5-ab6c-24aad3a86e54",
+  "supported": true
+ },
+ "IDWritePixelSnapping": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "eaf3a2da-ecf4-4d24-b644-b34f6842024b",
+  "supported": true
+ },
+ "IDWriteRemoteFontFileLoader": {
+  "base": "IDWriteFontFileLoader",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "68648c83-6ede-46c0-ab46-20083a887fde",
+  "supported": true
+ },
+ "IDWriteRemoteFontFileStream": {
+  "base": "IDWriteFontFileStream",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "4db3757a-2c72-4ed9-b2b6-1ababe1aff9c",
+  "supported": true
+ },
+ "IDWriteRenderingParams": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite.h",
+  "iid": "2f0da53a-2add-47cd-82ee-d9ec34688e75",
+  "supported": true
+ },
+ "IDWriteRenderingParams1": {
+  "base": "IDWriteRenderingParams",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "94413cf4-a6fc-4248-8b50-6674348fcad3",
+  "supported": true
+ },
+ "IDWriteRenderingParams2": {
+  "base": "IDWriteRenderingParams1",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "f9d711c3-9777-40ae-87e8-3e5af9bf0948",
+  "supported": true
+ },
+ "IDWriteRenderingParams3": {
+  "base": "IDWriteRenderingParams2",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "b7924baa-391b-412a-8c5c-e44cc2d867dc",
+  "supported": true
+ },
+ "IDWriteStringList": {
+  "base": "IUnknown",
+  "evidence": [
+   "qi-registry"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "cfee3140-1157-47ca-8b85-31bfcf3f2d0e",
+  "supported": true
+ },
+ "IDWriteTextAnalysisSink": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "5810cd44-0ca0-4701-b3fa-bec5182ae4f6",
+  "supported": true
+ },
+ "IDWriteTextAnalysisSink1": {
+  "base": "IDWriteTextAnalysisSink",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "b0d941a0-85e7-4d8b-9fd3-5ced9934482a",
+  "supported": true
+ },
+ "IDWriteTextAnalysisSource": {
+  "base": "IUnknown",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "688e1a58-5094-47c8-adc8-fbcea60ae92b",
+  "supported": true
+ },
+ "IDWriteTextAnalysisSource1": {
+  "base": "IDWriteTextAnalysisSource",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "639cfad8-0fb4-4b21-a58a-067920120009",
+  "supported": true
+ },
+ "IDWriteTextAnalyzer": {
+  "base": "IUnknown",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_analyzer.rs"
+  ],
+  "header": "dwrite.h",
+  "iid": "b7e6163e-7f46-43b4-84b3-e4e6249c365d",
+  "supported": true
+ },
+ "IDWriteTextAnalyzer1": {
+  "base": "IDWriteTextAnalyzer",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_analyzer.rs"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "80dad800-e21f-4e83-96ce-bfcce500db7c",
+  "supported": true
+ },
+ "IDWriteTextAnalyzer2": {
+  "base": "IDWriteTextAnalyzer1",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_analyzer.rs"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "553a9ff3-5693-4df7-b52b-74806f7f2eb9",
+  "supported": true
+ },
+ "IDWriteTextFormat": {
+  "base": "IUnknown",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_format.rs"
+  ],
+  "header": "dwrite.h",
+  "iid": "9c906818-31d7-4fd3-a151-7c5e225db55a",
+  "supported": true
+ },
+ "IDWriteTextFormat1": {
+  "base": "IDWriteTextFormat",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_format.rs"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "5f174b49-0d8b-4cfb-8bca-f1cce9d06c67",
+  "supported": true
+ },
+ "IDWriteTextFormat2": {
+  "base": "IDWriteTextFormat1",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_format.rs"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "f67e0edd-9e3d-4ecc-8c32-4183253dfe70",
+  "supported": true
+ },
+ "IDWriteTextFormat3": {
+  "base": "IDWriteTextFormat2",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_format.rs"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "6d3b5641-e550-430d-a85b-b7bf48a93427",
+  "supported": true
+ },
+ "IDWriteTextLayout": {
+  "base": "IDWriteTextFormat",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_layout.rs"
+  ],
+  "header": "dwrite.h",
+  "iid": "53737037-6d14-410b-9bfe-0b182bb70961",
+  "supported": true
+ },
+ "IDWriteTextLayout1": {
+  "base": "IDWriteTextLayout",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_layout.rs"
+  ],
+  "header": "dwrite_1.h",
+  "iid": "9064d822-80a7-465c-a986-df65f78b8feb",
+  "supported": true
+ },
+ "IDWriteTextLayout2": {
+  "base": "IDWriteTextLayout1",
+  "evidence": [
+   "outbound-const",
+   "rust-impl:rust/api_impl/src/text_layout.rs"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "1093c18f-8d5e-43f0-b064-0917311b525e",
+  "supported": true
+ },
+ "IDWriteTextLayout3": {
+  "base": "IDWriteTextLayout2",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_layout.rs"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "07ddcd52-020e-4de8-ac33-6c953d83f92d",
+  "supported": true
+ },
+ "IDWriteTextLayout4": {
+  "base": "IDWriteTextLayout3",
+  "evidence": [
+   "rust-impl:rust/api_impl/src/text_layout.rs"
+  ],
+  "header": "dwrite_3.h",
+  "iid": "05a9bf42-223f-4441-b5fb-8263685f55e9",
+  "supported": true
+ },
+ "IDWriteTextRenderer": {
+  "base": "IDWritePixelSnapping",
+  "evidence": [
+   "app-implemented"
+  ],
+  "header": "dwrite.h",
+  "iid": "ef8a8135-5cc6-45fe-8825-c5a0724eb819",
+  "supported": true
+ },
+ "IDWriteTextRenderer1": {
+  "base": "IDWriteTextRenderer",
+  "evidence": [
+   "outbound-const",
+   "app-implemented"
+  ],
+  "header": "dwrite_2.h",
+  "iid": "d3e0e934-22a0-427e-aae4-7d9574b59db1",
+  "supported": true
+ },
+ "IDWriteTypography": {
+  "base": "IUnknown",
+  "evidence": [
+   "rust-impl:rust/layout/src/properties.rs"
+  ],
+  "header": "dwrite.h",
+  "iid": "55f1112b-1dc2-4b3c-9541-f46894ed85b6",
+  "supported": true
+ },
+ "_generated_by": "tools/analyze_interfaces.py",
+ "_source": "third_party/office-android/libdwritecore.so",
+ "_source_sha256": "3da882f4f2697968816b90c1031d3dd212d7c93f464a2da14339715b6936563d"
+}

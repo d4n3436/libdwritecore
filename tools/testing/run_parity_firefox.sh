@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+#
+# run_parity_firefox.sh - start a Firefox configured for Windows parity.
+#
+#   run_parity_firefox.sh start [options]          # here, under Xvfb
+#   run_parity_firefox.sh stop
+#   run_parity_firefox.sh guest <domain> [options] # in a libvirt guest
+#   run_parity_firefox.sh guest-stop <domain>
+#
+# Options:
+#   --port N        Marionette port                     (default 2828)
+#   --display :N    X display to create                 (default :99)
+#   --size WxH      X screen size                       (default 2560x1440)
+#   --shim PATH     the interceptor to preload          (default: the build)
+#   --no-shim       run without LD_PRELOAD, the control run
+#   --no-prefs      start on a stock profile, without the parity prefs. Use
+#                   this when *measuring* a Windows Firefox: a browser already
+#                   carrying the parity prefs answers with what those prefs
+#                   say, which is circular if the answer is what they should
+#                   say in the first place.
+#   --url URL       first page to open                  (default about:blank)
+#   --profile DIR   keep the profile here               (default: a temp dir)
+#
+# Both settings this starts Firefox with are load-bearing, and each was found
+# by a comparison that failed without it:
+#
+#   prefs             supplied by the shim through MOZ_DEFAULT_PREFS - the
+#                     rendering prefs, and ui.font.* for the UI font that
+#                     `system-ui` resolves to.
+#
+# And two that are about the X server and not about fonts: without a window
+# manager Firefox never maps its window and WebDriver:SetWindowRect is ignored,
+# and without GDK_BACKEND=x11 a browser started from inside a Wayland session
+# connects to that session instead of the display being photographed.
+#
+# The browser is *windowed*, never headless. A headless Firefox
+# substitutes HeadlessLookAndFeel, which answers "sans-serif" for every system
+# font, so system-ui cannot be measured at all that way.
+set -u
+
+# Xvfb, minwm and the Marionette helpers must run without it; the browser at
+# the bottom is the only thing that sets it again.
+unset LD_PRELOAD
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+STATE="${TMPDIR:-/tmp}/dwc-parity-firefox.$(id -u)"
+
+usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+find_firefox() {
+    if [ -n "${FIREFOX:-}" ]; then echo "$FIREFOX"; return; fi
+    for candidate in firefox firefox-esr firefox-bin; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"; return
+        fi
+    done
+    echo ""
+}
+
+find_shim() {
+    for candidate in "$REPO"/build/libcleartype.so \
+                     "$REPO"/build/cleartype/libcleartype.so; do
+        [ -f "$candidate" ] && { echo "$candidate"; return; }
+    done
+    echo ""
+}
+
+# Builds the font list before anything is measured.
+#
+# Firefox assembles the platform font list, and resolves fallback, partly off
+# the main thread, so the first page a fresh browser loads can be laid out
+# against an incomplete list and reflow by a few pixels when the rest arrives.
+# It happens only on the first load, and nothing inside the content process can
+# see that work finish, so it cannot be waited for from there.
+#
+# Paying it here instead costs a second and a half at startup and nothing after
+# that. The warm-up page names every generic and several scripts, so the list,
+# the per-language prefs and the fallback path are all exercised before the
+# first real measurement.
+warm_up() {                                # warm_up <host> <port>
+    python3 - "$1" "$2" <<'PYWARM'
+import sys, time
+sys.path.insert(0, __import__("os").environ["DWC_TESTING_DIR"])
+from marionette import Marionette
+
+PAGE = ("data:text/html;charset=utf-8,<meta charset=utf-8>"
+        "<div style='font-family:serif'>Handgloves</div>"
+        "<div style='font-family:sans-serif'>Handgloves</div>"
+        "<div style='font-family:monospace'>Handgloves</div>"
+        "<div style='font-family:cursive'>Handgloves</div>"
+        "<div style='font-family:fantasy'>Handgloves</div>"
+        "<div style='font-family:system-ui'>Handgloves</div>"
+        "<div>%D0%B4%D0%B0 %CE%B1%CE%B2 %D7%90%D7%91 %D8%A7%D8%A8 "
+        "%E3%81%82%E3%81%84 %ED%95%9C%EA%B8%80 %E4%B8%AD%E6%96%87 "
+        "%E0%A4%95%E0%A4%96 %E0%B8%81%E0%B8%82</div>")
+
+try:
+    m = Marionette(sys.argv[1], int(sys.argv[2]), timeout=60)
+    m.start("content")
+    m.call("WebDriver:Navigate", {"url": PAGE})
+    # Hold until the layout has been unchanged for a stretch far longer than
+    # the reflow this is here to absorb. A ceiling, not a duration: it exits as
+    # soon as the page has been quiet for 0.6s.
+    last, quiet, end = None, 0.0, time.time() + 20
+    while time.time() < end:
+        shape = m.script("return document.documentElement.scrollHeight + 'x' +"
+                         " document.body.getBoundingClientRect().height;")
+        now = time.time()
+        quiet = 0.0 if shape != last else quiet + 0.05
+        last = shape
+        if quiet >= 0.6:
+            break
+        time.sleep(0.05)
+except Exception as exc:                    # a warm-up is never fatal
+    print("warm-up skipped: %s" % exc, file=sys.stderr)
+PYWARM
+}
+
+stop_all() {
+    if [ -f "$STATE/firefox.pid" ]; then
+        # Only ever this browser, by pid. Never pkill firefox: the user's own
+        # session is very likely running one.
+        kill "$(cat "$STATE/firefox.pid")" 2>/dev/null
+    fi
+    for name in minwm xvfb; do
+        [ -f "$STATE/$name.pid" ] && kill "$(cat "$STATE/$name.pid")" 2>/dev/null
+    done
+    sleep 1
+    rm -rf "$STATE"
+    echo "stopped"
+}
+
+[ $# -ge 1 ] || usage
+COMMAND="$1"; shift
+
+GUEST_DOMAIN=""
+case "$COMMAND" in
+    stop) stop_all; exit 0 ;;
+    start) ;;
+    guest|guest-stop)
+        [ $# -ge 1 ] || usage
+        GUEST_DOMAIN="$1"; shift ;;
+    *) usage ;;
+esac
+
+PORT=2828
+DISPLAY_NAME=":99"
+SIZE="2560x1440"
+SHIM="$(find_shim)"
+URL="about:blank"
+PROFILE=""
+USE_PREFS=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port)    PORT="$2"; shift 2 ;;
+        --display) DISPLAY_NAME="$2"; shift 2 ;;
+        --size)    SIZE="$2"; shift 2 ;;
+        --shim)    SHIM="$2"; shift 2 ;;
+        --no-shim) SHIM=""; shift ;;
+        --no-prefs) USE_PREFS=0; export CLEARTYPE_PREFS=0; shift ;;
+        --url)     URL="$2"; shift 2 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# The guest side
+#
+# Everything here goes through the QEMU guest agent (vmexec.py), which runs in
+# session 0 and therefore cannot put a window on screen. So the browser is
+# started by a scheduled task whose principal is the INTERACTIVE group: that is
+# what lands it in the logged-on user's session, which is the session that gets
+# photographed and the only one where the browser is not headless.
+#
+# Marionette binds to loopback, so it also needs a port proxy and a firewall
+# hole before anything outside the guest can drive it.
+# ---------------------------------------------------------------------------
+
+run_guest() {                             # run_guest <powershell text>
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | base64 -w0 > "$STATE.ps1.b64"
+    python3 "$HERE/vmexec.py" "$GUEST_DOMAIN" powershell -NoProfile \
+            -EncodedCommand "$(cat "$STATE.ps1.b64")"
+    local status=$?
+    rm -f "$STATE.ps1.b64"
+    return $status
+}
+
+if [ "$COMMAND" = "guest-stop" ]; then
+    run_guest "
+Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
+schtasks /delete /tn dwcff /f 2>&1 | Out-Null
+netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 | Out-Null
+netsh advfirewall firewall delete rule name=dwc-marionette | Out-Null
+Write-Output 'guest stopped'
+"
+    exit $?
+fi
+
+if [ "$COMMAND" = "guest" ] && [ "$USE_PREFS" = 1 ]; then
+    echo "guest needs --no-prefs: the parity prefs live in the shim now, and a" >&2
+    echo "Windows Firefox given them answers with what they say instead of with" >&2
+    echo "what Windows does." >&2
+    exit 2
+fi
+
+if [ "$COMMAND" = "guest" ]; then
+    # The prefs go over in pieces. guest-exec passes its argument vector
+    # through a helper with a bounded command line, and a whole prefs file
+    # base64-encoded inside a UTF-16 -EncodedCommand blows past it - the agent
+    # answers "Failed to execute helper program (Invalid argument)", which
+    # names nothing. So: append a chunk at a time, then decode in the guest.
+    GUEST_PREFS="$STATE.guest-user.js"
+    {
+        echo ""
+        echo "// Added by tools/testing/run_parity_firefox.sh"
+        echo 'user_pref("marionette.port", 2828);'
+        echo 'user_pref("browser.shell.checkDefaultBrowser", false);'
+        # No caching, on either side. A page under measurement is usually one
+        # being regenerated between runs, and a browser that revalidates on a
+        # heuristic keeps the old copy - so the two sides compare different
+        # pages and the number is wrong instead of slow.
+        echo 'user_pref("browser.cache.disk.enable", false);'
+        echo 'user_pref("browser.cache.memory.enable", false);'
+        echo 'user_pref("browser.cache.check_doc_frequency", 1);'
+        echo 'user_pref("datareporting.policy.dataSubmissionEnabled", false);'
+    } > "$GUEST_PREFS"
+    CHUNKS="$(base64 -w0 < "$GUEST_PREFS" | fold -w1200)"
+    FIRST=1
+    while IFS= read -r chunk; do
+        if [ "$FIRST" = 1 ]; then
+            run_guest "Set-Content -Path \$env:TEMP\dwc-prefs.b64 -Value '$chunk' -NoNewline" >/dev/null || exit 1
+            FIRST=0
+        else
+            run_guest "Add-Content -Path \$env:TEMP\dwc-prefs.b64 -Value '$chunk' -NoNewline" >/dev/null || exit 1
+        fi
+    done <<< "$CHUNKS"
+
+    run_guest "
+\$ErrorActionPreference = 'Continue'
+# Not under LOCALAPPDATA: the guest agent runs as SYSTEM, so that expands to
+# the *service* profile, which the interactive user the browser runs as cannot
+# read. Firefox then starts on some other profile with no user.js and no
+# Marionette, and the only symptom is a port that never opens. A fixed path
+# with the Users group granted access is reachable from both sides. S-1-5-32-545
+# is that group by SID, which is the same on a guest in any language.
+\$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile'
+New-Item -ItemType Directory -Force -Path \$profileDir | Out-Null
+icacls \$profileDir /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
+\$prefs = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content \$env:TEMP\dwc-prefs.b64 -Raw)))
+Set-Content -Path (Join-Path \$profileDir 'user.js') -Value \$prefs -Encoding UTF8
+Write-Output ('user.js ' + (Get-Item (Join-Path \$profileDir 'user.js')).Length + ' bytes')
+" || exit 1
+
+    run_guest "
+\$exe = @((Join-Path \$env:ProgramFiles 'Mozilla Firefox\firefox.exe'),
+          (Join-Path \${env:ProgramFiles(x86)} 'Mozilla Firefox\firefox.exe')) |
+        Where-Object { Test-Path \$_ } | Select-Object -First 1
+if (-not \$exe) { Write-Error 'no firefox.exe in the guest'; exit 1 }
+Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
+schtasks /delete /tn dwcff /f 2>&1 | Out-Null
+\$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile'
+\$a = '-marionette -remote-allow-system-access -no-remote -profile \"' + \$profileDir + '\" \"$URL\"'
+\$act = New-ScheduledTaskAction -Execute \$exe -Argument \$a
+\$pri = New-ScheduledTaskPrincipal -GroupId 'INTERACTIVE' -RunLevel Limited
+Register-ScheduledTask -TaskName 'dwcff' -Action \$act -Principal \$pri | Out-Null
+Start-ScheduledTask -TaskName 'dwcff'
+Write-Output 'started'
+" || exit 1
+
+    run_guest "
+netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 2>&1 | Out-Null
+netsh interface portproxy add v4tov4 listenport=$PORT listenaddress=0.0.0.0 connectport=2828 connectaddress=127.0.0.1 | Out-Null
+netsh advfirewall firewall delete rule name=dwc-marionette 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-marionette dir=in action=allow protocol=TCP localport=$PORT | Out-Null
+\$ip = (Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } |
+        Select-Object -First 1).IPAddress
+Write-Output ('marionette at ' + \$ip + ':$PORT')
+"
+    status=$?
+    GUEST_IP="$(python3 "$HERE/vmexec.py" "$GUEST_DOMAIN" powershell -NoProfile -Command \
+        "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -First 1).IPAddress" \
+        2>/dev/null | tr -d '\r' | tail -1)"
+    if [ -n "$GUEST_IP" ]; then
+        DWC_TESTING_DIR="$HERE" warm_up "$GUEST_IP" "$PORT"
+    fi
+    exit $status
+fi
+
+BROWSER="$(find_firefox)"
+[ -n "$BROWSER" ] || { echo "no firefox found; set FIREFOX" >&2; exit 1; }
+
+mkdir -p "$STATE"
+[ -n "$PROFILE" ] || PROFILE="$STATE/profile"
+mkdir -p "$PROFILE"
+
+# The prefs, plus the Marionette port. Firefox reads user.js on every start, so
+# the parity prefs are re-applied even if a previous run wrote prefs.js.
+: > "$PROFILE/user.js"
+{
+    echo ""
+    echo "// Added by tools/testing/run_parity_firefox.sh"
+    echo "user_pref(\"marionette.port\", $PORT);"
+    echo "user_pref(\"browser.shell.checkDefaultBrowser\", false);"
+    echo "user_pref(\"browser.cache.disk.enable\", false);"
+    echo "user_pref(\"browser.cache.memory.enable\", false);"
+    echo "user_pref(\"browser.cache.check_doc_frequency\", 1);"
+    echo "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");"
+    echo "user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);"
+    echo "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);"
+} >> "$PROFILE/user.js"
+
+if command -v Xvfb >/dev/null 2>&1; then
+    Xvfb "$DISPLAY_NAME" -screen 0 "${SIZE}x24" >/dev/null 2>&1 &
+    echo $! > "$STATE/xvfb.pid"
+    sleep 2
+else
+    echo "Xvfb not found; using the display already at $DISPLAY_NAME" >&2
+fi
+
+DISPLAY="$DISPLAY_NAME" python3 "$HERE/minwm.py" >"$STATE/minwm.log" 2>&1 &
+echo $! > "$STATE/minwm.pid"
+sleep 1
+
+export DISPLAY="$DISPLAY_NAME"
+export GDK_BACKEND=x11
+export MOZ_ENABLE_WAYLAND=0
+unset WAYLAND_DISPLAY
+if [ -n "$SHIM" ]; then
+    export LD_PRELOAD="$SHIM"
+fi
+
+"$BROWSER" -marionette -remote-allow-system-access \
+           -profile "$PROFILE" -no-remote "$URL" \
+           >"$STATE/firefox.log" 2>&1 &
+echo $! > "$STATE/firefox.pid"
+
+for _ in $(seq 1 60); do
+    if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+        echo "firefox on $DISPLAY_NAME, marionette 127.0.0.1:$PORT${SHIM:+, shim $SHIM}"
+        echo "profile $PROFILE"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "marionette never came up on $PORT; see $STATE/firefox.log" >&2
+exit 1
