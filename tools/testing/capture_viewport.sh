@@ -34,6 +34,13 @@ if [ $# -lt 7 ]; then
     exit 2
 fi
 
+# Which browser driver to use. Marionette (Firefox) is the default, and
+# --driver cdp drives Chromium and Electron over the DevTools protocol. Both
+# put the page into the same state, the choreography being shared in
+# viewport_protocol.py, so the screenshot half below does not care which.
+DRIVER="marionette"
+if [ "$1" = "--driver" ]; then DRIVER="$2"; shift 2; fi
+
 BACKEND="$1"; OUT="$2"; shift 2
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAG="$(mktemp -u "${TMPDIR:-/tmp}/dwc-capture-XXXXXX")"
@@ -49,15 +56,30 @@ case "$BACKEND" in
     *) echo "backend must be x11:<display> or libvirt:<domain>"; exit 2 ;;
 esac
 
+# ImageMagick 7 renamed the tools: convert became magick, and import became
+# magick import. Both generations are still shipped, and mixing the two
+# spellings works only where the newer one was installed with its legacy
+# links, so which is present is settled once here.
+if command -v magick > /dev/null 2>&1; then
+    IM_IMPORT=(magick import)
+    IM_CONVERT=(magick)
+elif command -v import > /dev/null 2>&1 && command -v convert > /dev/null 2>&1; then
+    IM_IMPORT=(import)
+    IM_CONVERT=(convert)
+else
+    echo "ImageMagick not found: need magick, or both import and convert" >&2
+    exit 2
+fi
+
 shoot() {                                  # shoot <path.png>
     case "$BACKEND" in
         x11:*)
-            DISPLAY="$DISPLAY_NAME" import -window root "$1"
+            DISPLAY="$DISPLAY_NAME" "${IM_IMPORT[@]}" -window root "$1"
             ;;
         libvirt:*)
             virsh --connect "${LIBVIRT_URI:-qemu:///system}" screenshot \
                   "$DOMAIN" "$1.ppm" >/dev/null
-            magick "$1.ppm" "$1"
+            "${IM_CONVERT[@]}" "$1.ppm" "$1"
             rm -f "$1.ppm"
             ;;
     esac
@@ -118,7 +140,12 @@ RETRIES="${CAPTURE_RETRIES:-2}"
 
 attempt() {
 rm -f "$TAG.marked" "$TAG.clean"
-python3 "$HERE/capture_viewport.py" "$1" "$2" "$3" "$4" "$5" "$TAG" "${@:6}" &
+case "$DRIVER" in
+    marionette) DRIVER_SCRIPT="capture_viewport.py" ;;
+    cdp)        DRIVER_SCRIPT="capture_viewport_cdp.py" ;;
+    *)          echo "unknown driver: $DRIVER" >&2; exit 2 ;;
+esac
+python3 "$HERE/$DRIVER_SCRIPT" "$1" "$2" "$3" "$4" "$5" "$TAG" "${@:6}" &
 DRIVER=$!
 trap 'kill $DRIVER 2>/dev/null; rm -f "$TAG.marked" "$TAG.clean"' EXIT
 

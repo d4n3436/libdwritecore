@@ -1,0 +1,503 @@
+#include "dwrite_raster.h"
+
+#include "compat.h"
+#include "dwrite_3.h"
+#include "dwrite_core.h"
+
+#include <cmath>
+#include <cstdio>
+#include <mutex>
+#include <unordered_map>
+
+#include <dlfcn.h>
+
+namespace dwrite_raster {
+namespace {
+
+void Say(const char* what)
+{
+    (void)std::fprintf(stderr, "chromium-patch: dwrite: %s\n", what);
+}
+
+using PfnCreateFactory = HRESULT (*)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+
+struct Dwrite
+{
+    IDWriteFactory5* factory5 = nullptr;
+    IDWriteFactory2* factory2 = nullptr;
+    IDWriteInMemoryFontFileLoader* loader = nullptr;
+    bool tried = false;
+    bool ok = false;
+};
+
+std::mutex g_mutex;
+Dwrite g_dw;
+
+// Loading the library and building a factory are deliberately separate, and
+// happen on opposite sides of the fork.
+//
+// The dlopen has to be early: a renderer is forked from the zygote and can no
+// longer open a file, so the mapping must already exist. The factory has to
+// be late: DirectWrite starts threads and takes locks of its own while
+// initializing, and only the forking thread survives a fork, so a factory
+// built in the zygote leaves the child holding locks nobody will ever
+// release, which hangs the renderer.
+//
+// Splitting them keeps both constraints: the file is mapped before the
+// sandbox closes, and every DirectWrite object is created in the process that
+// uses it. Nothing needs the filesystem after the dlopen, because the fonts
+// come from memory.
+PfnCreateFactory g_create = nullptr;
+
+bool PreloadLibrary()
+{
+    if (g_create != nullptr) {
+        return true;
+    }
+    void* handle = dlopen("libdwritecore.so", RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        const char* why = dlerror();
+        (void)std::fprintf(stderr, "chromium-patch: dwrite: libdwritecore.so did not load (%s); "
+                                   "glyphs stay with Fontations\n",
+                           why != nullptr ? why : "no reason given");
+        return false;
+    }
+    g_create = reinterpret_cast<PfnCreateFactory>(dlsym(handle, "DWriteCoreCreateFactory"));
+    if (g_create == nullptr) {
+        Say("libdwritecore.so has no DWriteCoreCreateFactory");
+        return false;
+    }
+    return true;
+}
+
+bool EnsureFactory()
+{
+    if (g_dw.tried) {
+        return g_dw.ok;
+    }
+    g_dw.tried = true;
+    if (!PreloadLibrary()) {
+        return false;
+    }
+    const PfnCreateFactory create = g_create;
+    IUnknown* unknown = nullptr;
+    if (FAILED(create(DWRITE_FACTORY_TYPE_ISOLATED, __uuidof(IDWriteFactory5), &unknown)) ||
+        unknown == nullptr) {
+        Say("no IDWriteFactory5");
+        return false;
+    }
+    g_dw.factory5 = static_cast<IDWriteFactory5*>(unknown);
+    if (FAILED(g_dw.factory5->QueryInterface(__uuidof(IDWriteFactory2),
+                                             reinterpret_cast<void**>(&g_dw.factory2)))) {
+        g_dw.factory2 = nullptr;
+    }
+    if (FAILED(g_dw.factory5->CreateInMemoryFontFileLoader(&g_dw.loader)) ||
+        g_dw.loader == nullptr) {
+        Say("no in-memory font file loader");
+        return false;
+    }
+    if (FAILED(g_dw.factory5->RegisterFontFileLoader(g_dw.loader))) {
+        Say("the in-memory loader would not register");
+        return false;
+    }
+    g_dw.ok = true;
+    Say("DWriteCore ready");
+    return true;
+}
+
+// One font face per typeface, built from the bytes typeface_bridge rebuilt,
+// so DirectWrite never touches the filesystem. That is what makes this work in
+// a sandboxed renderer.
+IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes)
+{
+    static std::unordered_map<const void*, IDWriteFontFace*> faces;
+    const auto it = faces.find(typeface);
+    if (it != faces.end()) {
+        return it->second;
+    }
+    IDWriteFontFace* face = nullptr;
+    IDWriteFontFile* file = nullptr;
+    if (!bytes.empty() &&
+        SUCCEEDED(g_dw.loader->CreateInMemoryFontFileReference(
+            g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()), nullptr, &file)) &&
+        file != nullptr) {
+        if (FAILED(g_dw.factory5->CreateFontFace(DWRITE_FONT_FACE_TYPE_TRUETYPE, 1, &file, 0,
+                                                 DWRITE_FONT_SIMULATIONS_NONE, &face))) {
+            face = nullptr;
+        }
+        file->Release();
+    }
+    faces[typeface] = face;
+    if (face == nullptr) {
+        Say("could not build a font face from the rebuilt bytes");
+    }
+    return face;
+}
+
+uint8_t ApplyLut(const uint8_t v, const uint8_t* table)
+{
+    return table != nullptr ? table[v] : v;
+}
+
+size_t RowBytes(const skia_abi::Glyph& g)
+{
+    switch (g.mask_format) {
+        case skia_abi::kBW: return (static_cast<size_t>(g.width) + 7) >> 3;
+        case skia_abi::kLCD16: return static_cast<size_t>(g.width) * 2;
+        case skia_abi::kARGB32: return static_cast<size_t>(g.width) * 4;
+        default: return g.width;
+    }
+}
+
+// src/ports/SkScalerContext_win_dw.cpp, isLCD - the Rec's mask format, not
+// the glyph's, is what chooses the conversion.
+bool IsLcd(const skia_abi::Rec& rec)
+{
+    return rec.mask_format == skia_abi::kLCD16;
+}
+
+uint16_t Pack888ToRGB16(const uint8_t r, const uint8_t g, const uint8_t b)
+{
+    return static_cast<uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+}  // namespace
+
+bool Preload()
+{
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    return PreloadLibrary();
+}
+
+bool Available()
+{
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    return EnsureFactory();
+}
+
+// SkScalerContext_DW::generateMetrics' advance, which is what decides where
+// the next glyph goes. A GDI measuring mode takes it from
+// GetGdiCompatibleGlyphMetrics and rounds the result; anything else takes it
+// from GetDesignGlyphMetrics and leaves it fractional.
+//
+// The design-metrics branch is the one an ordinary page takes, and it is
+// linear in the text size. That is why Windows advances step by exactly the
+// same amount per pixel of size and a grid-fitted scaler's do not.
+bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                  const uint16_t glyph_id, const windows_path::Decision& decision,
+                  float* advance)
+{
+    if (advance == nullptr) {
+        return false;
+    }
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    if (face == nullptr) {
+        return false;
+    }
+
+    DWRITE_GLYPH_METRICS gm{};
+    UINT16 id = glyph_id;
+    const bool gdi = decision.measuring_mode == windows_path::kMeasureGdiClassic ||
+                     decision.measuring_mode == windows_path::kMeasureGdiNatural;
+    HRESULT hr;
+    if (gdi) {
+        hr = face->GetGdiCompatibleGlyphMetrics(
+            decision.text_size_measure, 1.0f, nullptr,
+            decision.measuring_mode == windows_path::kMeasureGdiNatural ? TRUE : FALSE,
+            &id, 1, &gm);
+    } else {
+        hr = face->GetDesignGlyphMetrics(&id, 1, &gm);
+    }
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    DWRITE_FONT_METRICS dwfm{};
+    face->GetMetrics(&dwfm);
+    if (dwfm.designUnitsPerEm == 0) {
+        return false;
+    }
+
+    float x = decision.text_size_measure * static_cast<float>(gm.advanceWidth) /
+              static_cast<float>(dwfm.designUnitsPerEm);
+    if (gdi) {
+        // DirectWrite produced 'compatible' metrics, but while close, the end
+        // result is not always an integer as it would be with GDI.
+        x = std::round(x);
+    }
+    *advance = x;
+    return true;
+}
+
+// SkScalerContext_DW::generateFontMetrics. Every field is the design value
+// scaled by fTextSizeRender over the design units per em, with ascent
+// negated.
+//
+// Blink then rounds ascent, descent and leading separately before adding them
+// (SimpleFontData::PlatformInit, SetLineSpacing), so a fraction of a pixel of
+// disagreement here becomes a whole pixel of line height.
+bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                 const windows_path::Decision& decision, void* sk_font_metrics)
+{
+    if (sk_font_metrics == nullptr) {
+        return false;
+    }
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    if (face == nullptr) {
+        return false;
+    }
+
+    DWRITE_FONT_METRICS dwfm{};
+    const bool gdi = decision.measuring_mode == windows_path::kMeasureGdiClassic ||
+                     decision.measuring_mode == windows_path::kMeasureGdiNatural;
+    if (gdi) {
+        DWRITE_MATRIX transform{};
+        transform.m11 = 1.0f;
+        transform.m22 = 1.0f;
+        if (FAILED(face->GetGdiCompatibleMetrics(decision.text_size_render, 1.0f, &transform,
+                                                 &dwfm))) {
+            return false;
+        }
+    } else {
+        face->GetMetrics(&dwfm);
+    }
+    if (dwfm.designUnitsPerEm == 0) {
+        return false;
+    }
+
+    auto* m = static_cast<unsigned char*>(sk_font_metrics);
+    const float size = decision.text_size_render;
+    const auto upem = static_cast<float>(dwfm.designUnitsPerEm);
+    const auto scaled = [&](const int design) { return size * static_cast<float>(design) / upem; };
+
+    const float ascent = -scaled(dwfm.ascent);
+    const float descent = scaled(dwfm.descent);
+    const float leading = scaled(dwfm.lineGap);
+    const float x_height = scaled(dwfm.xHeight);
+    const float cap_height = scaled(dwfm.capHeight);
+    const float underline_thickness = scaled(dwfm.underlineThickness);
+    const float underline_position = -scaled(dwfm.underlinePosition);
+    const float strikeout_thickness = scaled(dwfm.strikethroughThickness);
+    const float strikeout_position = -scaled(dwfm.strikethroughPosition);
+
+    std::memcpy(m + skia_abi::kFontMetricsAscent, &ascent, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsDescent, &descent, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsLeading, &leading, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsXHeight, &x_height, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsCapHeight, &cap_height, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsUnderlineThickness, &underline_thickness, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsUnderlinePosition, &underline_position, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsStrikeoutThickness, &strikeout_thickness, sizeof(float));
+    std::memcpy(m + skia_abi::kFontMetricsStrikeoutPosition, &strikeout_position, sizeof(float));
+
+    auto flags = skia_abi::Read<uint32_t>(m, skia_abi::kFontMetricsFlags);
+    flags |= skia_abi::kUnderlineThicknessValid | skia_abi::kUnderlinePositionValid |
+             skia_abi::kStrikeoutThicknessValid | skia_abi::kStrikeoutPositionValid;
+    std::memcpy(m + skia_abi::kFontMetricsFlags, &flags, sizeof(flags));
+
+    // fTop, fBottom, fXMin and fXMax bound the ink rather than the line, and
+    // Skia's own values are already in the struct.
+    return true;
+}
+
+bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                 const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
+                 const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
+                 void* image_buffer)
+{
+    // Only a plain outline glyph. COLRv0, COLRv1 and embedded bitmaps are
+    // drawn by Skia through paths an alpha texture cannot stand in for.
+    if (glyph.scaler_bits != skia_abi::kFontationsPath) {
+        return false;
+    }
+    if (glyph.mask_format == skia_abi::kARGB32 || glyph.width == 0 || glyph.height == 0 ||
+        image_buffer == nullptr) {
+        return false;
+    }
+
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    if (face == nullptr) {
+        return false;
+    }
+
+    // getDWMaskBits: the transform carries the sub-pixel offset, and the run
+    // is one glyph with a zero advance at the origin.
+    DWRITE_MATRIX transform{};
+    transform.m11 = rec.post2x2[0][0];
+    transform.m12 = rec.post2x2[0][1];
+    transform.m21 = rec.post2x2[1][0];
+    transform.m22 = rec.post2x2[1][1];
+    // Skia normalizes the vertical scale into the em size, so the matrix
+    // handed to DirectWrite must not apply it twice.
+    const float y = decision.real_text_size / (rec.text_size != 0 ? rec.text_size : 1.0f);
+    if (y != 0.0f) {
+        transform.m11 /= y;
+        transform.m12 /= y;
+        transform.m21 /= y;
+        transform.m22 /= y;
+    }
+    transform.dx = static_cast<float>(glyph.SubX()) / 4.0f;
+    transform.dy = static_cast<float>(glyph.SubY()) / 4.0f;
+
+    FLOAT advance = 0.0f;
+    UINT16 index = glyph.GlyphId();
+    DWRITE_GLYPH_OFFSET offset{};
+    DWRITE_GLYPH_RUN run{};
+    run.glyphCount = 1;
+    run.glyphAdvances = &advance;
+    run.fontFace = face;
+    run.fontEmSize = decision.text_size_render;
+    run.bidiLevel = 0;
+    run.glyphIndices = &index;
+    run.isSideways = FALSE;
+    run.glyphOffsets = &offset;
+
+    const auto rendering_mode = static_cast<DWRITE_RENDERING_MODE>(decision.rendering_mode);
+    const auto measuring_mode = static_cast<DWRITE_MEASURING_MODE>(decision.measuring_mode);
+    const auto texture_type = static_cast<DWRITE_TEXTURE_TYPE>(decision.texture_type);
+
+    IDWriteGlyphRunAnalysis* analysis = nullptr;
+    HRESULT hr = E_FAIL;
+    // IDWriteFactory2::CreateGlyphRunAnalysis is very bad at aliased glyphs,
+    // so Skia only uses it where it has to - grid fitting off, or grayscale.
+    if (g_dw.factory2 != nullptr &&
+        (decision.grid_fit_mode == windows_path::kGridFitDisabled ||
+         decision.anti_alias_mode == windows_path::kAntiAliasGrayscale)) {
+        hr = g_dw.factory2->CreateGlyphRunAnalysis(
+            &run, &transform, rendering_mode, measuring_mode,
+            static_cast<DWRITE_GRID_FIT_MODE>(decision.grid_fit_mode),
+            static_cast<DWRITE_TEXT_ANTIALIAS_MODE>(decision.anti_alias_mode), 0.0f, 0.0f,
+            &analysis);
+    } else {
+        hr = g_dw.factory5->CreateGlyphRunAnalysis(&run, 1.0f, &transform, rendering_mode,
+                                                   measuring_mode, 0.0f, 0.0f, &analysis);
+    }
+    if (FAILED(hr) || analysis == nullptr) {
+        return false;
+    }
+
+    const size_t pixels = static_cast<size_t>(glyph.width) * glyph.height;
+    const size_t needed = texture_type == windows_path::kTextureClearType3x1 ? pixels * 3 : pixels;
+    std::vector<uint8_t> bits(needed, 0);
+
+    RECT bbox;
+    bbox.left = glyph.left;
+    bbox.top = glyph.top;
+    bbox.right = glyph.left + glyph.width;
+    bbox.bottom = glyph.top + glyph.height;
+
+    hr = analysis->CreateAlphaTexture(texture_type, &bbox, bits.data(),
+                                      static_cast<UINT32>(bits.size()));
+    analysis->Release();
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    // generateDWImage, with the conversions from the bottom of
+    // SkScalerContext_win_dw.cpp. sk_apply_lut_if is the preblend, passing the
+    // value through where the PreBlend is not applicable.
+    const size_t row_bytes = RowBytes(glyph);
+    const uint8_t* src = bits.data();
+    auto* dst8 = static_cast<uint8_t*>(image_buffer);
+
+    if (decision.rendering_mode == windows_path::kRenderAliased) {
+        // BilevelToBW. The aliased texture is one byte per pixel holding 0 or
+        // 0xFF, so masking each source byte with its own destination bit
+        // packs eight pixels at a time.
+        const int width = glyph.width;
+        const size_t dst_rb = (static_cast<size_t>(width) + 7) >> 3;
+        const int byte_count = width >> 3;
+        const int bit_count = width & 7;
+        uint8_t* dst = dst8;
+        for (int y = 0; y < glyph.height; ++y) {
+            for (int i = 0; i < byte_count; ++i) {
+                unsigned byte = 0;
+                byte |= src[0] & (1u << 7);
+                byte |= src[1] & (1u << 6);
+                byte |= src[2] & (1u << 5);
+                byte |= src[3] & (1u << 4);
+                byte |= src[4] & (1u << 3);
+                byte |= src[5] & (1u << 2);
+                byte |= src[6] & (1u << 1);
+                byte |= src[7] & (1u << 0);
+                dst[i] = static_cast<uint8_t>(byte);
+                src += 8;
+            }
+            if (bit_count > 0) {
+                unsigned byte = 0;
+                unsigned mask = 0x80;
+                for (int i = 0; i < bit_count; ++i) {
+                    byte |= src[i] & mask;
+                    mask >>= 1;
+                }
+                dst[byte_count] = static_cast<uint8_t>(byte);
+            }
+            src += bit_count;
+            dst += dst_rb;
+        }
+        return true;
+    }
+
+    if (!IsLcd(rec)) {
+        uint8_t* dst = dst8;
+        if (texture_type == windows_path::kTextureAliased1x1) {
+            // GrayscaleToA8
+            for (int y = 0; y < glyph.height; ++y) {
+                for (int i = 0; i < glyph.width; ++i) {
+                    dst[i] = ApplyLut(*src++, preblend.g);
+                }
+                dst += row_bytes;
+            }
+        } else {
+            // RGBToA8: the three subpixels averaged, then the green table.
+            for (int y = 0; y < glyph.height; ++y) {
+                for (int i = 0; i < glyph.width; ++i) {
+                    const unsigned r = *src++;
+                    const unsigned g = *src++;
+                    const unsigned b = *src++;
+                    dst[i] = ApplyLut(static_cast<uint8_t>((r + g + b) / 3), preblend.g);
+                }
+                dst += row_bytes;
+            }
+        }
+        return true;
+    }
+
+    // RGBToLcd16, which needs the ClearType texture and a matching mask.
+    if (texture_type != windows_path::kTextureClearType3x1 ||
+        glyph.mask_format != skia_abi::kLCD16) {
+        return false;
+    }
+    const bool rgb = (rec.flags & skia_abi::kLCD_BGROrder) == 0;
+    for (int y = 0; y < glyph.height; ++y) {
+        auto* dst = reinterpret_cast<uint16_t*>(dst8 + static_cast<size_t>(y) * row_bytes);
+        for (int i = 0; i < glyph.width; ++i) {
+            uint8_t r, g, b;
+            if (rgb) {
+                r = ApplyLut(*src++, preblend.r);
+                g = ApplyLut(*src++, preblend.g);
+                b = ApplyLut(*src++, preblend.b);
+            } else {
+                b = ApplyLut(*src++, preblend.b);
+                g = ApplyLut(*src++, preblend.g);
+                r = ApplyLut(*src++, preblend.r);
+            }
+            dst[i] = Pack888ToRGB16(r, g, b);
+        }
+    }
+    return true;
+}
+
+}  // namespace dwrite_raster

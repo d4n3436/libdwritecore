@@ -40,6 +40,10 @@
 //  the matching questions in the FcFontSort block below. Whether any of them
 //  is answered at all is decided by Answering, below.
 //
+//  FcFontSort is also exported by libchromium-vtable-patch.so, where it only
+//  watches which family carries which charset rather than substituting a
+//  pattern. Preloading both into one process is not supported, since whichever
+//  LD_PRELOAD names first takes the symbol. See chromium/src/fallback_order.cpp.
 //----------------------------------------------------------------------------
 
 #include <cstdio>
