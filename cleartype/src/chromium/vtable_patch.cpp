@@ -571,6 +571,9 @@ constexpr uint32_t kFvarTag = 0x66766172;
 // context's.
 constexpr uint32_t kColrTag = 0x434F4C52;
 
+// How far apart two functions from one source file can sit.
+constexpr uintptr_t kSameFileSpan = 0x80000;
+
 // FT_GLYPH_FORMAT_OUTLINE. A build predating the Rust bridge rasterizes with
 // a FreeType compiled into it, and SkScalerContext_FreeType::generateMetrics
 // tests the loaded glyph against this format
@@ -587,16 +590,41 @@ constexpr unsigned kColrToTableTags = 14;
 // between revisions; this pair has not.
 constexpr unsigned kColrToFilterRec = 6;
 
+// Where that virtual sits in a Fontations typeface vtable. Unrelated tables
+// hold the tag too, and the index tells them apart.
+constexpr size_t kColrSlot = 15;
+
+// Virtuals that reach the COLR tag, directly or through the SkOnce lambda.
+std::vector<uintptr_t> g_colr_sites;
+std::vector<uintptr_t> g_vt_starts;
+std::vector<uintptr_t> g_colr_fns;
+
 // Patch onFilterRec on the typeface vtable a COLR-holding virtual belongs to.
 // This is what an older build gets: its scaler context cannot be named, but
 // the render params still reach every scaler context Skia builds.
-void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
-                             const std::vector<uintptr_t>& colr_sites)
+bool PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
+                             const std::vector<uintptr_t>& colr_sites,
+                             const size_t want_index)
 {
     if (colr_sites.empty()) {
-        return;
+        return false;
     }
     const auto holds = [&](const uintptr_t fn) {
+        if (std::ranges::binary_search(g_colr_fns, fn)) {
+            return true;
+        }
+        // A tag anywhere before the next function a vtable names counts. It
+        // can sit past a branch, outside the site's own function.
+        if (!g_vt_starts.empty()) {
+            const auto next = std::ranges::upper_bound(g_vt_starts, fn);
+            const uintptr_t stop = next != g_vt_starts.end()
+                                       ? *next
+                                       : reinterpret_cast<uintptr_t>(image.text[0].end);
+            const auto at = std::ranges::lower_bound(g_colr_sites, fn);
+            if (at != g_colr_sites.end() && *at < stop) {
+                return true;
+            }
+        }
         const auto it = std::ranges::lower_bound(colr_sites, fn);
         for (auto s = it; s != colr_sites.end() && *s < fn + 0x20000; ++s) {
             if (const size_t i = map.IndexOf(*s);
@@ -622,7 +650,7 @@ void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
             continue;
         }
         const auto index = static_cast<size_t>(p - reinterpret_cast<uintptr_t*>(base));
-        if (index < kColrToFilterRec) {
+        if (index < kColrToFilterRec || (want_index != 0 && index != want_index)) {
             continue;
         }
         void** slot = base + (index - kColrToFilterRec);
@@ -657,9 +685,11 @@ void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
     // same virtual. That is expected; what is not is two different functions
     // answering to the tag, which would mean the wrong class is in the set.
     if (chosen == nullptr || mixed) {
-        Report("%u typeface vtables hold the COLR tag%s; not applying the render "
-               "params through them", found, mixed ? ", naming different virtuals" : "");
-        return;
+        if (want_index == 0) {
+            Report("%u typeface vtables hold the COLR tag%s; not applying the render "
+                   "params through them", found, mixed ? ", naming different virtuals" : "");
+        }
+        return false;
     }
     g_original_filter_rec = *chosen;
     unsigned written = 0;
@@ -676,6 +706,7 @@ void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
     } else {
         g_original_filter_rec = nullptr;
     }
+    return written != 0;
 }
 
 // SkFontationsScalerContext answers per-glyph questions from generateMetrics
@@ -684,8 +715,9 @@ void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
 constexpr unsigned kRecognizeFirst = 2;    // generateMetrics
 constexpr unsigned kRecognizeSecond = 6;   // generateFontMetrics
 
-std::vector<uintptr_t> g_colr_sites;
-std::vector<uintptr_t> g_vt_starts;
+// generateImage's place in that table, which is where chosen_slot points.
+constexpr unsigned kScalerImageSlot = 3;
+
 std::atomic g_typeface_resolved{false};
 
 // The typeface vtable, taken off a live scaler context rather than searched
@@ -720,6 +752,9 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
     auto* slots = reinterpret_cast<uintptr_t*>(base);
 
     const auto holds_colr = [&](const uintptr_t fn) {
+        if (std::ranges::binary_search(g_colr_fns, fn)) {
+            return true;
+        }
         const auto next = std::ranges::upper_bound(g_vt_starts, fn);
         const uintptr_t stop = next != g_vt_starts.end()
                                    ? *next
@@ -735,9 +770,31 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         if (!InText(g_image, slots[i]) || !holds_colr(slots[i])) {
             continue;
         }
-        const size_t tags_at = i + kColrToTableTags;
-        if (reinterpret_cast<unsigned char*>(slots + tags_at + 2) > g_image.relro.end ||
-            !InText(g_image, slots[tags_at]) || !InText(g_image, slots[tags_at + 1])) {
+        // How far the table calls sit past this virtual moves between Skia
+        // revisions, so the slot answers for itself. SkTypeface's getTableSize
+        // is onGetTableData(tag, 0, ~0U, nullptr), and head is 54 bytes in
+        // every font.
+        constexpr uint32_t kHeadTag = 0x68656164;
+        constexpr size_t kHeadSize = 54;
+        // Only the distances Skia has used, newest first. A wider sweep
+        // would call virtuals that take a pointer where the tag goes.
+        constexpr size_t kTableDistances[] = {kColrToTableTags, 12};
+        size_t tags_at = 0;
+        for (const size_t d : kTableDistances) {
+            const size_t at = i + d;
+            if (reinterpret_cast<unsigned char*>(slots + at + 2) > g_image.relro.end) {
+                break;
+            }
+            if (!InText(g_image, slots[at]) || !InText(g_image, slots[at + 1])) {
+                continue;
+            }
+            const auto probe = reinterpret_cast<GetTableDataFn>(slots[at + 1]);
+            if (probe(typeface, kHeadTag, 0, ~0U, nullptr) == kHeadSize) {
+                tags_at = at;
+                break;
+            }
+        }
+        if (tags_at == 0) {
             return;
         }
         const std::vector<uintptr_t> tag_fns{slots[tags_at]};
@@ -749,15 +806,130 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         Report("typeface vtable %p resolved from a live scaler context: "
                "onGetTableTags slot %zu, onGetTableData %zu",
                static_cast<void*>(base), tags_at, tags_at + 1);
-        // The vtable is not written here. By the time a scaler context exists
-        // Skia is already dispatching through this table, and replacing a slot
-        // underneath it takes the renderer down. Nothing needs the write: the
-        // bridge reads the tables through the slots it was just told about,
-        // and the rec is adjusted where it is reached instead.
-        (void)may_patch;
+        // The table slots are left alone. Skia dispatches through them while
+        // a scaler context is alive, and the bridge reads the tables through
+        // the slots it was told about.
+        //
+        // onFilterRec is read when a scaler context is built, so writing it
+        // reaches every context made after this.
+        if (may_patch && g_original_filter_rec == nullptr) {
+            if (void** slot = reinterpret_cast<void**>(base) + kFilterRecSlot;
+                InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
+                g_original_filter_rec = *slot;
+                if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
+                    Report("onFilterRec %p replaced through the live typeface vtable",
+                           g_original_filter_rec);
+                } else {
+                    g_original_filter_rec = nullptr;
+                }
+            }
+        }
+        // onGetTableData hides VDMX, which Blink otherwise takes a font's
+        // ascent and descent from. The write is one aligned pointer, so a call
+        // in flight sees the old function or the new.
+        if (may_patch && g_original_get_table_data == nullptr) {
+            if (auto* slot = reinterpret_cast<void**>(slots + tags_at + 1);
+                InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
+                g_original_get_table_data = reinterpret_cast<GetTableDataFn>(*slot);
+                if (WriteSlot(slot, reinterpret_cast<void*>(&ChromiumGetTableData))) {
+                    Report("onGetTableData %p replaced through the live typeface "
+                           "vtable; VDMX will report as absent, as it does on Windows",
+                           reinterpret_cast<void*>(g_original_get_table_data));
+                } else {
+                    g_original_get_table_data = nullptr;
+                }
+            }
+        }
         return;
     }
     Report("no slot of the live typeface vtable holds the COLR tag");
+}
+
+// The address a rip-relative lea reaches, which is how position-independent
+// code names a vtable.
+bool LeaTarget(const unsigned char* q, uintptr_t* target)
+{
+    if (q[0] != 0x48 || q[1] != 0x8D || (q[2] & 0xC7) != 0x05) {
+        return false;
+    }
+    int32_t disp = 0;
+    std::memcpy(&disp, q + 3, sizeof(disp));
+    *target = reinterpret_cast<uintptr_t>(q + 7) + static_cast<uintptr_t>(disp);
+    return true;
+}
+
+// Find the typeface through the scaler context it builds.
+// SkTypeface_Fontations::onCreateScalerContext names that vtable's address, so
+// the vtable entry holding that function is the typeface's.
+bool PatchTypefaceByScalerRef(const Image& image, const CodeMap& map, const uintptr_t sc_vptr)
+{
+    std::vector<uintptr_t> makers;
+    for (unsigned s = 0; s < image.text_count; ++s) {
+        const Region& r = image.text[s];
+        for (const unsigned char* q = r.begin; q + 7 <= r.end; ++q) {
+            uintptr_t target = 0;
+            if (!LeaTarget(q, &target) || target != sc_vptr) {
+                continue;
+            }
+            if (const size_t i = map.IndexOf(reinterpret_cast<uintptr_t>(q));
+                i != static_cast<size_t>(-1)) {
+                makers.push_back(map.starts[i]);
+            }
+        }
+    }
+    std::ranges::sort(makers);
+    makers.erase(std::ranges::unique(makers).begin(), makers.end());
+    if (makers.empty()) {
+        return false;
+    }
+
+    const auto holds_colr = [&](const uintptr_t fn) {
+        if (std::ranges::binary_search(g_colr_fns, fn)) {
+            return true;
+        }
+        const auto next = std::ranges::upper_bound(g_vt_starts, fn);
+        const uintptr_t stop = next != g_vt_starts.end()
+                                   ? *next
+                                   : reinterpret_cast<uintptr_t>(image.text[0].end);
+        const auto it = std::ranges::lower_bound(g_colr_sites, fn);
+        return it != g_colr_sites.end() && *it < stop;
+    };
+
+    unsigned patched = 0;
+    auto* p = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.begin));
+    auto* end = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.end));
+    for (; p + 1 <= end; ++p) {
+        if (!InText(image, *p) || !std::ranges::binary_search(makers, *p)) {
+            continue;
+        }
+        auto* base = VtableBaseFrom(image, reinterpret_cast<void**>(p));
+        if (base == nullptr) {
+            continue;
+        }
+        auto* slots = reinterpret_cast<uintptr_t*>(base);
+        void** data_slot = nullptr;
+        for (unsigned i = 0; i < typeface_bridge::kMaxSlotSearched; ++i) {
+            if (reinterpret_cast<unsigned char*>(slots + i + 1) > image.relro.end) {
+                break;
+            }
+            if (!InText(image, slots[i]) || !holds_colr(slots[i])) {
+                continue;
+            }
+            const size_t tags_at = i + kColrToTableTags;
+            if (reinterpret_cast<unsigned char*>(slots + tags_at + 2) <= image.relro.end &&
+                InText(image, slots[tags_at + 1])) {
+                data_slot = reinterpret_cast<void**>(slots + tags_at + 1);
+            }
+            break;
+        }
+        // A subclass that overrides nothing gets its own table, and the
+        // typeface Skia hands out may be of that subclass.
+        Report("typeface vtable %p found by the scaler context it builds",
+               static_cast<void*>(base));
+        PatchTypefaceSlots(base, data_slot);
+        ++patched;
+    }
+    return patched != 0;
 }
 
 void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum,
@@ -901,6 +1073,30 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
             }
         }
         std::ranges::sort(g_colr_sites);
+        // The tag is loaded inside the SkOnce lambda
+        // onGlyphMaskNeedsCurrentColor runs, which some builds keep as its own
+        // function, so a virtual that only calls the holder counts as well.
+        std::vector<uintptr_t> holders;
+        for (const uintptr_t site : g_colr_sites) {
+            if (const auto it = std::ranges::upper_bound(starts_seed, site);
+                it != starts_seed.begin()) {
+                holders.push_back(*std::prev(it));
+            }
+        }
+        std::ranges::sort(holders);
+        holders.erase(std::ranges::unique(holders).begin(), holders.end());
+        g_colr_fns = holders;
+        ForEachCall(image, [&](const uintptr_t site, const uintptr_t target) {
+            if (!std::ranges::binary_search(holders, target)) {
+                return;
+            }
+            if (const auto it = std::ranges::upper_bound(starts_seed, site);
+                it != starts_seed.begin()) {
+                g_colr_fns.push_back(*std::prev(it));
+            }
+        });
+        std::ranges::sort(g_colr_fns);
+        g_colr_fns.erase(std::ranges::unique(g_colr_fns).begin(), g_colr_fns.end());
         const auto* w = reinterpret_cast<const uintptr_t*>(image.relro.begin);
         for (const auto* w_end = reinterpret_cast<const uintptr_t*>(image.relro.end);
              w + 1 <= w_end; ++w) {
@@ -1036,7 +1232,9 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
                 }
             }
             std::ranges::sort(colr);
-            PatchFilterRecByColrTag(image, map, colr);
+            if (!PatchFilterRecByColrTag(image, map, colr, kColrSlot)) {
+                PatchFilterRecByColrTag(image, map, colr, 0);
+            }
         }
         return;
     }
@@ -1049,7 +1247,31 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     // precedes the call site, since the dense start set has entries inside
     // large functions. Each vtable-referenced address is asked instead whether
     // an anchor call falls inside it.
-    {
+    if (syms.empty()) {
+        // Nothing is exported to anchor on, so the typeface is recognized by
+        // the COLR tag its onGlyphMaskNeedsCurrentColor loads. Unrelated code
+        // holds that tag, so only the sites near the scaler context the fvar
+        // tag found are considered.
+        std::vector<uintptr_t> near_fontations;
+        for (const uintptr_t site : g_colr_sites) {
+            const auto it = std::ranges::lower_bound(fvar_sites, site);
+            const bool close =
+                (it != fvar_sites.end() && *it - site < kSameFileSpan) ||
+                (it != fvar_sites.begin() && site - *std::prev(it) < kSameFileSpan);
+            if (close) {
+                near_fontations.push_back(site);
+            }
+        }
+        if (chromium_patch::ParityWanted()) {
+            const auto sc_vptr = reinterpret_cast<uintptr_t>(chosen_slot - kScalerImageSlot);
+            const std::vector<uintptr_t>& sites =
+                near_fontations.empty() ? g_colr_sites : near_fontations;
+            if (!PatchFilterRecByColrTag(image, map, sites, kColrSlot) &&
+                !PatchTypefaceByScalerRef(image, map, sc_vptr)) {
+                PatchFilterRecByColrTag(image, map, sites, 0);
+            }
+        }
+    } else {
         uintptr_t tag_sym = 0;
         uintptr_t data_sym = 0;
         for (const FfiSymbol& s : syms) {
@@ -1529,7 +1751,9 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
 // a pixel here lands as a whole pixel of line height.
 void OnChromiumFontMetrics(void* context, void* metrics)
 {
-    ResolveTypefaceFromContext(context, false);
+    // Blink reads VDMX while it builds the font, so the patch has to land
+    // here and not at the first glyph.
+    ResolveTypefaceFromContext(context, true);
 
 
     if (context == nullptr || metrics == nullptr || !chromium_patch::ParityWanted()) {

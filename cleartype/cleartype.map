@@ -60,6 +60,13 @@
     /* Not FreeType: which font covers a character, answered per character so
        Chromium's fallback reaches the family Windows' table names. */
     FcCharSetHasChar;
+
+    /* Not FreeType: the per-script generic families are compiled into
+       Chromium's resource bundle, so the bundle is edited as it is mapped.
+       Anything that is not a read-only shared mapping of a .pak passes
+       straight through. See src/chromium/generic_families.cpp. */
+    mmap;
+    mmap64;
   local:
     *;
 };

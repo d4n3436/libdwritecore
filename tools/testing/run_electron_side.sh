@@ -10,9 +10,12 @@
 # shell that launched it and pattern-matching for it does not work: a pgrep
 # for the binary path also matches the very command line that starts it.
 #
-# The window is sized by the app itself (see the app's main.js): Electron does
-# not implement Chromium's Browser domain, so the DevTools side cannot resize
-# it and instead verifies the size it was given.
+# electron-app beside this script is the app to point it at, and the same one
+# belongs on the other machine.
+#
+# The window is sized by the app itself, in electron-app/main.js. Electron does
+# not implement Chromium's Browser domain, so the DevTools side verifies the
+# size it was given and does not set it.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

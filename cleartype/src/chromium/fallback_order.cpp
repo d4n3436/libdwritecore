@@ -171,16 +171,12 @@ const ScriptFonts kScripts[] = {
 
 
 // Which list unified Han resolves to, mirroring
-// LayoutLocale::GetSystem().GetScriptForHan(), which font_fallback_win.cc
+// LayoutLocale::LocaleForHan()->GetScriptForHan(), which font_fallback_win.cc
 // calls when it fills USCRIPT_HAN.
 //
-// layout_locale.cc takes the system locale from icu::Locale::getDefault() and
-// ComputeScriptForHan asks locale_to_script_mapping.cc's
+// layout_locale.cc's ComputeScriptForHan asks locale_to_script_mapping.cc's
 // ScriptCodeForHanFromSubtags, which walks the subtags and takes the first
 // that disambiguates: a two-letter region, or a four-letter script name.
-// Nothing conclusive leaves it at simplified Han.
-//
-// The environment is read as ICU reads it, LC_ALL before LC_CTYPE before LANG.
 struct HanChoice
 {
     const char* subtag;
@@ -188,15 +184,11 @@ struct HanChoice
     unsigned count;
 };
 
-const char* const* HanFamilies(unsigned* count)
+// Null when the locale settles nothing, which is HasScriptForHan() answering
+// false. ComputeScriptForHan falls back to simplified Han there but leaves
+// has_script_for_han_ clear, and LocaleForHan tests that flag.
+const char* const* HanForLocale(const char* locale, unsigned* count)
 {
-    static const char* const* chosen = nullptr;
-    static unsigned chosen_count = 0;
-    if (chosen != nullptr) {
-        *count = chosen_count;
-        return chosen;
-    }
-
     // ScriptCodeForHanFromRegion, plus the four-letter script names
     // IsUnambiguousHanScript accepts.
     static const HanChoice kChoices[] = {
@@ -210,7 +202,56 @@ const char* const* HanFamilies(unsigned* count)
         {"jpan", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
         {"kore", kHangul, DWC_COUNT(kHangul)},
     };
+    if (locale == nullptr) {
+        return nullptr;
+    }
 
+    // The language subtag itself decides only when it is already an
+    // unambiguous Han script. ja and ko are, zh is not.
+    char head[8] = {};
+    unsigned n = 0;
+    while (n + 1 < sizeof(head) && locale[n] != '\0' && locale[n] != '-' &&
+           locale[n] != '_' && locale[n] != '.' && locale[n] != '@') {
+        head[n] = static_cast<char>(tolower(static_cast<unsigned char>(locale[n])));
+        ++n;
+    }
+    if (std::strcmp(head, "ja") == 0) {
+        *count = DWC_COUNT(kKatakanaOrHiragana);
+        return kKatakanaOrHiragana;
+    }
+    if (std::strcmp(head, "ko") == 0) {
+        *count = DWC_COUNT(kHangul);
+        return kHangul;
+    }
+
+    // Then the subtags after it, first one that disambiguates.
+    for (const char* p = locale; *p != '\0' && *p != '.' && *p != '@';) {
+        if (*p != '-' && *p != '_') {
+            ++p;
+            continue;
+        }
+        ++p;
+        char sub[8] = {};
+        unsigned k = 0;
+        while (k + 1 < sizeof(sub) && p[k] != '\0' && p[k] != '-' &&
+               p[k] != '_' && p[k] != '.' && p[k] != '@') {
+            sub[k] = static_cast<char>(tolower(static_cast<unsigned char>(p[k])));
+            ++k;
+        }
+        for (const HanChoice& c : kChoices) {
+            if (std::strcmp(sub, c.subtag) == 0) {
+                *count = c.count;
+                return c.families;
+            }
+        }
+        p += k;
+    }
+    return nullptr;
+}
+
+// The environment is read as ICU reads it, LC_ALL before LC_CTYPE before LANG.
+const char* const* SystemHan(unsigned* count)
+{
     const char* env = std::getenv("LC_ALL");
     if (env == nullptr || env[0] == '\0') {
         env = std::getenv("LC_CTYPE");
@@ -218,75 +259,43 @@ const char* const* HanFamilies(unsigned* count)
     if (env == nullptr || env[0] == '\0') {
         env = std::getenv("LANG");
     }
-
-    chosen = kSimplifiedHan;
-    chosen_count = DWC_COUNT(kSimplifiedHan);
-    if (env != nullptr) {
-        // The language subtag itself decides only when it is already an
-        // unambiguous Han script: ja and ko are, zh is not.
-        char head[8] = {};
-        unsigned n = 0;
-        while (n + 1 < sizeof(head) && env[n] != '\0' && env[n] != '-' &&
-               env[n] != '_' && env[n] != '.' && env[n] != '@') {
-            head[n] = static_cast<char>(tolower(static_cast<unsigned char>(env[n])));
-            ++n;
-        }
-        if (std::strcmp(head, "ja") == 0) {
-            chosen = kKatakanaOrHiragana;
-            chosen_count = DWC_COUNT(kKatakanaOrHiragana);
-        } else if (std::strcmp(head, "ko") == 0) {
-            chosen = kHangul;
-            chosen_count = DWC_COUNT(kHangul);
-        } else {
-            // Then the subtags after it, first one that disambiguates.
-            for (const char* p = env; *p != '\0' && *p != '.' && *p != '@';) {
-                if (*p != '-' && *p != '_') {
-                    ++p;
-                    continue;
-                }
-                ++p;
-                char sub[8] = {};
-                unsigned k = 0;
-                while (k + 1 < sizeof(sub) && p[k] != '\0' && p[k] != '-' &&
-                       p[k] != '_' && p[k] != '.' && p[k] != '@') {
-                    sub[k] = static_cast<char>(tolower(static_cast<unsigned char>(p[k])));
-                    ++k;
-                }
-                bool done = false;
-                for (const HanChoice& c : kChoices) {
-                    if (std::strcmp(sub, c.subtag) == 0) {
-                        chosen = c.families;
-                        chosen_count = c.count;
-                        done = true;
-                        break;
-                    }
-                }
-                if (done) {
-                    break;
-                }
-                p += k;
-            }
-        }
-    }
-    *count = chosen_count;
-    return chosen;
+    return HanForLocale(env, count);
 }
 
-const ScriptFonts* ScriptFor(const unsigned codepoint)
+// How initializeScriptFontMap seeds USCRIPT_HAN, from the system locale
+// alone. GetFallbackFamily narrows that per call with the run's own language,
+// which is not mirrored here. That language reaches fontconfig only as FC_LANG
+// on the pattern Chromium sorts with, and the charset walk that reads the
+// sorted set carries no language.
+const char* const* HanFamilies(unsigned* count)
+{
+    if (const char* const* families = SystemHan(count)) {
+        return families;
+    }
+    *count = DWC_COUNT(kSimplifiedHan);
+    return kSimplifiedHan;
+}
+
+struct FamilyList
+{
+    const char* const* families;
+    unsigned count;
+};
+
+FamilyList ScriptFor(const unsigned codepoint)
 {
     for (const ScriptFonts& s : kScripts) {
         if (codepoint < s.first || codepoint > s.last) {
             continue;
         }
         if (s.families != kSimplifiedHan) {
-            return &s;
+            return {s.families, s.count};
         }
-        static ScriptFonts han{};
-        han = s;
-        han.families = HanFamilies(&han.count);
-        return &han;
+        unsigned count = 0;
+        const char* const* families = HanFamilies(&count);
+        return {families, count};
     }
-    return nullptr;
+    return {nullptr, 0};
 }
 
 // Which families the last sorts turned up, and the charset of each. Small and
@@ -353,8 +362,8 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
     if (!chromium_patch::ParityWanted() || answer == 0) {
         return answer;          // a miss stays a miss
     }
-    const ScriptFonts* script = ScriptFor(codepoint);
-    if (script == nullptr) {
+    const FamilyList script = ScriptFor(codepoint);
+    if (script.families == nullptr) {
         return answer;
     }
     const char* mine = FamilyOf(charset);
@@ -362,15 +371,15 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         return answer;          // not a font from a fallback sort
     }
     // The first candidate that exists and actually covers this character.
-    for (unsigned i = 0; i < script->count; ++i) {
-        if (!ShipsWithWindows(script->families[i])) {
+    for (unsigned i = 0; i < script.count; ++i) {
+        if (!ShipsWithWindows(script.families[i])) {
             continue;
         }
-        if (const void* candidate = CharSetOfFamily(script->families[i]);
+        if (const void* candidate = CharSetOfFamily(script.families[i]);
             candidate == nullptr || real(candidate, codepoint) == 0) {
             continue;
         }
-        return strcasecmp(mine, script->families[i]) == 0 ? 1 : 0;
+        return strcasecmp(mine, script.families[i]) == 0 ? 1 : 0;
     }
     return answer;              // none of them, so leave fontconfig's answer
 }
