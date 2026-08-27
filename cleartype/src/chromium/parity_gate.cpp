@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "../parity_mode.h"
+
 namespace chromium_patch {
 
 bool ParityWanted()
@@ -11,6 +13,9 @@ bool ParityWanted()
     // Blink caches render params per font, so the answer must not change
     // partway through the process.
     static const bool wanted = [] {
+        if (!dwcft::Enabled()) {
+            return false;
+        }
         const char* v = std::getenv("CHROMIUM_PATCH_DWRITE");
         return v != nullptr && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0);
     }();

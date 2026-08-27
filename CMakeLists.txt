@@ -459,22 +459,6 @@ int main() { FT_GlyphSlotRec slot; (void)slot.glyph_index; return 0; }
 endif()
 
 # ---------------------------------------------------------------------------
-# The Chromium/Electron vtable-patch prototype
-#
-# Off by default as it targets a mechanism (see chromium/src/vtable_patch.cpp),
-# not a finished parity path, and its own vtable-slot selection is specific
-# to the fontations_ffi bridge that only exists in a Chromium/Electron build.
-# ---------------------------------------------------------------------------
-
-option(DWRITECORE_BUILD_CHROMIUM_PROTOTYPE
-  "Build the experimental Chromium/Electron vtable-patch prototype" OFF)
-
-if(DWRITECORE_BUILD_CHROMIUM_PROTOTYPE)
-  enable_language(ASM)
-  add_subdirectory(chromium)
-endif()
-
-# ---------------------------------------------------------------------------
 # Installing.
 #
 # Both files go into one directory: the shim has libdwritecore.so in its

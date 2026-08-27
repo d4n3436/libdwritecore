@@ -912,17 +912,23 @@ void ScanLoadedImages()
         return;
     }
     if (chromium_patch::ParityWanted() && IsBrowserProcess()) {
+        // The main executable only, which is where Chromium keeps this
+        // function whichever scaler it was built with. Looking more widely
+        // would reach fontconfig's own copies of the same property names.
+        //
+        // No Fontations symbols are required here. This patch names its target
+        // by the properties it reads and refuses when no single function reads
+        // them all, so it applies equally to a build whose scaler is FreeType
+        // and carries no Rust bridge at all.
         ModuleList browser;
         dl_iterate_phdr(CollectModule, &browser);
         for (unsigned i = 0; i < browser.count; ++i) {
             const LoadedModule& m = browser.mods[i];
-            const char* path =
-                (m.name != nullptr && m.name[0] != '\0') ? m.name : "/proc/self/exe";
-            std::vector<FfiSymbol> syms;
-            if (FindFfiSymbols(path, "fontations_ffi", &syms) && syms.size() >= 10) {
-                render_params_patch::Apply(m.base, m.phdr, m.phnum);
-                break;
+            if (m.name != nullptr && m.name[0] != '\0') {
+                continue;
             }
+            render_params_patch::Apply(m.base, m.phdr, m.phnum);
+            break;
         }
         return;
     }

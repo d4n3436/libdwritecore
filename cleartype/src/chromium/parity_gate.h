@@ -5,9 +5,9 @@
 //  Off unless asked for. With it off nothing here touches a typeface,
 //  answers a fontconfig query or reorders fallback.
 //
-//  Separate from dwcft::Enabled() in cleartype/src/parity_mode.h, which gates
-//  the Firefox interposer and has to detect Gecko. This library is preloaded
-//  deliberately, so the only question is whether the user asked.
+//  CLEARTYPE=0 turns this off with everything else in the library. Past that
+//  it is its own switch and not dwcft::ParityActive(), which asks whether the
+//  process is Gecko. The answer here is only whether the user asked.
 //
 //----------------------------------------------------------------------------
 

@@ -40,10 +40,9 @@
 //  the matching questions in the FcFontSort block below. Whether any of them
 //  is answered at all is decided by Answering, below.
 //
-//  FcFontSort is also exported by libchromium-vtable-patch.so, where it only
-//  watches which family carries which charset rather than substituting a
-//  pattern. Preloading both into one process is not supported, since whichever
-//  LD_PRELOAD names first takes the symbol. See chromium/src/fallback_order.cpp.
+//  The Chromium half of this library needs the same FcFontSort, to learn which
+//  family carries which charset. It only watches, so this one calls into
+//  src/chromium/fallback_order.cpp with the sorted set.
 //----------------------------------------------------------------------------
 
 #include <cstdio>
@@ -58,6 +57,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include "chromium/fallback_order.h"
 #include "parity_mode.h"
 #include "shim_exports.h"
 #include "windows_fonts.h"
@@ -648,6 +648,9 @@ FcFontSet* FcFontSort(FcConfig* config, FcPattern* pattern, const FcBool trim,
     if (copy != nullptr && destroy != nullptr) {
         destroy(copy);
     }
+    // The Chromium half watches the result to learn which family carries which
+    // charset. It substitutes nothing, so it runs after the sort either way.
+    fallback_order::NoteFontSet(pattern, set);
     return set;
 }
 

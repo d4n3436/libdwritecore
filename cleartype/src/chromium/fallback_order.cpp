@@ -27,11 +27,6 @@
 //  Everything else is passed through, so fontconfig still decides what is
 //  installed and what covers what.
 //
-//  FcFontSort is also exported by libcleartype.so, which substitutes a Windows
-//  pattern there rather than watching, so preloading both libraries into one
-//  process is unsupported. Whichever LD_PRELOAD names first takes the symbol
-//  and the other's behavior is gone with no diagnostic.
-//
 //----------------------------------------------------------------------------
 
 #include <cstdio>
@@ -305,23 +300,25 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
     return answer;              // none of them, so leave fontconfig's answer
 }
 
-extern "C" __attribute__((visibility("default")))
-FcFontSet* FcFontSort(void* config, void* pattern, int trim, void** csp, int* result)
+namespace fallback_order {
+
+// Called from cleartype/src/fontconfig.cpp's FcFontSort, on the set the real
+// one returned. Both halves of this library wanted that symbol and only one
+// can define it, so the Firefox side keeps the interposer and hands the
+// result here.
+void NoteFontSet(const void* pattern, void* sorted)
 {
-    static const auto real = Sym<FontSortFn>("FcFontSort");
-    if (real == nullptr) {
-        return nullptr;
-    }
-    FcFontSet* set = real(config, pattern, trim, csp, result);
-    if (!chromium_patch::ParityWanted() || set == nullptr || set->nfont <= 1 || pattern == nullptr) {
-        return set;
+    auto* set = static_cast<FcFontSet*>(sorted);
+    if (!chromium_patch::ParityWanted() || set == nullptr || set->nfont <= 1 ||
+        pattern == nullptr) {
+        return;
     }
 
     // Only learning here. The choice is made per character, above.
     static const auto get_charset = Sym<PatternGetCharSetFn>("FcPatternGetCharSet");
     static const auto get_string = Sym<PatternGetStringFn>("FcPatternGetString");
     if (get_charset == nullptr || get_string == nullptr) {
-        return set;
+        return;
     }
     for (int i = 0; i < set->nfont; ++i) {
         void* charset = nullptr;
@@ -331,5 +328,6 @@ FcFontSet* FcFontSort(void* config, void* pattern, int trim, void** csp, int* re
             Remember(charset, reinterpret_cast<const char*>(family));
         }
     }
-    return set;
 }
+
+}  // namespace fallback_order

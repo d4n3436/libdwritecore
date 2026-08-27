@@ -1,11 +1,27 @@
 find_package(Threads REQUIRED)
 
+# The Chromium half needs an assembler for its vtable thunks.
+enable_language(ASM)
+
 add_library(cleartype SHARED
   src/freetype.cpp
   src/libxul_patch.cpp
   src/fontconfig.cpp
   src/prefs.cpp
-  src/parity_mode.cpp)
+  src/parity_mode.cpp
+  # Chromium, Electron and the Electron applications. Gecko is patched
+  # through libxul_patch.cpp above; these reach Skia's scaler context
+  # instead. See src/chromium/vtable_patch.cpp.
+  src/chromium/vtable_patch.cpp
+  src/chromium/windows_path.cpp
+  src/chromium/typeface_bridge.cpp
+  src/chromium/font_facts.cpp
+  src/chromium/dwrite_raster.cpp
+  src/chromium/parity_gate.cpp
+  src/chromium/render_params.cpp
+  src/chromium/render_params_patch.cpp
+  src/chromium/fallback_order.cpp
+  src/chromium/hook_thunk.S)
 
 # OFF leaves the parity paths out altogether, for a plain FreeType-to-
 # DirectWrite interposer. ON compiles them in; they still apply only to a Gecko
@@ -14,12 +30,20 @@ option(DWRITECORE_FIREFOX_PARITY
   "Reproduce Firefox-on-Windows glyph advances, metrics and synthetic oblique" ON)
 
 target_compile_definitions(cleartype
-  PRIVATE DWRITECORE_FIREFOX_PARITY=$<BOOL:${DWRITECORE_FIREFOX_PARITY}>)
+  PRIVATE DWRITECORE_FIREFOX_PARITY=$<BOOL:${DWRITECORE_FIREFOX_PARITY}>
+  # IDWriteFactory5 for the in-memory font file loader and IDWriteFactory2 for
+  # the grid-fit and antialias arguments to CreateGlyphRunAnalysis are gated in
+  # dwrite_3.h behind DWRITE_CORE or a Windows 10 NTDDI version.
+  PRIVATE DWRITE_CORE=1)
 
 target_link_libraries(cleartype
   PRIVATE dwritecore ${DWRITECORE_FREETYPE} Threads::Threads ${CMAKE_DL_LIBS})
 
-target_include_directories(cleartype PRIVATE "${CMAKE_BINARY_DIR}/generated")
+target_include_directories(cleartype
+  PRIVATE "${CMAKE_BINARY_DIR}/generated"
+  # src/chromium reaches windows_fonts.h and parity_mode.h beside it.
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  PRIVATE "${CMAKE_SOURCE_DIR}/include")
 add_dependencies(cleartype dwritecore_version)
 
 set_target_properties(cleartype PROPERTIES

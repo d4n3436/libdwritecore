@@ -56,6 +56,10 @@
     /* Not FreeType: the font list itself, so a page cannot name a family a
        stock Windows does not have. */
     FcConfigGetFonts;
+
+    /* Not FreeType: which font covers a character, answered per character so
+       Chromium's fallback reaches the family Windows' table names. */
+    FcCharSetHasChar;
   local:
     *;
 };
