@@ -46,6 +46,11 @@ constexpr size_t kProxyRealTypeface = 48;
 void SetAnchors(const std::vector<uintptr_t>& calls_table_tags,
                 const std::vector<uintptr_t>& calls_table_data);
 
+// A vtable whose table slots are already known, for a build where nothing is
+// exported and the anchors cannot be matched by what they call. Any typeface
+// carrying this vtable uses these slots directly.
+void SetSlotHint(const void* vtable, unsigned tags_slot, unsigned data_slot);
+
 // Whether this typeface answers the canary calls sensibly. Cached per
 // typeface pointer.
 bool LooksUsable(const void* typeface);

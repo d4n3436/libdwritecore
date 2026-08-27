@@ -11,6 +11,12 @@
 //
 //----------------------------------------------------------------------------
 
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable CppUseDesignatedInitializers
+// ReSharper disable CppUseStructuredBinding
+
 #include "font_facts.h"
 
 #include <cstring>
@@ -146,8 +152,8 @@ bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range)
         const uint16_t start_glyph = Be16(s + 40);
         const uint16_t end_glyph = Be16(s + 42);
         const uint8_t ppem_x = s[44];
-        const uint8_t ppem_y = s[45];
-        if (ppem_x == ppem_y && range.min_ppem <= ppem_x && ppem_x <= range.max_ppem &&
+        if (const uint8_t ppem_y = s[45];
+            ppem_x == ppem_y && range.min_ppem <= ppem_x && ppem_x <= range.max_ppem &&
             end_glyph >= start_glyph + 3) {
             return true;
         }

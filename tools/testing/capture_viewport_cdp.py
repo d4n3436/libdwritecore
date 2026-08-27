@@ -39,9 +39,9 @@ def main():
     try:
         browser = vp.CdpBrowser(args.host, args.port, args.connect_timeout)
     except (RuntimeError, OSError) as exc:
+        browser = None
         sys.exit("could not attach to DevTools on %s:%d: %s"
                  % (args.host, args.port, exc))
-
     try:
         vp.capture(browser, args.url, args.width, args.height, args.tag, args.scroll)
     finally:

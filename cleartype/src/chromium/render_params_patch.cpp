@@ -20,6 +20,15 @@
 //
 //----------------------------------------------------------------------------
 
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable CppRedundantParentheses
+// ReSharper disable CppUseDesignatedInitializers
+// ReSharper disable CppUseRangeAlgorithm
+// ReSharper disable CppUseStructuredBinding
+// ReSharper disable CppVariableCanBeMadeConstexpr
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -112,7 +121,7 @@ bool WriteDetour(unsigned char* at, void* to)
         return false;
     }
     constexpr size_t kPatch = 12;
-    auto start = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
+    const auto start = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
     const uintptr_t last =
         (reinterpret_cast<uintptr_t>(at) + kPatch - 1) & ~static_cast<uintptr_t>(page - 1);
     const size_t len = last - start + static_cast<size_t>(page);
@@ -175,7 +184,7 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
             continue;
         }
         const auto* begin = reinterpret_cast<const unsigned char*>(base + p.p_vaddr);
-        const Region r{begin, begin + p.p_filesz};
+        const Region r{.begin = begin, .end = begin + p.p_filesz};
         if ((p.p_flags & PF_X) != 0) {
             if (image.text_count < 4) {
                 image.text[image.text_count++] = r;
@@ -201,7 +210,7 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
         Say("not all of the fontconfig property names are present");
         return;
     }
-    std::sort(wanted.begin(), wanted.end());
+    std::ranges::sort(wanted);
 
     // Every function start reached by a direct call, so a lea can be
     // attributed to the function it sits in.
@@ -215,14 +224,14 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
             int32_t rel;
             std::memcpy(&rel, p + 1, sizeof(rel));
             const auto site = reinterpret_cast<uintptr_t>(p);
-            const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
-            if (InText(image, target)) {
+            if (const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
+                InText(image, target)) {
                 starts.push_back(target);
             }
         }
     }
-    std::sort(starts.begin(), starts.end());
-    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    std::ranges::sort(starts);
+    starts.erase(std::ranges::unique(starts).begin(), starts.end());
     if (starts.empty()) {
         return;
     }
@@ -250,7 +259,7 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
                 continue;
             }
             const unsigned which = found_str->second;
-            const auto it = std::upper_bound(starts.begin(), starts.end(), site);
+            const auto it = std::ranges::upper_bound(starts, site);
             if (it == starts.begin()) {
                 continue;
             }
@@ -270,8 +279,7 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
     int best_n = 0;
     int second_n = 0;
     for (const Hit& h : hits) {
-        const int n = popcount(h.mask);
-        if (n > best_n) {
+        if (const int n = popcount(h.mask); n > best_n) {
             second_n = best_n;
             best = h.fn;
             best_n = n;

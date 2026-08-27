@@ -23,6 +23,7 @@ in a function and passes `arguments`. CdpBrowser wraps it the same way, so one
 copy serves both.
 """
 
+import abc
 import base64
 import hashlib
 import json
@@ -105,13 +106,18 @@ class WebSocket:
         self.sock = socket.create_connection((host, int(port or 80)), timeout)
         self.sock.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode()
+        # DevTools refuses an upgrade whose Host is not a loopback name, to
+        # stop a page reaching the debugger by DNS rebinding. It reads the
+        # header rather than the peer address, so reaching a browser on another
+        # machine means saying localhost while dialling its real address.
+        sent_host = "localhost:%s" % (port or "80")
         self.sock.sendall((
             "GET /%s HTTP/1.1\r\n"
             "Host: %s\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: %s\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n" % (path, hostport, key)).encode())
+            "Sec-WebSocket-Version: 13\r\n\r\n" % (path, sent_host, key)).encode())
         header = self._read_until(b"\r\n\r\n")
         if b"101" not in header.split(b"\r\n")[0]:
             raise RuntimeError("websocket upgrade refused: %r" % header[:120])
@@ -170,6 +176,7 @@ class WebSocket:
             if opcode in (0x1, 0x2):
                 return payload.decode("utf-8", "replace")
 
+    @abc.abstractmethod
     def close(self):
         try:
             self.sock.close()
@@ -181,20 +188,24 @@ class WebSocket:
 # Browsers.
 # ---------------------------------------------------------------------------
 
-class Browser:
+class Browser(abc.ABC):
     """What Capture needs from whichever browser is being driven."""
 
+    @abc.abstractmethod
     def navigate(self, url):
         raise NotImplementedError
 
+    @abc.abstractmethod
     def script(self, body, args=()):
         """Run a Marionette-style body (uses `return` and `arguments`)."""
         raise NotImplementedError
 
+    @abc.abstractmethod
     def script_async(self, body):
         """Run a body whose last argument is a completion callback."""
         raise NotImplementedError
 
+    @abc.abstractmethod
     def set_window_rect(self, width, height):
         """Resize. False if this browser cannot, and the size must already hold."""
         raise NotImplementedError
@@ -213,6 +224,9 @@ class CdpBrowser(Browser):
     """
 
     def __init__(self, host, port, timeout=30.0):
+        # noinspection HttpUrlsUsage
+        # DevTools serves this endpoint over plain HTTP and offers no TLS; the
+        # port is bound to loopback and reached through a forward.
         base = "http://%s:%d" % (host, port)
         version = self._get_json(base + "/json/version", timeout)
         self.ws = WebSocket(version["webSocketDebuggerUrl"], timeout)

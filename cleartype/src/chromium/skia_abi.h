@@ -103,7 +103,8 @@ template <typename T>
 T Read(const void* base, const size_t offset)
 {
     T v{};
-    std::memcpy(&v, static_cast<const unsigned char*>(base) + offset, sizeof(T));
+    std::memcpy(static_cast<void*>(&v),
+                static_cast<const unsigned char*>(base) + offset, sizeof(T));
     return v;
 }
 
@@ -122,7 +123,7 @@ struct Glyph
     // SkPackedGlyphID packs the sub-pixel position around the glyph id:
     // sub-x in bits 0..1, id in 2..17, sub-y in 18..19. Bits 20 and up are
     // unused, so a value with any of them set is not a packed glyph id.
-    static bool PlausiblePackedID(const uint32_t v) { return (v >> 20) == 0; }
+    static bool PlausiblePackedID(const uint32_t v) { return v >> 20 == 0; }
 
     uint16_t GlyphId() const { return static_cast<uint16_t>((packed_id >> 2) & 0xFFFF); }
     unsigned SubX() const { return packed_id & 0x3; }

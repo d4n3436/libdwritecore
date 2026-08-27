@@ -61,7 +61,7 @@ float DeviceScaleY(const skia_abi::Rec& rec)
     const float m21 = rec.post2x2[1][0];
     const float y = std::sqrt(m21 * m21 + m22 * m22);
     const float fallback = std::sqrt(m11 * m11 + m12 * m12);
-    const float scale = y != 0.0f ? y : (fallback != 0.0f ? fallback : 1.0f);
+    const float scale = y != 0.0f ? y : fallback != 0.0f ? fallback : 1.0f;
     return rec.text_size * scale;
 }
 

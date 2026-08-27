@@ -29,12 +29,23 @@
 //
 //----------------------------------------------------------------------------
 
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable CppParameterMayBeConst
+// ReSharper disable CppParameterMayBeConstPtrOrRef
+// ReSharper disable CppUseDesignatedInitializers
+// ReSharper disable CppUseStructuredBinding
+
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <strings.h>
 
 #include <dlfcn.h>
 
+#include "fallback_order.h"
 #include "parity_gate.h"
 #include "windows_fonts.h"
 
@@ -42,19 +53,15 @@ namespace {
 
 // fontconfig, without its headers.
 constexpr int kFcResultMatch = 0;
-constexpr int kFcCharSetMapSize = 8;
 
 struct FcFontSet
 {
     int nfont;
-    int sfont;
     void** fonts;
 };
 
-using FontSortFn = FcFontSet* (*)(void*, void*, int, void**, int*);
 using PatternGetCharSetFn = int (*)(const void*, const char*, int, void**);
 using PatternGetStringFn = int (*)(const void*, const char*, int, unsigned char**);
-using CharSetFirstPageFn = unsigned (*)(const void*, unsigned*, unsigned*);
 
 template <typename T>
 T Sym(const char* name)
@@ -94,32 +101,34 @@ bool ShipsWithWindows(const char* name)
 // The lists from font_fallback_win.cc, verbatim and in their order. Only the
 // scripts a page can actually reach are here; the historic and symbol ones
 // all resolve to Segoe UI variants that fontconfig picks anyway.
-const char* const kKatakanaOrHiragana[] = {"Noto Sans JP", "Noto Sans CJK JP", "Meiryo",
+constexpr const char* kKatakanaOrHiragana[] = {"Noto Sans JP", "Noto Sans CJK JP", "Meiryo",
                                            "Yu Gothic", "MS PGothic", "Microsoft YaHei"};
-const char* const kSimplifiedHan[] = {"Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
+constexpr const char* kTraditionalHan[] = {"Noto Sans TC", "Noto Sans CJK TC",
+                                       "Microsoft JhengHei", "pmingli"};
+constexpr const char* kSimplifiedHan[] = {"Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
                                       "simsun"};
-const char* const kHangul[] = {"Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", "Gulim"};
-const char* const kArabic[] = {"Tahoma", "Segoe UI"};
-const char* const kHebrew[] = {"David", "Segoe UI"};
-const char* const kArmenian[] = {"Segoe UI", "Sylfaen"};
-const char* const kGeorgian[] = {"Sylfaen", "Segoe UI"};
-const char* const kDevanagari[] = {"Nirmala UI", "Mangal"};
-const char* const kBengali[] = {"Nirmala UI", "Vrinda"};
-const char* const kGurmukhi[] = {"Nirmala UI", "Raavi"};
-const char* const kGujarati[] = {"Nirmala UI", "Shruti"};
-const char* const kOriya[] = {"Kalinga", "ori1Uni", "Lohit Oriya", "Nirmala UI"};
-const char* const kTamil[] = {"Nirmala UI", "Latha"};
-const char* const kTelugu[] = {"Nirmala UI", "Gautami"};
-const char* const kKannada[] = {"Tunga", "Nirmala UI"};
-const char* const kMalayalam[] = {"Nirmala UI", "Kartika"};
-const char* const kSinhala[] = {"Iskoola Pota", "AksharUnicode", "Nirmala UI"};
-const char* const kThai[] = {"Tahoma", "Leelawadee UI", "Leelawadee"};
-const char* const kLao[] = {"Leelawadee UI", "Lao UI"};
-const char* const kKhmer[] = {"Leelawadee UI", "Khmer UI", "Khmer OS", "MoolBoran", "DaunPenh"};
+constexpr const char* kHangul[] = {"Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", "Gulim"};
+constexpr const char* kArabic[] = {"Tahoma", "Segoe UI"};
+constexpr const char* kHebrew[] = {"David", "Segoe UI"};
+constexpr const char* kArmenian[] = {"Segoe UI", "Sylfaen"};
+constexpr const char* kGeorgian[] = {"Sylfaen", "Segoe UI"};
+constexpr const char* kDevanagari[] = {"Nirmala UI", "Mangal"};
+constexpr const char* kBengali[] = {"Nirmala UI", "Vrinda"};
+constexpr const char* kGurmukhi[] = {"Nirmala UI", "Raavi"};
+constexpr const char* kGujarati[] = {"Nirmala UI", "Shruti"};
+constexpr const char* kOriya[] = {"Kalinga", "ori1Uni", "Lohit Oriya", "Nirmala UI"};
+constexpr const char* kTamil[] = {"Nirmala UI", "Latha"};
+constexpr const char* kTelugu[] = {"Nirmala UI", "Gautami"};
+constexpr const char* kKannada[] = {"Tunga", "Nirmala UI"};
+constexpr const char* kMalayalam[] = {"Nirmala UI", "Kartika"};
+constexpr const char* kSinhala[] = {"Iskoola Pota", "AksharUnicode", "Nirmala UI"};
+constexpr const char* kThai[] = {"Tahoma", "Leelawadee UI", "Leelawadee"};
+constexpr const char* kLao[] = {"Leelawadee UI", "Lao UI"};
+constexpr const char* kKhmer[] = {"Leelawadee UI", "Khmer UI", "Khmer OS", "MoolBoran", "DaunPenh"};
 
-// Where each script lives. USCRIPT_HAN resolves by locale on Windows; the
-// simplified list is used, which is what a system whose UI locale is neither
-// Japanese nor Korean resolves to.
+// Where each script lives. The unified Han block is filled in by HanFamilies()
+// below, since Windows picks its list from the locale rather than fixing one.
+#define DWC_COUNT(table) (sizeof(table) / sizeof((table)[0]))
 #define DWC_SCRIPT(first, last, table) {(first), (last), (table), \
                                         sizeof(table) / sizeof((table)[0])}
 
@@ -151,6 +160,8 @@ const ScriptFonts kScripts[] = {
     DWC_SCRIPT(0x3040, 0x309F, kKatakanaOrHiragana),
     DWC_SCRIPT(0x30A0, 0x30FF, kKatakanaOrHiragana),
     DWC_SCRIPT(0x31F0, 0x31FF, kKatakanaOrHiragana),
+    // Unified Han, whose list is chosen from the locale. kSimplifiedHan is
+    // named here only so the entry has a shape; HanFamilies() answers.
     DWC_SCRIPT(0x3400, 0x4DBF, kSimplifiedHan),
     DWC_SCRIPT(0x4E00, 0x9FFF, kSimplifiedHan),
     DWC_SCRIPT(0xF900, 0xFAFF, kSimplifiedHan),
@@ -158,60 +169,124 @@ const ScriptFonts kScripts[] = {
 
 #undef DWC_SCRIPT
 
-const ScriptFonts* ScriptFor(const unsigned codepoint)
-{
-    for (const ScriptFonts& s : kScripts) {
-        if (codepoint >= s.first && codepoint <= s.last) {
-            return &s;
-        }
-    }
-    return nullptr;
-}
 
-// The character the fallback is being asked about. font_fallback_linux.cc
-// puts exactly one into the pattern's charset.
-bool FirstCodepoint(const void* pattern, unsigned* out)
+// Which list unified Han resolves to, mirroring
+// LayoutLocale::GetSystem().GetScriptForHan(), which font_fallback_win.cc
+// calls when it fills USCRIPT_HAN.
+//
+// layout_locale.cc takes the system locale from icu::Locale::getDefault() and
+// ComputeScriptForHan asks locale_to_script_mapping.cc's
+// ScriptCodeForHanFromSubtags, which walks the subtags and takes the first
+// that disambiguates: a two-letter region, or a four-letter script name.
+// Nothing conclusive leaves it at simplified Han.
+//
+// The environment is read as ICU reads it, LC_ALL before LC_CTYPE before LANG.
+struct HanChoice
 {
-    static const auto get_charset = Sym<PatternGetCharSetFn>("FcPatternGetCharSet");
-    static const auto first_page = Sym<CharSetFirstPageFn>("FcCharSetFirstPage");
-    if (get_charset == nullptr || first_page == nullptr) {
-        return false;
+    const char* subtag;
+    const char* const* families;
+    unsigned count;
+};
+
+const char* const* HanFamilies(unsigned* count)
+{
+    static const char* const* chosen = nullptr;
+    static unsigned chosen_count = 0;
+    if (chosen != nullptr) {
+        *count = chosen_count;
+        return chosen;
     }
-    void* charset = nullptr;
-    if (get_charset(pattern, "charset", 0, &charset) != kFcResultMatch || charset == nullptr) {
-        return false;
+
+    // ScriptCodeForHanFromRegion, plus the four-letter script names
+    // IsUnambiguousHanScript accepts.
+    static const HanChoice kChoices[] = {
+        {"hk", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+        {"mo", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+        {"tw", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+        {"jp", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+        {"kr", kHangul, DWC_COUNT(kHangul)},
+        {"hant", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+        {"hans", kSimplifiedHan, DWC_COUNT(kSimplifiedHan)},
+        {"jpan", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+        {"kore", kHangul, DWC_COUNT(kHangul)},
+    };
+
+    const char* env = std::getenv("LC_ALL");
+    if (env == nullptr || env[0] == '\0') {
+        env = std::getenv("LC_CTYPE");
     }
-    unsigned map[kFcCharSetMapSize] = {};
-    unsigned next = 0;
-    const unsigned base = first_page(charset, map, &next);
-    if (base == static_cast<unsigned>(-1)) {
-        return false;
+    if (env == nullptr || env[0] == '\0') {
+        env = std::getenv("LANG");
     }
-    for (int i = 0; i < kFcCharSetMapSize; ++i) {
-        if (map[i] == 0) {
-            continue;
+
+    chosen = kSimplifiedHan;
+    chosen_count = DWC_COUNT(kSimplifiedHan);
+    if (env != nullptr) {
+        // The language subtag itself decides only when it is already an
+        // unambiguous Han script: ja and ko are, zh is not.
+        char head[8] = {};
+        unsigned n = 0;
+        while (n + 1 < sizeof(head) && env[n] != '\0' && env[n] != '-' &&
+               env[n] != '_' && env[n] != '.' && env[n] != '@') {
+            head[n] = static_cast<char>(tolower(static_cast<unsigned char>(env[n])));
+            ++n;
         }
-        for (int bit = 0; bit < 32; ++bit) {
-            if ((map[i] & (1u << bit)) != 0) {
-                *out = base + static_cast<unsigned>(i) * 32 + static_cast<unsigned>(bit);
-                return true;
+        if (std::strcmp(head, "ja") == 0) {
+            chosen = kKatakanaOrHiragana;
+            chosen_count = DWC_COUNT(kKatakanaOrHiragana);
+        } else if (std::strcmp(head, "ko") == 0) {
+            chosen = kHangul;
+            chosen_count = DWC_COUNT(kHangul);
+        } else {
+            // Then the subtags after it, first one that disambiguates.
+            for (const char* p = env; *p != '\0' && *p != '.' && *p != '@';) {
+                if (*p != '-' && *p != '_') {
+                    ++p;
+                    continue;
+                }
+                ++p;
+                char sub[8] = {};
+                unsigned k = 0;
+                while (k + 1 < sizeof(sub) && p[k] != '\0' && p[k] != '-' &&
+                       p[k] != '_' && p[k] != '.' && p[k] != '@') {
+                    sub[k] = static_cast<char>(tolower(static_cast<unsigned char>(p[k])));
+                    ++k;
+                }
+                bool done = false;
+                for (const HanChoice& c : kChoices) {
+                    if (std::strcmp(sub, c.subtag) == 0) {
+                        chosen = c.families;
+                        chosen_count = c.count;
+                        done = true;
+                        break;
+                    }
+                }
+                if (done) {
+                    break;
+                }
+                p += k;
             }
         }
     }
-    return false;
+    *count = chosen_count;
+    return chosen;
 }
 
-bool FamilyIs(const void* candidate, const char* want)
+const ScriptFonts* ScriptFor(const unsigned codepoint)
 {
-    static const auto get_string = Sym<PatternGetStringFn>("FcPatternGetString");
-    if (get_string == nullptr) {
-        return false;
+    for (const ScriptFonts& s : kScripts) {
+        if (codepoint < s.first || codepoint > s.last) {
+            continue;
+        }
+        if (s.families != kSimplifiedHan) {
+            return &s;
+        }
+        static ScriptFonts han{};
+        han = s;
+        han.families = HanFamilies(&han.count);
+        return &han;
     }
-    unsigned char* name = nullptr;
-    if (get_string(candidate, "family", 0, &name) != kFcResultMatch || name == nullptr) {
-        return false;
-    }
-    return strcasecmp(reinterpret_cast<const char*>(name), want) == 0;
+    return nullptr;
 }
 
 // Which families the last sorts turned up, and the charset of each. Small and
@@ -240,7 +315,7 @@ void Remember(const void* charset, const char* family)
         return;
     }
     g_known[g_known_count].charset = charset;
-    std::snprintf(g_known[g_known_count].family, sizeof(g_known[0].family), "%s", family);
+    (void)std::snprintf(g_known[g_known_count].family, sizeof(g_known[0].family), "%s", family);
     ++g_known_count;
 }
 
@@ -291,8 +366,8 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         if (!ShipsWithWindows(script->families[i])) {
             continue;
         }
-        const void* candidate = CharSetOfFamily(script->families[i]);
-        if (candidate == nullptr || real(candidate, codepoint) == 0) {
+        if (const void* candidate = CharSetOfFamily(script->families[i]);
+            candidate == nullptr || real(candidate, codepoint) == 0) {
             continue;
         }
         return strcasecmp(mine, script->families[i]) == 0 ? 1 : 0;
@@ -308,7 +383,7 @@ namespace fallback_order {
 // result here.
 void NoteFontSet(const void* pattern, void* sorted)
 {
-    auto* set = static_cast<FcFontSet*>(sorted);
+    const auto* set = static_cast<const FcFontSet*>(sorted);
     if (!chromium_patch::ParityWanted() || set == nullptr || set->nfont <= 1 ||
         pattern == nullptr) {
         return;

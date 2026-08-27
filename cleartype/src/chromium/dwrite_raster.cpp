@@ -1,4 +1,13 @@
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable RadGlobal
+
 #include "dwrite_raster.h"
+
+// Skia compares these to zero exactly. A tolerance check would take a
+// different branch than Windows does on the same input.
+#pragma GCC diagnostic ignored "-Wfloat-equal"
 
 #include "compat.h"
 #include "dwrite_3.h"
@@ -111,8 +120,7 @@ bool EnsureFactory()
 IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes)
 {
     static std::unordered_map<const void*, IDWriteFontFace*> faces;
-    const auto it = faces.find(typeface);
-    if (it != faces.end()) {
+    if (const auto it = faces.find(typeface); it != faces.end()) {
         return it->second;
     }
     IDWriteFontFace* face = nullptr;
@@ -165,13 +173,13 @@ uint16_t Pack888ToRGB16(const uint8_t r, const uint8_t g, const uint8_t b)
 
 bool Preload()
 {
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     return PreloadLibrary();
 }
 
 bool Available()
 {
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     return EnsureFactory();
 }
 
@@ -190,7 +198,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (advance == nullptr) {
         return false;
     }
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -200,7 +208,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     }
 
     DWRITE_GLYPH_METRICS gm{};
-    UINT16 id = glyph_id;
+    const UINT16 id = glyph_id;
     const bool gdi = decision.measuring_mode == windows_path::kMeasureGdiClassic ||
                      decision.measuring_mode == windows_path::kMeasureGdiNatural;
     HRESULT hr;
@@ -246,7 +254,7 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (sk_font_metrics == nullptr) {
         return false;
     }
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -323,7 +331,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
         return false;
     }
 
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -341,8 +349,8 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     transform.m22 = rec.post2x2[1][1];
     // Skia normalizes the vertical scale into the em size, so the matrix
     // handed to DirectWrite must not apply it twice.
-    const float y = decision.real_text_size / (rec.text_size != 0 ? rec.text_size : 1.0f);
-    if (y != 0.0f) {
+    if (const float y = decision.real_text_size / (rec.text_size != 0 ? rec.text_size : 1.0f);
+        y != 0.0f) {
         transform.m11 /= y;
         transform.m12 /= y;
         transform.m21 /= y;
@@ -366,6 +374,13 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
 
     const auto rendering_mode = static_cast<DWRITE_RENDERING_MODE>(decision.rendering_mode);
     const auto measuring_mode = static_cast<DWRITE_MEASURING_MODE>(decision.measuring_mode);
+    // windows_path names these the way SkScalerContext_DW does; DirectWrite has
+    // its own enum with the same values, so the comparisons below are made in
+    // DirectWrite's type rather than across the two.
+    constexpr auto kDwriteAliased1x1 =
+        static_cast<DWRITE_TEXTURE_TYPE>(windows_path::kTextureAliased1x1);
+    constexpr auto kDwriteClearType3x1 =
+        static_cast<DWRITE_TEXTURE_TYPE>(windows_path::kTextureClearType3x1);
     const auto texture_type = static_cast<DWRITE_TEXTURE_TYPE>(decision.texture_type);
 
     IDWriteGlyphRunAnalysis* analysis = nullptr;
@@ -389,7 +404,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     }
 
     const size_t pixels = static_cast<size_t>(glyph.width) * glyph.height;
-    const size_t needed = texture_type == windows_path::kTextureClearType3x1 ? pixels * 3 : pixels;
+    const size_t needed = texture_type == kDwriteClearType3x1 ? pixels * 3 : pixels;
     std::vector<uint8_t> bits(needed, 0);
 
     RECT bbox;
@@ -421,7 +436,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
         const int byte_count = width >> 3;
         const int bit_count = width & 7;
         uint8_t* dst = dst8;
-        for (int y = 0; y < glyph.height; ++y) {
+        for (int row = 0; row < glyph.height; ++row) {
             for (int i = 0; i < byte_count; ++i) {
                 unsigned byte = 0;
                 byte |= src[0] & (1u << 7);
@@ -452,9 +467,9 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
 
     if (!IsLcd(rec)) {
         uint8_t* dst = dst8;
-        if (texture_type == windows_path::kTextureAliased1x1) {
+        if (texture_type == kDwriteAliased1x1) {
             // GrayscaleToA8
-            for (int y = 0; y < glyph.height; ++y) {
+            for (int row = 0; row < glyph.height; ++row) {
                 for (int i = 0; i < glyph.width; ++i) {
                     dst[i] = ApplyLut(*src++, preblend.g);
                 }
@@ -462,7 +477,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
             }
         } else {
             // RGBToA8: the three subpixels averaged, then the green table.
-            for (int y = 0; y < glyph.height; ++y) {
+            for (int row = 0; row < glyph.height; ++row) {
                 for (int i = 0; i < glyph.width; ++i) {
                     const unsigned r = *src++;
                     const unsigned g = *src++;
@@ -476,13 +491,13 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     }
 
     // RGBToLcd16, which needs the ClearType texture and a matching mask.
-    if (texture_type != windows_path::kTextureClearType3x1 ||
+    if (texture_type != kDwriteClearType3x1 ||
         glyph.mask_format != skia_abi::kLCD16) {
         return false;
     }
     const bool rgb = (rec.flags & skia_abi::kLCD_BGROrder) == 0;
-    for (int y = 0; y < glyph.height; ++y) {
-        auto* dst = reinterpret_cast<uint16_t*>(dst8 + static_cast<size_t>(y) * row_bytes);
+    for (int row = 0; row < glyph.height; ++row) {
+        auto* dst = reinterpret_cast<uint16_t*>(dst8 + static_cast<size_t>(row) * row_bytes);
         for (int i = 0; i < glyph.width; ++i) {
             uint8_t r, g, b;
             if (rgb) {

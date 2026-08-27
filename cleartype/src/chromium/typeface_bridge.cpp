@@ -1,3 +1,12 @@
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable ClangTidy
+// ReSharper disable CppRedundantParentheses
+// ReSharper disable CppUseRangeAlgorithm
+// ReSharper disable CppUseStructuredBinding
+// ReSharper disable RadGlobal
+
 #include "typeface_bridge.h"
 
 #include <algorithm>
@@ -20,13 +29,14 @@ template <typename T>
 T Read(const void* base, const size_t offset)
 {
     T v{};
-    std::memcpy(&v, static_cast<const unsigned char*>(base) + offset, sizeof(T));
+    std::memcpy(static_cast<void*>(&v),
+                static_cast<const unsigned char*>(base) + offset, sizeof(T));
     return v;
 }
 
 void* Slot(const void* object, const unsigned index)
 {
-    const auto* vptr = *reinterpret_cast<void* const* const*>(object);
+    const auto* vptr = *static_cast<void* const* const*>(object);
     return vptr[index];
 }
 
@@ -45,11 +55,14 @@ struct Slots
     bool found = false;
 };
 std::unordered_map<const void*, Slots> g_slots;
+const void* g_hint_vtable = nullptr;
+unsigned g_hint_tags = 0;
+unsigned g_hint_data = 0;
 std::unordered_map<const void*, const void*> g_real;
 
 bool Calls(const std::vector<uintptr_t>& set, const uintptr_t fn)
 {
-    return std::binary_search(set.begin(), set.end(), fn);
+    return std::ranges::binary_search(set, fn);
 }
 
 // Which slots of this typeface's vtable are onGetTableTags and
@@ -60,11 +73,18 @@ Slots FindSlots(const void* typeface)
     if (g_calls_tags.empty() || g_calls_data.empty()) {
         return s;
     }
-    const auto* vptr = *reinterpret_cast<void* const* const*>(typeface);
+    const auto* const* vptr =
+        *static_cast<void* const* const*>(typeface);
+    if (g_hint_vtable != nullptr && static_cast<const void*>(vptr) == g_hint_vtable) {
+        s.tags = g_hint_tags;
+        s.data = g_hint_data;
+        s.found = true;
+        return s;
+    }
     unsigned tags_found = 0;
     for (unsigned i = 0; i < kMaxSlotSearched; ++i) {
-        const auto fn = reinterpret_cast<uintptr_t>(vptr[i]);
-        if (fn != 0 && Calls(g_calls_tags, fn)) {
+        if (const auto fn = reinterpret_cast<uintptr_t>(vptr[i]);
+            fn != 0 && Calls(g_calls_tags, fn)) {
             s.tags = i;
             ++tags_found;
         }
@@ -115,14 +135,32 @@ void Append16(std::vector<uint8_t>* out, const uint16_t v)
 
 }  // namespace
 
+void SetSlotHint(const void* vtable, const unsigned tags_slot, const unsigned data_slot)
+{
+    const std::lock_guard lock(g_mutex);
+    g_hint_vtable = vtable;
+    g_hint_tags = tags_slot;
+    g_hint_data = data_slot;
+    g_slots.clear();
+    g_usable.clear();
+    g_real.clear();
+
+}
+
 void SetAnchors(const std::vector<uintptr_t>& calls_table_tags,
                 const std::vector<uintptr_t>& calls_table_data)
 {
-    const std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     g_calls_tags = calls_table_tags;
     g_calls_data = calls_table_data;
-    std::sort(g_calls_tags.begin(), g_calls_tags.end());
-    std::sort(g_calls_data.begin(), g_calls_data.end());
+    std::ranges::sort(g_calls_tags);
+    std::ranges::sort(g_calls_data);
+    // Anything already asked about was asked before there was anything to
+    // answer with, so those answers are worthless.
+    g_slots.clear();
+    g_usable.clear();
+    g_real.clear();
+
 }
 
 // The object whose vtable actually answers the table calls: this typeface if
@@ -145,8 +183,8 @@ const void* RealTypeface(const void* typeface, Slots* out)
         *out = s;
         return nullptr;
     }
-    const auto* vptr = Read<const void*>(inner, 0);
-    if (vptr == nullptr || (reinterpret_cast<uintptr_t>(vptr) & 7) != 0) {
+    if (const auto* vptr = Read<const void*>(inner, 0);
+        vptr == nullptr || (reinterpret_cast<uintptr_t>(vptr) & 7) != 0) {
         *out = s;
         return nullptr;
     }
@@ -160,9 +198,8 @@ bool LooksUsable(const void* typeface)
     if (typeface == nullptr) {
         return false;
     }
-    const std::lock_guard<std::mutex> lock(g_mutex);
-    const auto it = g_usable.find(typeface);
-    if (it != g_usable.end()) {
+    const std::lock_guard lock(g_mutex);
+    if (const auto it = g_usable.find(typeface); it != g_usable.end()) {
         return it->second;
     }
     Slots s;
@@ -182,7 +219,7 @@ std::vector<uint8_t> ReadFontFile(const void* typeface)
     Slots slots;
     const void* real = nullptr;
     {
-        const std::lock_guard<std::mutex> lock(g_mutex);
+        const std::lock_guard lock(g_mutex);
         slots = g_slots[typeface];
         real = g_real[typeface];
     }
@@ -216,7 +253,7 @@ std::vector<uint8_t> ReadFontFile(const void* typeface)
         // answers zero. SkTypeface::getTableSize passes ~0U for the same
         // reason.
         const size_t len = data_fn(typeface, tag, 0, ~0U, nullptr);
-        if (len == 0 || len > (32u << 20)) {
+        if (len == 0 || len > 32u << 20) {
             continue;
         }
         Table t;

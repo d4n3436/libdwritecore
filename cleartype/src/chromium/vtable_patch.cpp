@@ -32,6 +32,27 @@
 //
 //----------------------------------------------------------------------------
 
+// Everything below is entered from this library's constructor, which static
+// analysis does not model, so it reads the whole file as unreachable.
+// ReSharper disable CppDFAUnreachableFunctionCall
+//
+// OnChromiumFilterRec always returns true by design: hook_thunk.S reads the
+// result out of al to decide whether to run the original, and the answer here
+// is always yes.
+// ReSharper disable CppDFAConstantFunctionResult
+
+// Style inspections left as they are: the shapes they suggest either read
+// worse against the sources being mirrored, or would change which overload
+// is chosen if one were ever added.
+// ReSharper disable CppLocalVariableMayBeConst
+// ReSharper disable CppParameterMayBeConstPtrOrRef
+// ReSharper disable CppRedundantParentheses
+// ReSharper disable CppRedundantQualifierADL
+// ReSharper disable CppTemplateArgumentsCanBeDeduced
+// ReSharper disable CppUseStructuredBinding
+// ReSharper disable CppVariableCanBeMadeConstexpr
+// ReSharper disable RadGlobal
+
 #include "skia_abi.h"
 #include "typeface_bridge.h"
 #include "font_facts.h"
@@ -131,11 +152,6 @@ bool EnvDisables(const char* name)
     return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
 }
 
-bool EnvEnables(const char* name)
-{
-    const char* v = std::getenv(name);
-    return v != nullptr && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0);
-}
 
 // ---------------------------------------------------------------------------
 // The image, meaning its executable segments and relocated read-only data.
@@ -173,6 +189,10 @@ bool DescribeImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half
     }
     return out->text_count != 0 && out->relro.begin != nullptr;
 }
+
+// The image the patch settled on, kept for the runtime work that happens
+// after the scan has finished.
+Image g_image;
 
 bool InText(const Image& image, const uintptr_t addr)
 {
@@ -266,8 +286,8 @@ bool FindFfiSymbols(const char* path, const char* want_substr, std::vector<FfiSy
         if (shstrtab.sh_offset + sh.sh_name >= size) {
             continue;
         }
-        const auto* name = reinterpret_cast<const char*>(base + shstrtab.sh_offset + sh.sh_name);
-        if (std::strcmp(name, ".dynsym") == 0) {
+        if (const auto* name = reinterpret_cast<const char*>(base + shstrtab.sh_offset + sh.sh_name);
+            std::strcmp(name, ".dynsym") == 0) {
             dynsym = &sh;
         } else if (std::strcmp(name, ".dynstr") == 0) {
             dynstr = &sh;
@@ -304,7 +324,7 @@ bool FindFfiSymbols(const char* path, const char* want_substr, std::vector<FfiSy
 
 // Set once the vtable slot has actually been written, so the constructor
 // knows whether it is worth loading DirectWrite at all.
-std::atomic<bool> g_patched{false};
+std::atomic g_patched{false};
 
 // fFlags as onFilterRec received them. Scaler contexts are built one at a
 // time under Skia's lock, so one slot carries it across the call.
@@ -373,7 +393,7 @@ struct CodeMap
 
     size_t IndexOf(const uintptr_t addr) const
     {
-        const auto it = std::upper_bound(starts.begin(), starts.end(), addr);
+        const auto it = std::ranges::upper_bound(starts, addr);
         if (it == starts.begin()) {
             return static_cast<size_t>(-1);
         }
@@ -382,7 +402,7 @@ struct CodeMap
 
     bool Has(const uintptr_t fn, const uint8_t bit) const
     {
-        const auto it = std::lower_bound(starts.begin(), starts.end(), fn);
+        const auto it = std::ranges::lower_bound(starts, fn);
         if (it == starts.end() || *it != fn) {
             return false;
         }
@@ -405,8 +425,8 @@ void ForEachCall(const Image& image, F&& visit)
             int32_t rel;
             std::memcpy(&rel, p + 1, sizeof(rel));
             const uintptr_t site = reinterpret_cast<uintptr_t>(p);
-            const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
-            if (InText(image, target)) {
+            if (const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
+                InText(image, target)) {
                 visit(site, target);
             }
         }
@@ -435,8 +455,8 @@ void ForEachBranch(const Image& image, F&& visit)
             int32_t rel;
             std::memcpy(&rel, p + 1, sizeof(rel));
             const uintptr_t site = reinterpret_cast<uintptr_t>(p);
-            const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
-            if (InText(image, target)) {
+            if (const uintptr_t target = site + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
+                InText(image, target)) {
                 visit(site, target);
             }
         }
@@ -473,6 +493,37 @@ void** VtableBaseFrom(const Image& image, void** known_slot)
 // this one (SkTypeface_proxy::onFilterRec is
 // `fRealTypeface->onFilterRec(rec)`), so patching here covers every scaler
 // context without having to find the proxy's table too.
+// The two writes a typeface vtable gets when it is identified before Skia is
+// dispatching through it: the rec filter that applies the Windows render
+// params, and the table read that hides VDMX.
+void PatchTypefaceSlots(void** base, void** data_slot)
+{
+    if (void** slot = base + kFilterRecSlot; InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
+        g_original_filter_rec = *slot;
+        if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
+            Report("onFilterRec %p replaced through vtable slot %p; the Windows font "
+                   "render params will be applied to every scaler context",
+                   g_original_filter_rec, static_cast<void*>(slot));
+        } else {
+            g_original_filter_rec = nullptr;
+        }
+    } else {
+        Report("slot %u of that vtable is not a function", kFilterRecSlot);
+    }
+
+    if (data_slot != nullptr && InText(g_image, reinterpret_cast<uintptr_t>(*data_slot))) {
+        g_original_get_table_data = reinterpret_cast<GetTableDataFn>(*data_slot);
+        if (WriteSlot(data_slot, reinterpret_cast<void*>(&ChromiumGetTableData))) {
+            Report("onGetTableData %p replaced through vtable slot %p; VDMX will "
+                   "report as absent, as it does on Windows",
+                   reinterpret_cast<void*>(g_original_get_table_data),
+                   static_cast<void*>(data_slot));
+        } else {
+            g_original_get_table_data = nullptr;
+        }
+    }
+}
+
 void InstallRecFilter(const Image& image, const std::vector<uintptr_t>& calls_tags)
 {
     if (calls_tags.size() != 1) {
@@ -484,7 +535,8 @@ void InstallRecFilter(const Image& image, const std::vector<uintptr_t>& calls_ta
 
     void** tags_slot = nullptr;
     auto* p = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.begin));
-    auto* end = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.end));
+    const auto* end =
+        reinterpret_cast<const uintptr_t*>(image.relro.end);
     for (; p + 1 <= end; ++p) {
         if (*p != tags_fn) {
             continue;
@@ -505,33 +557,207 @@ void InstallRecFilter(const Image& image, const std::vector<uintptr_t>& calls_ta
         Report("could not find the head of the Fontations typeface vtable");
         return;
     }
-    void** slot = base + kFilterRecSlot;
-    if (!InText(image, reinterpret_cast<uintptr_t>(*slot))) {
-        Report("slot %u of that vtable is not a function", kFilterRecSlot);
+    PatchTypefaceSlots(base, tags_slot + 1);
+}
+
+// The tag SkFontationsScalerContext::generateFontMetrics reads, from
+// src/ports/SkTypeface_fontations.cpp. It is an immediate in that function, so
+// it names the scaler context on a build that exports nothing. Other code
+// holds the same constant, so the shape test below is required as well.
+constexpr uint32_t kFvarTag = 0x66766172;
+
+// The tag SkTypeface_Fontations::onGlyphMaskNeedsCurrentColor reads, from the
+// same file. It names the typeface vtable the way fvar names the scaler
+// context's.
+constexpr uint32_t kColrTag = 0x434F4C52;
+
+// FT_GLYPH_FORMAT_OUTLINE. A build predating the Rust bridge rasterizes with
+// a FreeType compiled into it, and SkScalerContext_FreeType::generateMetrics
+// tests the loaded glyph against this format
+// (src/ports/SkFontHost_FreeType.cpp).
+constexpr uint32_t kOutlineFormat = 0x6F75746C;
+
+// Where the two table virtuals sit relative to it. SkTypeface declares
+// onGetTableTags and onGetTableData last but for onCopyTableData and
+// onComputeBounds, which puts them fourteen and fifteen slots along.
+constexpr unsigned kColrToTableTags = 14;
+
+// onFilterRec relative to it. SkTypeface declares onFilterRec near the top and
+// onGlyphMaskNeedsCurrentColor six virtuals later. The table calls have moved
+// between revisions; this pair has not.
+constexpr unsigned kColrToFilterRec = 6;
+
+// Patch onFilterRec on the typeface vtable a COLR-holding virtual belongs to.
+// This is what an older build gets: its scaler context cannot be named, but
+// the render params still reach every scaler context Skia builds.
+void PatchFilterRecByColrTag(const Image& image, const CodeMap& map,
+                             const std::vector<uintptr_t>& colr_sites)
+{
+    if (colr_sites.empty()) {
         return;
     }
-    g_original_filter_rec = *slot;
-    if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
-        Report("onFilterRec %p replaced through vtable slot %p; the Windows font "
-               "render params will be applied to every scaler context",
-               g_original_filter_rec, static_cast<void*>(slot));
+    const auto holds = [&](const uintptr_t fn) {
+        const auto it = std::ranges::lower_bound(colr_sites, fn);
+        for (auto s = it; s != colr_sites.end() && *s < fn + 0x20000; ++s) {
+            if (const size_t i = map.IndexOf(*s);
+                i != static_cast<size_t>(-1) && map.starts[i] == fn) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto* p = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.begin));
+    auto* end = reinterpret_cast<uintptr_t*>(const_cast<unsigned char*>(image.relro.end));
+    unsigned found = 0;
+    void** chosen = nullptr;
+    uintptr_t colr_fn = 0;
+    bool mixed = false;
+    std::vector<void**> slots_to_patch;
+    for (; p + 1 <= end; ++p) {
+        if (!InText(image, *p) || !holds(*p)) {
+            continue;
+        }
+        auto* base = VtableBaseFrom(image, reinterpret_cast<void**>(p));
+        if (base == nullptr) {
+            continue;
+        }
+        const auto index = static_cast<size_t>(p - reinterpret_cast<uintptr_t*>(base));
+        if (index < kColrToFilterRec) {
+            continue;
+        }
+        void** slot = base + (index - kColrToFilterRec);
+        if (!InText(image, reinterpret_cast<uintptr_t>(*slot))) {
+            continue;
+        }
+        // A typeface vtable runs well past this virtual. A shorter table
+        // holding the same tag is something else.
+        const size_t tail = index + 12;
+        if (reinterpret_cast<unsigned char*>(base + tail + 1) > image.relro.end) {
+            continue;
+        }
+        bool long_enough = true;
+        for (size_t k = index + 1; k <= tail && long_enough; ++k) {
+            if (!InText(image, reinterpret_cast<uintptr_t>(base[k]))) {
+                long_enough = false;
+            }
+        }
+        if (!long_enough) {
+            continue;
+        }
+        ++found;
+        if (chosen == nullptr) {
+            chosen = slot;
+            colr_fn = *p;
+        } else if (*p != colr_fn) {
+            mixed = true;
+        }
+        slots_to_patch.push_back(slot);
+    }
+    // Sibling typefaces share one implementation, so several vtables name the
+    // same virtual. That is expected; what is not is two different functions
+    // answering to the tag, which would mean the wrong class is in the set.
+    if (chosen == nullptr || mixed) {
+        Report("%u typeface vtables hold the COLR tag%s; not applying the render "
+               "params through them", found, mixed ? ", naming different virtuals" : "");
+        return;
+    }
+    g_original_filter_rec = *chosen;
+    unsigned written = 0;
+    for (void** s : slots_to_patch) {
+        if (*s == g_original_filter_rec &&
+            WriteSlot(s, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
+            ++written;
+        }
+    }
+    if (written != 0) {
+        Report("onFilterRec %p replaced through %u vtable slot(s), found by the COLR "
+               "tag; the Windows font render params will be applied",
+               g_original_filter_rec, written);
     } else {
         g_original_filter_rec = nullptr;
     }
+}
 
-    // onGetTableData follows onGetTableTags by declaration order.
-    void** data_slot = tags_slot + 1;
-    if (InText(image, reinterpret_cast<uintptr_t>(*data_slot))) {
-        g_original_get_table_data = reinterpret_cast<GetTableDataFn>(*data_slot);
-        if (WriteSlot(data_slot, reinterpret_cast<void*>(&ChromiumGetTableData))) {
-            Report("onGetTableData %p replaced through vtable slot %p; VDMX will "
-                   "report as absent, as it does on Windows",
-                   reinterpret_cast<void*>(g_original_get_table_data),
-                   static_cast<void*>(data_slot));
-        } else {
-            g_original_get_table_data = nullptr;
-        }
+// SkFontationsScalerContext answers per-glyph questions from generateMetrics
+// and font-wide ones from generateFontMetrics, so those two slots are the ones
+// that must reach the bridge.
+constexpr unsigned kRecognizeFirst = 2;    // generateMetrics
+constexpr unsigned kRecognizeSecond = 6;   // generateFontMetrics
+
+std::vector<uintptr_t> g_colr_sites;
+std::vector<uintptr_t> g_vt_starts;
+std::atomic g_typeface_resolved{false};
+
+// The typeface vtable, taken off a live scaler context rather than searched
+// for. SkScalerContext holds fTypeface, so that object's vtable is the one
+// Skia is really using and there is nothing to disambiguate.
+//
+// Its COLR slot is found by the tag, and the table calls sit a fixed distance
+// along.
+void ResolveTypefaceFromContext(const void* context, const bool may_patch)
+{
+    static std::atomic patched{false};
+    if (g_typeface_resolved.load(std::memory_order_acquire) &&
+        (!may_patch || patched.load(std::memory_order_acquire))) {
+        return;
     }
+    if (may_patch) {
+        patched.store(true, std::memory_order_release);
+    }
+    g_typeface_resolved.store(true, std::memory_order_release);
+    if (g_image.text_count == 0 || context == nullptr) {
+        return;
+    }
+    const auto* typeface = skia_abi::Read<const void*>(context, skia_abi::kContextTypeface);
+    if (typeface == nullptr) {
+        return;
+    }
+    auto* vptr = *static_cast<uintptr_t* const*>(typeface);
+    auto* base = VtableBaseFrom(g_image, reinterpret_cast<void**>(vptr));
+    if (base == nullptr) {
+        return;
+    }
+    auto* slots = reinterpret_cast<uintptr_t*>(base);
+
+    const auto holds_colr = [&](const uintptr_t fn) {
+        const auto next = std::ranges::upper_bound(g_vt_starts, fn);
+        const uintptr_t stop = next != g_vt_starts.end()
+                                   ? *next
+                                   : reinterpret_cast<uintptr_t>(g_image.text[0].end);
+        const auto it = std::ranges::lower_bound(g_colr_sites, fn);
+        return it != g_colr_sites.end() && *it < stop;
+    };
+
+    for (unsigned i = 0; i < typeface_bridge::kMaxSlotSearched; ++i) {
+        if (reinterpret_cast<unsigned char*>(slots + i + 1) > g_image.relro.end) {
+            break;
+        }
+        if (!InText(g_image, slots[i]) || !holds_colr(slots[i])) {
+            continue;
+        }
+        const size_t tags_at = i + kColrToTableTags;
+        if (reinterpret_cast<unsigned char*>(slots + tags_at + 2) > g_image.relro.end ||
+            !InText(g_image, slots[tags_at]) || !InText(g_image, slots[tags_at + 1])) {
+            return;
+        }
+        const std::vector<uintptr_t> tag_fns{slots[tags_at]};
+        const std::vector<uintptr_t> data_fns{
+            slots[tags_at + 1], reinterpret_cast<uintptr_t>(&ChromiumGetTableData)};
+        typeface_bridge::SetAnchors(tag_fns, data_fns);
+        typeface_bridge::SetSlotHint(vptr, static_cast<unsigned>(tags_at),
+                                     static_cast<unsigned>(tags_at + 1));
+        Report("typeface vtable %p resolved from a live scaler context: "
+               "onGetTableTags slot %zu, onGetTableData %zu",
+               static_cast<void*>(base), tags_at, tags_at + 1);
+        // The vtable is not written here. By the time a scaler context exists
+        // Skia is already dispatching through this table, and replacing a slot
+        // underneath it takes the renderer down. Nothing needs the write: the
+        // bridge reads the tables through the slots it was just told about,
+        // and the rec is adjusted where it is reached instead.
+        (void)may_patch;
+        return;
+    }
+    Report("no slot of the live typeface vtable holds the COLR tag");
 }
 
 void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum,
@@ -542,6 +768,8 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         Report("%s has no shape this can read", path);
         return;
     }
+
+    g_image = image;
 
     // Which fontations symbols are rasterization-only, by runtime address.
     std::vector<uintptr_t> ffi;
@@ -557,14 +785,14 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
             }
         }
     }
-    std::sort(ffi.begin(), ffi.end());
-    std::sort(ffi_raster.begin(), ffi_raster.end());
+    std::ranges::sort(ffi);
+    std::ranges::sort(ffi_raster);
 
     const auto is_ffi = [&](const uintptr_t a) {
-        return std::binary_search(ffi.begin(), ffi.end(), a);
+        return std::ranges::binary_search(ffi, a);
     };
     const auto is_raster = [&](const uintptr_t a) {
-        return std::binary_search(ffi_raster.begin(), ffi_raster.end(), a);
+        return std::ranges::binary_search(ffi_raster, a);
     };
 
     // RELRO is relocated by the time a constructor runs, so the two zero
@@ -581,13 +809,19 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     ForEachCall(image, [&](uintptr_t, const uintptr_t target) {
         map.starts.push_back(target);
     });
-    std::sort(map.starts.begin(), map.starts.end());
-    map.starts.erase(std::unique(map.starts.begin(), map.starts.end()), map.starts.end());
+    std::ranges::sort(map.starts);
+    map.starts.erase(std::ranges::unique(map.starts).begin(), map.starts.end());
     map.flags.assign(map.starts.size(), 0);
 
+    std::vector<uintptr_t> ffi_sites;
+    std::vector<uintptr_t> raster_sites;
     ForEachBranch(image, [&](const uintptr_t site, const uintptr_t target) {
         if (!is_ffi(target)) {
             return;
+        }
+        ffi_sites.push_back(site);
+        if (is_raster(target)) {
+            raster_sites.push_back(site);
         }
         const size_t i = map.IndexOf(site);
         if (i == static_cast<size_t>(-1)) {
@@ -599,23 +833,132 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         }
     });
 
-    // One more hop, since a debug build leaves the C++ fontations_ffi
-    // wrappers out of line.
-    ForEachBranch(image, [&](const uintptr_t site, const uintptr_t target) {
-        if (!map.Has(target, kCallsFfi)) {
-            return;
+    // Hops outward from the anchors. One is enough where a debug build has
+    // left the C++ wrapper out of line, but a virtual can reach the bridge
+    // through more layers than that, so the propagation is repeated. The round
+    // count is bounded so a mistake cannot spread across the whole image.
+    constexpr unsigned kHops = 2;
+    for (unsigned hop = 0; hop < kHops; ++hop) {
+        std::vector<size_t> newly;
+        ForEachBranch(image, [&](const uintptr_t site, const uintptr_t target) {
+            if (!map.Has(target, kCallsFfi) && !map.Has(target, kCallsFfiCaller)) {
+                return;
+            }
+            if (const size_t i = map.IndexOf(site);
+                i != static_cast<size_t>(-1) && (map.flags[i] & kCallsFfiCaller) == 0) {
+                newly.push_back(i);
+            }
+        });
+        if (newly.empty()) {
+            break;
         }
-        const size_t i = map.IndexOf(site);
-        if (i != static_cast<size_t>(-1)) {
+        for (const size_t i : newly) {
             map.flags[i] |= kCallsFfiCaller;
         }
-    });
+    }
+
+    // Where nothing is exported there are no anchor calls to find, so the
+    // scaler context is recognized by the tag its generateFontMetrics loads.
+    std::vector<uintptr_t> fvar_sites;
+    if (syms.empty()) {
+        std::vector<uintptr_t> outline_sites;
+        std::vector<uintptr_t> starts_seed;
+        ForEachCall(image, [&](uintptr_t, const uintptr_t target) {
+            starts_seed.push_back(target);
+        });
+        std::ranges::sort(starts_seed);
+        starts_seed.erase(std::ranges::unique(starts_seed).begin(), starts_seed.end());
+        for (unsigned s = 0; s < image.text_count; ++s) {
+            const Region& r = image.text[s];
+            for (const unsigned char* q = r.begin; q + 4 <= r.end; ++q) {
+                uint32_t v;
+                std::memcpy(&v, q, sizeof(v));
+                if (v == kOutlineFormat) {
+                    outline_sites.push_back(reinterpret_cast<uintptr_t>(q));
+                }
+            }
+        }
+        std::ranges::sort(outline_sites);
+        // The functions those constants sit in. A build old enough to use the
+        // FreeType scaler reaches them from generateMetrics, sometimes through
+        // a helper, so they serve as anchors and the hops below do the rest.
+        for (const uintptr_t s2 : outline_sites) {
+            if (const auto it = std::ranges::upper_bound(starts_seed, s2);
+                it != starts_seed.begin()) {
+                ffi.push_back(*std::prev(it));
+            }
+        }
+        std::ranges::sort(ffi);
+        ffi.erase(std::ranges::unique(ffi).begin(), ffi.end());
+        for (unsigned s = 0; s < image.text_count; ++s) {
+            const Region& r = image.text[s];
+            for (const unsigned char* q = r.begin; q + 4 <= r.end; ++q) {
+                uint32_t v;
+                std::memcpy(&v, q, sizeof(v));
+                if (v == kColrTag) {
+                    g_colr_sites.push_back(reinterpret_cast<uintptr_t>(q));
+                }
+            }
+        }
+        std::ranges::sort(g_colr_sites);
+        const auto* w = reinterpret_cast<const uintptr_t*>(image.relro.begin);
+        for (const auto* w_end = reinterpret_cast<const uintptr_t*>(image.relro.end);
+             w + 1 <= w_end; ++w) {
+            if (InText(image, *w)) {
+                g_vt_starts.push_back(*w);
+            }
+        }
+        std::ranges::sort(g_vt_starts);
+        g_vt_starts.erase(std::ranges::unique(g_vt_starts).begin(), g_vt_starts.end());
+    }
+    if (syms.empty()) {
+        const auto tag = kFvarTag;
+        for (unsigned s = 0; s < image.text_count; ++s) {
+            const Region& r = image.text[s];
+            for (const unsigned char* q = r.begin; q + 4 <= r.end; ++q) {
+                uint32_t v;
+                std::memcpy(&v, q, sizeof(v));
+                if (v == tag) {
+                    fvar_sites.push_back(reinterpret_cast<uintptr_t>(q));
+                }
+            }
+        }
+        std::ranges::sort(fvar_sites);
+    }
+
+    std::ranges::sort(ffi_sites);
+    std::ranges::sort(raster_sites);
+
+    // Every text address a vtable holds is a function entry, so consecutive
+    // ones bound a function from above. The dense start set does not: it has
+    // entries inside large functions, and asking only whether the enclosing
+    // start carries the flag loses any call that sits past one of them. That
+    // is what hides a scaler context whose generate* virtuals are large.
+    std::vector<uintptr_t> vt_starts;
+    for (const uintptr_t* q = relro; q + 1 <= relro_end; ++q) {
+        if (InText(image, *q)) {
+            vt_starts.push_back(*q);
+        }
+    }
+    std::ranges::sort(vt_starts);
+    vt_starts.erase(std::ranges::unique(vt_starts).begin(), vt_starts.end());
+
+    const auto site_within = [&](const std::vector<uintptr_t>& sites, const uintptr_t fn) {
+        const auto next = std::ranges::upper_bound(vt_starts, fn);
+        const uintptr_t end = next != vt_starts.end()
+                                  ? *next
+                                  : reinterpret_cast<uintptr_t>(image.text[0].end);
+        const auto it = std::ranges::lower_bound(sites, fn);
+        return it != sites.end() && *it < end;
+    };
 
     const auto reaches = [&](const uintptr_t fn) {
-        return map.Has(fn, kCallsFfi) || map.Has(fn, kCallsFfiCaller);
+        return map.Has(fn, kCallsFfi) || map.Has(fn, kCallsFfiCaller) ||
+               site_within(ffi_sites, fn);
     };
 
     unsigned found = 0;
+    unsigned shaped_total = 0;
     void** chosen_slot = nullptr;
     uintptr_t chosen_fn = 0;
     int best_raster = -1;
@@ -650,12 +993,21 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         if (InText(image, p[kScalerContextVirtuals])) {
             continue;
         }
-        if (!reaches(slots[2]) || !reaches(slots[6])) {
+        ++shaped_total;
+        if (syms.empty()) {
+            // Either scaler: the Rust one names fvar in generateFontMetrics,
+            // the compiled-in FreeType one names the outline format in
+            // generateMetrics.
+            if (!site_within(fvar_sites, slots[kRecognizeSecond]) &&
+                !reaches(slots[kRecognizeFirst])) {
+                continue;
+            }
+        } else if (!reaches(slots[kRecognizeFirst]) || !reaches(slots[kRecognizeSecond])) {
             continue;
         }
         int raster = 0;
         for (unsigned i = 2; i < kScalerContextVirtuals; ++i) {
-            if (map.Has(slots[i], kCallsRaster)) {
+            if (map.Has(slots[i], kCallsRaster) || site_within(raster_sites, slots[i])) {
                 ++raster;
             }
         }
@@ -669,7 +1021,23 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     }
 
     if (chosen_slot == nullptr) {
-        Report("%s: no SkScalerContext vtable answering to the Fontations shape", path);
+        Report("%s: %u vtables have the SkScalerContext shape, none of them reaching "
+               "the bridge", path, shaped_total);
+        if (syms.empty() && chromium_patch::ParityWanted()) {
+            std::vector<uintptr_t> colr;
+            for (unsigned s = 0; s < image.text_count; ++s) {
+                const Region& r = image.text[s];
+                for (const unsigned char* q = r.begin; q + 4 <= r.end; ++q) {
+                    uint32_t v;
+                    std::memcpy(&v, q, sizeof(v));
+                    if (v == kColrTag) {
+                        colr.push_back(reinterpret_cast<uintptr_t>(q));
+                    }
+                }
+            }
+            std::ranges::sort(colr);
+            PatchFilterRecByColrTag(image, map, colr);
+        }
         return;
     }
     if (found > 1) {
@@ -715,33 +1083,59 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
                 const uintptr_t end = i + 1 < map.starts.size()
                                           ? map.starts[i + 1]
                                           : reinterpret_cast<uintptr_t>(image.text[0].end);
-                constexpr size_t kLargestThunk = 64;
-                if (end - start > kLargestThunk) {
+                if (constexpr size_t kLargestThunk = 64; end - start > kLargestThunk) {
                     return;
                 }
                 (target == tag_sym ? tag_targets : data_targets).push_back(start);
             });
         }
-        std::sort(tag_targets.begin(), tag_targets.end());
-        std::sort(data_targets.begin(), data_targets.end());
+        std::ranges::sort(tag_targets);
+        std::ranges::sort(data_targets);
 
         std::vector<uintptr_t> tag_sites;
         std::vector<uintptr_t> data_sites;
         if (tag_sym != 0 && data_sym != 0) {
             ForEachBranch(image, [&](const uintptr_t site, const uintptr_t target) {
-                if (std::binary_search(tag_targets.begin(), tag_targets.end(), target)) {
+                if (std::ranges::binary_search(tag_targets, target)) {
                     tag_sites.push_back(site);
-                } else if (std::binary_search(data_targets.begin(), data_targets.end(), target)) {
+                } else if (std::ranges::binary_search(data_targets, target)) {
                     data_sites.push_back(site);
                 }
             });
         }
-        std::sort(tag_sites.begin(), tag_sites.end());
-        std::sort(data_sites.begin(), data_sites.end());
+
+        // One more hop, the same allowance the anchors get above: the virtual
+        // may call a helper that holds the table call rather than making it
+        // itself. Such a helper starts no vtable entry, so a site inside it is
+        // attributed to whoever calls it instead.
+        const auto hop_to_callers = [&](std::vector<uintptr_t>* sites) {
+            std::vector<uintptr_t> holders;
+            for (const uintptr_t s : *sites) {
+                if (const auto it = std::ranges::upper_bound(map.starts, s);
+                    it != map.starts.begin()) {
+                    holders.push_back(*std::prev(it));
+                }
+            }
+            std::ranges::sort(holders);
+            holders.erase(std::ranges::unique(holders).begin(), holders.end());
+            if (holders.empty()) {
+                return;
+            }
+            ForEachBranch(image, [&](const uintptr_t site, const uintptr_t target) {
+                if (std::ranges::binary_search(holders, target)) {
+                    sites->push_back(site);
+                }
+            });
+        };
+        hop_to_callers(&tag_sites);
+        hop_to_callers(&data_sites);
+
+        std::ranges::sort(tag_sites);
+        std::ranges::sort(data_sites);
 
         const auto has_site_in = [](const std::vector<uintptr_t>& sites, const uintptr_t lo,
                                     const uintptr_t hi) {
-            const auto it = std::lower_bound(sites.begin(), sites.end(), lo);
+            const auto it = std::ranges::lower_bound(sites, lo);
             return it != sites.end() && *it < hi;
         };
 
@@ -751,14 +1145,13 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
                 vtable_entries.push_back(*p);
             }
         }
-        std::sort(vtable_entries.begin(), vtable_entries.end());
-        vtable_entries.erase(std::unique(vtable_entries.begin(), vtable_entries.end()),
-                             vtable_entries.end());
+        std::ranges::sort(vtable_entries);
+        vtable_entries.erase(std::ranges::unique(vtable_entries).begin(), vtable_entries.end());
 
         std::vector<uintptr_t> calls_tags;
         std::vector<uintptr_t> calls_data;
         for (const uintptr_t fn : vtable_entries) {
-            const auto it = std::upper_bound(map.starts.begin(), map.starts.end(), fn);
+            const auto it = std::ranges::upper_bound(map.starts, fn);
             const uintptr_t end = it != map.starts.end()
                                       ? *it
                                       : reinterpret_cast<uintptr_t>(image.text[0].end);
@@ -781,40 +1174,52 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
                calls_data.size());
     }
 
-    if (chromium_patch::ParityWanted()) {
-        void** metrics_slot = chosen_slot - 1;
-        if (InText(image, reinterpret_cast<uintptr_t>(*metrics_slot))) {
-            g_original_metrics = *metrics_slot;
-            if (WriteSlot(metrics_slot, reinterpret_cast<void*>(&chromium_metrics_thunk))) {
-                Report("%s: generateMetrics %p replaced through vtable slot %p", path,
-                       g_original_metrics, static_cast<void*>(metrics_slot));
-            } else {
-                g_original_metrics = nullptr;
-            }
+    // Every vtable that names the same three functions, not just the one the
+    // search settled on. A subclass that overrides nothing gets its own table
+    // holding the same pointers, and the object Skia hands out may be of that
+    // subclass, so patching one table alone leaves the live one untouched.
+    // The neighbours are checked as well, so a table that merely happens to
+    // hold this function at some other index is left alone.
+    void* const image_fn = *chosen_slot;
+    void* const metrics_fn = *(chosen_slot - 1);
+    void* const font_metrics_fn = *(chosen_slot + 3);
+
+    std::vector<void**> tables;
+    for (const uintptr_t* q = relro + 1; q + 4 <= relro_end; ++q) {
+        if (auto* slot = const_cast<void**>(reinterpret_cast<void* const*>(q));
+            *slot == image_fn && *(slot - 1) == metrics_fn && *(slot + 3) == font_metrics_fn) {
+            tables.push_back(slot);
         }
     }
-
-    if (chromium_patch::ParityWanted()) {
-        void** font_metrics_slot = chosen_slot + 3;
-        if (InText(image, reinterpret_cast<uintptr_t>(*font_metrics_slot))) {
-            g_original_font_metrics = *font_metrics_slot;
-            if (WriteSlot(font_metrics_slot,
-                          reinterpret_cast<void*>(&chromium_font_metrics_thunk))) {
-                Report("%s: generateFontMetrics %p replaced through vtable slot %p", path,
-                       g_original_font_metrics, static_cast<void*>(font_metrics_slot));
-            } else {
-                g_original_font_metrics = nullptr;
-            }
-        }
+    if (tables.size() > 1) {
+        Report("%s: %zu vtables name the same scaler context methods; patching each",
+               path, tables.size());
     }
 
     g_original = reinterpret_cast<void*>(chosen_fn);
-    if (WriteSlot(chosen_slot, reinterpret_cast<void*>(&chromium_hook_thunk))) {
-        Report("%s: generateImage %#lx replaced through vtable slot %p", path, chosen_fn,
-               static_cast<void*>(chosen_slot));
+    g_original_metrics = metrics_fn;
+    g_original_font_metrics = font_metrics_fn;
+    bool any = false;
+    for (void** slot : tables) {
+        if (chromium_patch::ParityWanted() && InText(image, reinterpret_cast<uintptr_t>(metrics_fn))) {
+            (void)WriteSlot(slot - 1, reinterpret_cast<void*>(&chromium_metrics_thunk));
+        }
+        if (chromium_patch::ParityWanted() &&
+            InText(image, reinterpret_cast<uintptr_t>(font_metrics_fn))) {
+            (void)WriteSlot(slot + 3, reinterpret_cast<void*>(&chromium_font_metrics_thunk));
+        }
+        if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_hook_thunk))) {
+            any = true;
+        }
+    }
+    if (any) {
+        Report("%s: generateImage %#lx replaced through %zu vtable slot(s)", path, chosen_fn,
+               tables.size());
         g_patched.store(true, std::memory_order_release);
     } else {
         g_original = nullptr;
+        g_original_metrics = nullptr;
+        g_original_font_metrics = nullptr;
     }
 }
 
@@ -835,15 +1240,16 @@ struct ModuleList
 
 int CollectModule(dl_phdr_info* info, size_t, void* out)
 {
-    auto* list = static_cast<ModuleList*>(out);
-    if (list->count < ModuleList::kMax) {
-        list->mods[list->count++] = {info->dlpi_name, info->dlpi_addr, info->dlpi_phdr,
-                                      info->dlpi_phnum};
+    if (auto* list = static_cast<ModuleList*>(out); list->count < ModuleList::kMax) {
+        list->mods[list->count++] = {.name = info->dlpi_name,
+                                     .base = info->dlpi_addr,
+                                     .phdr = info->dlpi_phdr,
+                                     .phnum = info->dlpi_phnum};
     }
     return 0;
 }
 
-std::atomic<bool> g_done{false};
+std::atomic g_done{false};
 
 // Chromium and Electron relaunch the same executable for every process role
 // and this constructor runs in each one, but only a renderer rasterizes a
@@ -918,8 +1324,7 @@ void ScanLoadedImages()
         //
         // No Fontations symbols are required here. This patch names its target
         // by the properties it reads and refuses when no single function reads
-        // them all, so it applies equally to a build whose scaler is FreeType
-        // and carries no Rust bridge at all.
+        // them all, so it applies to any Chromium build.
         ModuleList browser;
         dl_iterate_phdr(CollectModule, &browser);
         for (unsigned i = 0; i < browser.count; ++i) {
@@ -946,12 +1351,18 @@ void ScanLoadedImages()
     // and the open()/mmap() below must not run under it.
     for (unsigned i = 0; i < list.count; ++i) {
         const LoadedModule& m = list.mods[i];
-        const char* path = (m.name != nullptr && m.name[0] != '\0') ? m.name : "/proc/self/exe";
+        const char* path = m.name != nullptr && m.name[0] != '\0' ? m.name : "/proc/self/exe";
         std::vector<FfiSymbol> syms;
         // Well under what a real Fontations build exports, but enough to rule
         // out a few unrelated dynsym entries that contain the substring.
         if (!FindFfiSymbols(path, "fontations_ffi", &syms) || syms.size() < 10) {
-            continue;
+            // A build can link the same Skia with nothing exported. Only the
+            // executable itself is worth the scan, and TryPatchModule refuses
+            // when the tag anchor finds no vtable of the right shape.
+            if (m.name != nullptr && m.name[0] != '\0') {
+                continue;
+            }
+            syms.clear();
         }
         TryPatchModule(m.base, m.phdr, m.phnum, path, syms);
         return;
@@ -984,9 +1395,9 @@ windows_path::FontFacts FactsFor(void* typeface, const int ppem)
 {
     static std::unordered_map<const void*, std::pair<int, windows_path::FontFacts>> cache;
 
-    const std::lock_guard<std::mutex> lock(g_font_mutex);
-    const auto cached = cache.find(typeface);
-    if (cached != cache.end() && cached->second.first == ppem) {
+    const std::lock_guard lock(g_font_mutex);
+    if (const auto cached = cache.find(typeface);
+        cached != cache.end() && cached->second.first == ppem) {
         return cached->second.second;
     }
 
@@ -1011,7 +1422,7 @@ bool OnChromiumFilterRec(void*, void* rec)
     {
         // This flag, not anything in the Rec, is what decides in
         // skia_text_metrics.cc whether advances keep their fraction.
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("SkFont arrived with subpixelPositioning=%d hinting=%u "
                    "(flags %#x)",
@@ -1046,8 +1457,11 @@ void OnChromiumFilterRecDone(void* rec)
 // either has to agree with Windows.
 void OnChromiumMetrics(void* result, void* context, const void* glyph)
 {
+    ResolveTypefaceFromContext(context, false);
+
+
     {
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("generateMetrics hook reached (result=%p context=%p glyph=%p dwrite=%d)",
                    result, context, glyph, chromium_patch::ParityWanted() ? 1 : 0);
@@ -1058,9 +1472,9 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         return;
     }
     const skia_abi::Glyph g = skia_abi::Glyph::From(glyph);
-    void* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
     {
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("  metrics: id_known=%d id=%u typeface=%p", g.packed_id_known ? 1 : 0,
                    g.GlyphId(), typeface);
@@ -1076,11 +1490,11 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
 
     std::vector<uint8_t> font;
     {
-        const std::lock_guard<std::mutex> lock(g_font_mutex);
+        const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
     if (font.empty()) {
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("  metrics: no font bytes for typeface %p", typeface);
         }
@@ -1091,7 +1505,7 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
 
     float advance = 0;
     if (!dwrite_raster::GlyphAdvance(typeface, font, g.GlyphId(), d, &advance)) {
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("DirectWrite would not measure glyph %u; advances stay Skia's",
                    g.GlyphId());
@@ -1102,8 +1516,7 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
                 &advance, sizeof(advance));
 
     static std::atomic<uint64_t> count{0};
-    const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n <= 3) {
+    if (const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1; n <= 3) {
         Report("advance for glyph %u replaced with DirectWrite's %.3f", g.GlyphId(),
                static_cast<double>(advance));
     }
@@ -1116,10 +1529,13 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
 // a pixel here lands as a whole pixel of line height.
 void OnChromiumFontMetrics(void* context, void* metrics)
 {
+    ResolveTypefaceFromContext(context, false);
+
+
     if (context == nullptr || metrics == nullptr || !chromium_patch::ParityWanted()) {
         return;
     }
-    void* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
     if (typeface == nullptr) {
         return;
     }
@@ -1129,7 +1545,7 @@ void OnChromiumFontMetrics(void* context, void* metrics)
 
     std::vector<uint8_t> font;
     {
-        const std::lock_guard<std::mutex> lock(g_font_mutex);
+        const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
     if (font.empty()) {
@@ -1138,7 +1554,7 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     const windows_path::Decision d =
         windows_path::Decide(rec, scale_y, font_facts::Describe(font, ppem));
     if (dwrite_raster::FontMetrics(typeface, font, d, metrics)) {
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("font metrics now DirectWrite's");
         }
@@ -1152,6 +1568,8 @@ void OnChromiumFontMetrics(void* context, void* metrics)
 // to rasterize the glyph itself, which it does for anything declined here.
 bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffer)
 {
+    ResolveTypefaceFromContext(context, true);
+
     static std::atomic<uint64_t> count{0};
     const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
 
@@ -1161,7 +1579,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const skia_abi::Glyph g = skia_abi::Glyph::From(glyph);
     if (!g.LooksPlausible()) {
         // The offsets did not describe this build.
-        static std::atomic<bool> said{false};
+        static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("SkGlyph at %p does not look like one (%ux%u, mask %u); "
                    "skia_abi.h does not match this build",
@@ -1175,7 +1593,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     // gdiTextSize rounded to whole pixels is the ppem the gasp and bitmap
     // strike lookups are made at, the same as SkScalerContext_DW does.
     const int ppem = static_cast<int>(std::round(scale_y * 64.0f) / 64.0f);
-    void* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
     // Without DirectWrite the tree takes the branch Skia takes for a font with
     // no gasp and no strike.
     const windows_path::FontFacts facts =
@@ -1204,8 +1622,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
                static_cast<double>(d.text_size_render),
                static_cast<double>(d.text_size_measure), static_cast<int>(d.grid_fit_mode),
                static_cast<int>(d.anti_alias_mode), d.branch);
-        const skia_abi::PreBlend pb = skia_abi::PreBlend::From(context);
-        if (pb.Applicable()) {
+        if (const skia_abi::PreBlend pb = skia_abi::PreBlend::From(context); pb.Applicable()) {
             Report("    preblend applicable, green ramp: 0->%u 64->%u 128->%u 192->%u 255->%u",
                    pb.g[0], pb.g[64], pb.g[128], pb.g[192], pb.g[255]);
         } else {
@@ -1223,7 +1640,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 
     std::vector<uint8_t> font;
     {
-        const std::lock_guard<std::mutex> lock(g_font_mutex);
+        const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
     if (font.empty()) {
@@ -1250,12 +1667,12 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
             g.mask_format == skia_abi::kLCD16) {
             Report("LCD mask for glyph %u (%ux%u), R/G/B per pixel:", g.GlyphId(), g.width,
                    g.height);
-            const auto* px = reinterpret_cast<const uint16_t*>(image_buffer);
+            const auto* px = static_cast<const uint16_t*>(image_buffer);
             for (int row = 0; row < g.height; ++row) {
                 char line[200];
                 int at = 0;
                 for (int x = 0; x < g.width && at < 190; ++x) {
-                    const uint16_t v = px[static_cast<size_t>(row) * g.width + x];
+                    const uint16_t v = px[static_cast<size_t>(row) * g.width + static_cast<size_t>(x)];
                     const unsigned r = (v >> 11) & 0x1f;
                     const unsigned gg = (v >> 5) & 0x3f;
                     const unsigned b = v & 0x1f;
@@ -1275,7 +1692,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
                 char line[160];
                 int at = 0;
                 for (int x = 0; x < g.width && at < 150; ++x) {
-                    const uint8_t v = px[static_cast<size_t>(row) * g.width + x];
+                    const uint8_t v = px[static_cast<size_t>(row) * g.width + static_cast<size_t>(x)];
                     line[at++] = " .:-=+*#%@"[v * 9 / 255];
                 }
                 line[at] = '\0';
