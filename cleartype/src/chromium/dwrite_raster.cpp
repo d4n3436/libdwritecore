@@ -117,19 +117,27 @@ bool EnsureFactory()
 // One font face per typeface, built from the bytes typeface_bridge rebuilt,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
-IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes)
+IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes,
+                         const uint32_t face_index)
 {
     static std::unordered_map<const void*, IDWriteFontFace*> faces;
     if (const auto it = faces.find(typeface); it != faces.end()) {
         return it->second;
     }
+    // A collection carries 'ttcf' where a single face carries its SFNT
+    // version, and DirectWrite has to be told which of the two it was given
+    // before face_index means anything.
+    const bool collection = bytes.size() >= 4 && bytes[0] == 't' && bytes[1] == 't' &&
+                            bytes[2] == 'c' && bytes[3] == 'f';
+    const DWRITE_FONT_FACE_TYPE type = collection ? DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION
+                                                  : DWRITE_FONT_FACE_TYPE_TRUETYPE;
     IDWriteFontFace* face = nullptr;
     IDWriteFontFile* file = nullptr;
     if (!bytes.empty() &&
         SUCCEEDED(g_dw.loader->CreateInMemoryFontFileReference(
             g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()), nullptr, &file)) &&
         file != nullptr) {
-        if (FAILED(g_dw.factory5->CreateFontFace(DWRITE_FONT_FACE_TYPE_TRUETYPE, 1, &file, 0,
+        if (FAILED(g_dw.factory5->CreateFontFace(type, 1, &file, face_index,
                                                  DWRITE_FONT_SIMULATIONS_NONE, &face))) {
             face = nullptr;
         }
@@ -192,7 +200,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision,
                  const windows_path::RenderingMode rendering_mode,
                  const windows_path::TextureType texture_type, int* left, int* top,
-                 int* right, int* bottom)
+                 int* right, int* bottom, const uint32_t face_index)
 {
     if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) {
         return false;
@@ -201,7 +209,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
     if (face == nullptr) {
         return false;
     }
@@ -282,7 +290,8 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
 // same amount per pixel of size and a grid-fitted scaler's do not.
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   const uint16_t glyph_id, const skia_abi::Rec& rec,
-                  const windows_path::Decision& decision, float* advance_x, float* advance_y)
+                  const windows_path::Decision& decision, float* advance_x, float* advance_y,
+                  const uint32_t face_index)
 {
     if (advance_x == nullptr || advance_y == nullptr) {
         return false;
@@ -291,7 +300,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
     if (face == nullptr) {
         return false;
     }
@@ -347,7 +356,8 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
 // (SimpleFontData::PlatformInit, SetLineSpacing), so a fraction of a pixel of
 // disagreement here becomes a whole pixel of line height.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
-                 const windows_path::Decision& decision, void* sk_font_metrics)
+                 const windows_path::Decision& decision, void* sk_font_metrics,
+                 const uint32_t face_index)
 {
     if (sk_font_metrics == nullptr) {
         return false;
@@ -356,7 +366,7 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
     if (face == nullptr) {
         return false;
     }
@@ -424,7 +434,7 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer)
+                 void* image_buffer, const uint32_t face_index)
 {
     // Only a plain outline glyph. COLRv0, COLRv1 and embedded bitmaps are
     // drawn by Skia through paths an alpha texture cannot stand in for.
@@ -440,7 +450,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
     if (face == nullptr) {
         return false;
     }

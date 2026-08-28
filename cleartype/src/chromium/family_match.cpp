@@ -72,7 +72,7 @@ constexpr WeightPair kWeights[] = {
 };
 
 // map_ranges, on the fontconfig column.
-float OpenTypeWeight(const int fc_weight)
+float OpenTypeWeightImpl(const int fc_weight)
 {
     const auto value = static_cast<float>(fc_weight);
     if (value < kWeights[0].fc) {
@@ -91,7 +91,7 @@ float OpenTypeWeight(const int fc_weight)
 }
 
 // GetFirstMatchingFont's pick, among the weights the set offers.
-bool Beats(const float candidate, const float best, const float wanted)
+bool BeatsImpl(const float candidate, const float best, const float wanted)
 {
     const float d_candidate = candidate < wanted ? wanted - candidate : candidate - wanted;
     const float d_best = best < wanted ? wanted - best : best - wanted;
@@ -127,6 +127,13 @@ bool HasFamily(const PatternGetStringFn get_string, const void* font, const char
 
 namespace family_match {
 
+float OpenTypeWeight(const int fc_weight) { return OpenTypeWeightImpl(fc_weight); }
+
+bool BeatsForWindows(const float candidate, const float best, const float wanted)
+{
+    return BeatsImpl(candidate, best, wanted);
+}
+
 void ReorderForWindows(const void* pattern, void* sorted)
 {
     auto* set = static_cast<FcFontSet*>(sorted);
@@ -160,7 +167,7 @@ void ReorderForWindows(const void* pattern, void* sorted)
     if (get_integer(pattern, "weight", 0, &fc_weight) != kFcResultMatch) {
         return;
     }
-    const float wanted = OpenTypeWeight(fc_weight);
+    const float wanted = OpenTypeWeightImpl(fc_weight);
 
     // Slant is left to fontconfig. Candidates are held to the slant of the
     // face it already chose, so an italic request keeps picking among italics
@@ -192,8 +199,8 @@ void ReorderForWindows(const void* pattern, void* sorted)
             !HasFamily(get_string, font, family)) {
             continue;
         }
-        const float weight = OpenTypeWeight(font_weight);
-        if (winner < 0 || Beats(weight, best, wanted)) {
+        const float weight = OpenTypeWeightImpl(font_weight);
+        if (winner < 0 || BeatsImpl(weight, best, wanted)) {
             winner = i;
             best = weight;
         }

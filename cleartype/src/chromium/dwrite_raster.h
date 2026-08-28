@@ -42,7 +42,8 @@ bool Available();
 // cannot be had, and the caller should keep whatever Skia computed.
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   uint16_t glyph_id, const skia_abi::Rec& rec,
-                  const windows_path::Decision& decision, float* advance_x, float* advance_y);
+                  const windows_path::Decision& decision, float* advance_x, float* advance_y,
+                  uint32_t face_index = 0);
 
 // SkScalerContext_DW::generateDWMetrics, the box DirectWrite will fill.
 // Fontations instead rounds out an unhinted outline, which can sit a pixel
@@ -56,17 +57,18 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision,
                  windows_path::RenderingMode rendering_mode,
                  windows_path::TextureType texture_type,
-                 int* left, int* top, int* right, int* bottom);
+                 int* left, int* top, int* right, int* bottom, uint32_t face_index = 0);
 
 // The font-wide metrics Windows would report, written into an SkFontMetrics.
 // False when they cannot be had, and the caller keeps Skia's own.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
-                 const windows_path::Decision& decision, void* sk_font_metrics);
+                 const windows_path::Decision& decision, void* sk_font_metrics,
+                 uint32_t face_index = 0);
 
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer);
+                 void* image_buffer, uint32_t face_index = 0);
 
 }  // namespace dwrite_raster
 

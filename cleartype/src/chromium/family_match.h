@@ -31,6 +31,16 @@ namespace family_match {
 // family, which is how the per-character fallback sort is left alone.
 void ReorderForWindows(const void* pattern, void* sorted);
 
+// map_ranges on the fontconfig weight column, so a candidate's fontconfig
+// weight reads as the weight its OS/2 table holds.
+float OpenTypeWeight(int fc_weight);
+
+// GetFirstMatchingFont's pick between two OpenType weights, for a request of
+// `wanted`. True when `candidate` is the one DirectWrite would answer with.
+// cleartype/src/chromium/bold_fallback.cpp asks the same question of a family
+// whose faces it is choosing among.
+bool BeatsForWindows(float candidate, float best, float wanted);
+
 }  // namespace family_match
 
 #endif  // CHROMIUM_FAMILY_MATCH_H_INCLUDED

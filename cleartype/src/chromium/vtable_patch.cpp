@@ -56,6 +56,7 @@
 #include "skia_abi.h"
 #include "typeface_bridge.h"
 #include "font_facts.h"
+#include "bold_fallback.h"
 #include "dwrite_raster.h"
 #include "render_params.h"
 #include "parity_gate.h"
@@ -1749,10 +1750,26 @@ windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int 
 // should go on to run that, which it always should. This only needs to see
 // the flags first, because Fontations clears kGenA8FromLCD_Flag and that flag
 // is the only sign the surface cannot show subpixel text.
-bool OnChromiumFilterRec(void*, void* rec)
+bool OnChromiumFilterRec(void* self, void* rec)
 {
     if (rec == nullptr) {
         return true;
+    }
+    // Before Fontations turns a synthetic bold into a stroke. A family with a
+    // real bold face is given it instead, which is the face Windows was handed
+    // and the reason its rec carries no stroke at all.
+    if (self != nullptr && chromium_patch::ParityWanted()) {
+        std::vector<uint8_t> font;
+        {
+            const std::lock_guard lock(g_font_mutex);
+            font = FontBytesLocked(self);
+        }
+        if (!font.empty() && bold_fallback::ClearSyntheticBold(rec, font)) {
+            static std::atomic said{false};
+            if (!said.exchange(true)) {
+                Report("synthetic bold replaced with a real bold face");
+            }
+        }
     }
     const uint16_t arrived = skia_abi::Read<uint16_t>(rec, skia_abi::kRecFlags);
     g_flags_before_filter.store(arrived, std::memory_order_relaxed);
@@ -1792,6 +1809,25 @@ void OnChromiumFilterRecDone(void* rec)
 // The bounds are left as Skia computed them. They are the box generateImage
 // is then asked to fill, and the two have to agree with each other more than
 // either has to agree with Windows.
+// Blink asked for bold, fell back to a face that has none, and settled for the
+// stroke useStrokeForFakeBold leaves in the rec. Windows was handed the real
+// Bold face instead, whose advances come from its own hmtx, so that face is
+// what gets measured and drawn here. Null when this is not such a run.
+//
+// DirectWrite caches a font face per key and the typeface here is still the
+// regular one, so the substitute is keyed on its own bytes, which live in
+// bold_fallback's table for the life of the process.
+static bold_fallback::Face BoldSubstitute(const void* context, const std::vector<uint8_t>& font)
+{
+    const float frame_width = skia_abi::Read<float>(
+        static_cast<const unsigned char*>(context) + skia_abi::kContextRec,
+        skia_abi::kRecFrameWidth);
+    if (!bold_fallback::WasMarked(frame_width)) {
+        return {};
+    }
+    return bold_fallback::RealBoldFor(font);
+}
+
 void OnChromiumMetrics(void* result, void* context, const void* glyph)
 {
     ResolveTypefaceFromContext(context, false);
@@ -1839,13 +1875,24 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         }
         return;
     }
+    const std::vector<uint8_t>* use = &font;
+    const void* face_key = typeface;
+    uint32_t face_index = 0;
+    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+        bold.bytes != nullptr) {
+        use = bold.bytes;
+        face_key = bold.bytes->data();
+        face_index = bold.face_index;
+    }
+
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(font, gasp_ppem, bitmap_ppem));
+                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem));
 
     float advance = 0;
     float advance_y = 0;
-    if (!dwrite_raster::GlyphAdvance(typeface, font, g.GlyphId(), rec, d, &advance, &advance_y)) {
+    if (!dwrite_raster::GlyphAdvance(face_key, *use, g.GlyphId(), rec, d, &advance,
+                                     &advance_y, face_index)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("DirectWrite would not measure glyph %u; advances stay Skia's",
@@ -1870,13 +1917,17 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         skia_abi::Read<uint8_t>(result, skia_abi::kMetricsMaskFormat);
     const auto metrics_bits =
         skia_abi::Read<uint16_t>(result, skia_abi::kMetricsExtraBits);
-    if (metrics_mask != skia_abi::kARGB32 && metrics_bits == skia_abi::kFontationsPath) {
+    // A substituted face is asked for its box too, and it is the box that
+    // decides where the mask is drawn.
+    if (metrics_mask != skia_abi::kARGB32 &&
+        (metrics_bits == skia_abi::kFontationsPath || use != &font)) {
         int left = 0;
         int top = 0;
         int right = 0;
         int bottom = 0;
-        if (dwrite_raster::GlyphBounds(typeface, font, g, rec, d, d.rendering_mode,
-                                       d.texture_type, &left, &top, &right, &bottom)) {
+        if (dwrite_raster::GlyphBounds(face_key, *use, g, rec, d, d.rendering_mode,
+                                       d.texture_type, &left, &top, &right, &bottom,
+                                       face_index)) {
             const float box[4] = {static_cast<float>(left), static_cast<float>(top),
                                   static_cast<float>(right), static_cast<float>(bottom)};
             std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsBounds, box,
@@ -1889,6 +1940,13 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         // then draws the glyph a different way. Nothing here follows it that
         // far, so Skia's own bounds stay and so does its image.
     }
+
+    // useStrokeForFakeBold leaves a frame width behind, and SkScalerContext
+    // sets fGenerateImageFromPath for any rec that has one, so the glyph is
+    // stroked from its own outline and generateImage is never asked for a
+    // mask. Windows carries no stroke on this run, having been given a real
+    // bold face, so the mask is asked for here and the substitute is what
+    // fills it.
 
     static std::atomic<uint64_t> count{0};
     if (const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1; n <= 3) {
@@ -1930,10 +1988,20 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     if (font.empty()) {
         return;
     }
+    const std::vector<uint8_t>* use = &font;
+    const void* face_key = typeface;
+    uint32_t face_index = 0;
+    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+        bold.bytes != nullptr) {
+        use = bold.bytes;
+        face_key = bold.bytes->data();
+        face_index = bold.face_index;
+    }
+
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(font, gasp_ppem, bitmap_ppem));
-    if (dwrite_raster::FontMetrics(typeface, font, d, metrics)) {
+                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem));
+    if (dwrite_raster::FontMetrics(face_key, *use, d, metrics, face_index)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("font metrics now DirectWrite's");
@@ -1977,11 +2045,31 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
     auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    // The bytes of the face that will actually be drawn. A substituted bold
+    // face answers the gasp and strike questions for itself, so it has to be
+    // resolved before the tree is walked and not just before the draw.
+    std::vector<uint8_t> font;
+    if (chromium_patch::ParityWanted()) {
+        const std::lock_guard lock(g_font_mutex);
+        font = FontBytesLocked(typeface);
+    }
+    const std::vector<uint8_t>* use = &font;
+    const void* face_key = typeface;
+    uint32_t face_index = 0;
+    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+        bold.bytes != nullptr) {
+        use = bold.bytes;
+        face_key = bold.bytes->data();
+        face_index = bold.face_index;
+    }
+
     // Without DirectWrite the tree takes the branch Skia takes for a font with
     // no gasp and no strike.
     const windows_path::FontFacts facts =
-        chromium_patch::ParityWanted() ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
-                                       : windows_path::FontFacts{};
+        chromium_patch::ParityWanted()
+            ? (use == &font ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
+                            : font_facts::Describe(*use, gasp_ppem, bitmap_ppem))
+            : windows_path::FontFacts{};
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y, facts);
 
@@ -2023,18 +2111,14 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
         return false;
     }
 
-    std::vector<uint8_t> font;
-    {
-        const std::lock_guard lock(g_font_mutex);
-        font = FontBytesLocked(typeface);
-    }
     if (font.empty()) {
         return false;
     }
 
     const skia_abi::PreBlend preblend = skia_abi::PreBlend::From(context);
     const bool drawn =
-        dwrite_raster::RenderGlyph(typeface, font, rec, g, preblend, d, image_buffer);
+        dwrite_raster::RenderGlyph(face_key, *use, rec, g, preblend, d, image_buffer,
+                                   face_index);
     static std::atomic<uint64_t> drawn_count{0};
     static std::atomic<uint64_t> declined_count{0};
     const uint64_t seen =
@@ -2091,6 +2175,9 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 __attribute__((constructor)) static void ChromiumPatchInit()
 {
     ScanLoadedImages();
+    // Mapping the bold faces needs the filesystem too, and a renderer forked
+    // from here inherits the mappings it can no longer make for itself.
+    bold_fallback::MapAtLoad();
     // Creating the factory needs the filesystem, so a renderer that waits
     // until it is sandboxed gets nothing. One forked from here inherits a built
     // factory, and its fonts come from memory.

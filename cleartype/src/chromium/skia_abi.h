@@ -68,6 +68,8 @@ enum MaskFormat : uint8_t
 // SkScalerContext flags
 enum Flags : uint16_t
 {
+    kFrameAndFill = 0x0001,
+    kEmbolden = 0x0008,
     kEmbeddedBitmapText = 0x0004,
     kLCD_Vertical = 0x0200,
     kLCD_BGROrder = 0x0400,
