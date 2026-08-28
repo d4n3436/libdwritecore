@@ -1685,10 +1685,29 @@ void ScanLoadedImages()
 std::mutex g_font_mutex;
 std::unordered_map<const void*, std::vector<uint8_t>> g_fonts;
 
+// The caches below are keyed on the typeface pointer, which only identifies a
+// font while that address still belongs to the same object. Skia frees
+// typefaces and the allocator hands the address back, and the entry then
+// answers for the wrong font. One reference is taken so a cached typeface
+// outlives its cache entry. SkTypeface derives from SkRefCntBase, whose only
+// field is the count, so it sits one pointer into the object.
+void HoldTypeface(void* typeface)
+{
+    auto* count = reinterpret_cast<std::atomic<int32_t>*>(
+        static_cast<unsigned char*>(typeface) + sizeof(void*));
+    // A live typeface holds a small positive count. Anything else is not the
+    // field this expects, and is left alone.
+    if (const int32_t now = count->load(std::memory_order_relaxed);
+        now > 0 && now < (1 << 20)) {
+        (void)count->fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 const std::vector<uint8_t>& FontBytesLocked(void* typeface)
 {
     auto font = g_fonts.find(typeface);
     if (font == g_fonts.end()) {
+        HoldTypeface(typeface);
         std::vector<uint8_t> bytes = typeface_bridge::ReadFontFile(typeface);
         if (bytes.empty()) {
             Report("typeface %p: no font (its onGetTableTags/onGetTableData could not be "
@@ -1701,18 +1720,26 @@ const std::vector<uint8_t>& FontBytesLocked(void* typeface)
     return font->second;
 }
 
-windows_path::FontFacts FactsFor(void* typeface, const int ppem)
+windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int bitmap_ppem)
 {
-    static std::unordered_map<const void*, std::pair<int, windows_path::FontFacts>> cache;
+    struct Cached
+    {
+        int gasp_ppem;
+        int bitmap_ppem;
+        windows_path::FontFacts facts;
+    };
+    static std::unordered_map<const void*, Cached> cache;
 
     const std::lock_guard lock(g_font_mutex);
     if (const auto cached = cache.find(typeface);
-        cached != cache.end() && cached->second.first == ppem) {
-        return cached->second.second;
+        cached != cache.end() && cached->second.gasp_ppem == gasp_ppem &&
+        cached->second.bitmap_ppem == bitmap_ppem) {
+        return cached->second.facts;
     }
 
-    const windows_path::FontFacts facts = font_facts::Describe(FontBytesLocked(typeface), ppem);
-    cache[typeface] = {ppem, facts};
+    const windows_path::FontFacts facts =
+        font_facts::Describe(FontBytesLocked(typeface), gasp_ppem, bitmap_ppem);
+    cache[typeface] = {gasp_ppem, bitmap_ppem, facts};
     return facts;
 }
 
@@ -1796,7 +1823,9 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
 
     const skia_abi::Rec rec = skia_abi::Rec::From(context);
     const float scale_y = windows_path::DeviceScaleY(rec);
-    const int ppem = static_cast<int>(std::round(scale_y * 64.0f) / 64.0f);
+    const float gdi_text_size = std::round(scale_y * 64.0f) / 64.0f;
+    const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
+    const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
     std::vector<uint8_t> font;
     {
@@ -1811,7 +1840,7 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         return;
     }
     const windows_path::Decision d =
-        windows_path::Decide(rec, scale_y, font_facts::Describe(font, ppem));
+        windows_path::Decide(rec, scale_y, font_facts::Describe(font, gasp_ppem, bitmap_ppem));
 
     float advance = 0;
     if (!dwrite_raster::GlyphAdvance(typeface, font, g.GlyphId(), d, &advance)) {
@@ -1853,7 +1882,9 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     }
     const skia_abi::Rec rec = skia_abi::Rec::From(context);
     const float scale_y = windows_path::DeviceScaleY(rec);
-    const int ppem = static_cast<int>(std::round(scale_y * 64.0f) / 64.0f);
+    const float gdi_text_size = std::round(scale_y * 64.0f) / 64.0f;
+    const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
+    const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
     std::vector<uint8_t> font;
     {
@@ -1864,7 +1895,7 @@ void OnChromiumFontMetrics(void* context, void* metrics)
         return;
     }
     const windows_path::Decision d =
-        windows_path::Decide(rec, scale_y, font_facts::Describe(font, ppem));
+        windows_path::Decide(rec, scale_y, font_facts::Describe(font, gasp_ppem, bitmap_ppem));
     if (dwrite_raster::FontMetrics(typeface, font, d, metrics)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
@@ -1902,14 +1933,18 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 
     const skia_abi::Rec rec = skia_abi::Rec::From(context);
     const float scale_y = windows_path::DeviceScaleY(rec);
-    // gdiTextSize rounded to whole pixels is the ppem the gasp and bitmap
-    // strike lookups are made at, the same as SkScalerContext_DW does.
-    const int ppem = static_cast<int>(std::round(scale_y * 64.0f) / 64.0f);
+    // SkScalerContext_DW asks the gasp table at SkScalarRoundToInt(gdiTextSize)
+    // and the bitmap strike at SkScalarTruncToInt(gdiTextSize), which differ
+    // whenever the size has a fraction.
+    const float gdi_text_size = std::round(scale_y * 64.0f) / 64.0f;
+    const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
+    const int bitmap_ppem = static_cast<int>(gdi_text_size);
     auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
     // Without DirectWrite the tree takes the branch Skia takes for a font with
     // no gasp and no strike.
     const windows_path::FontFacts facts =
-        chromium_patch::ParityWanted() ? FactsFor(typeface, ppem) : windows_path::FontFacts{};
+        chromium_patch::ParityWanted() ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
+                                       : windows_path::FontFacts{};
     const windows_path::Decision d = windows_path::Decide(rec, scale_y, facts);
 
     // Enough to see what the tree decides, without a line per glyph forever.

@@ -384,6 +384,20 @@ def wait_for_removal(path, deadline=WORK_TIMEOUT):
         time.sleep(POLL)
 
 
+def park_pointer(browser):
+    """Move the pointer to the top-left corner of the viewport.
+
+    Chromium keeps :hover wherever the pointer last sat, so a machine whose
+    pointer happens to rest on a link captures it underlined and in its hover
+    color. The corner is page background on both sides. Only the CDP driver can
+    send input, and the WebDriver one leaves its pointer outside the window.
+    """
+    if not hasattr(browser, "call"):
+        return
+    browser.call("Input.dispatchMouseEvent",
+                 {"type": "mouseMoved", "x": 1, "y": 1, "buttons": 0})
+
+
 def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT):
     """Put the browser into the compared state and hand off for two shots.
 
@@ -399,6 +413,7 @@ def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT):
     state = browser.script(MARK, [scroll])
     await_condition(browser, VIEWPORT_READY, deadline,
                     "the viewport never settled after scrolling", [scroll])
+    park_pointer(browser)
     browser.script_async(PAINTED)
     print(json.dumps({"inner": state}), flush=True)
 

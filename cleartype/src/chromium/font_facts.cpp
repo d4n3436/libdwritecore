@@ -20,6 +20,7 @@
 #include "font_facts.h"
 
 #include <cstring>
+#include <string>
 
 namespace font_facts {
 namespace {
@@ -161,12 +162,63 @@ bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range)
     return false;
 }
 
+// The typeface family name, which is name ID 1. Unicode and Windows records
+// are UTF-16BE and Macintosh ones are single byte, and all are read since a
+// font need not carry any one of them.
+std::string FamilyName(const std::vector<uint8_t>& font)
+{
+    const Span name = FindTable(font, Tag('n', 'a', 'm', 'e'));
+    if (name.data == nullptr || name.size < 6) {
+        return {};
+    }
+    const uint16_t count = Be16(name.data + 2);
+    const uint16_t storage = Be16(name.data + 4);
+    if (name.size < 6 + static_cast<size_t>(count) * 12) {
+        return {};
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        const uint8_t* r = name.data + 6 + static_cast<size_t>(i) * 12;
+        if (Be16(r + 6) != 1) {       // name ID 1, the family
+            continue;
+        }
+        const uint16_t platform = Be16(r);
+        const uint16_t length = Be16(r + 8);
+        const size_t at = storage + Be16(r + 10);
+        if (at + length > name.size) {
+            continue;
+        }
+        std::string out;
+        if (platform == 0 || platform == 3) {   // UTF-16BE, ASCII is enough here
+            for (uint16_t k = 1; k < length; k += 2) {
+                out.push_back(static_cast<char>(name.data[at + k]));
+            }
+        } else {
+            out.assign(reinterpret_cast<const char*>(name.data + at), length);
+        }
+        if (!out.empty()) {
+            return out;
+        }
+    }
+    return {};
+}
+
+// The families blink refuses embedded bitmaps for, from
+// bitmap_glyphs_block_list.cc. Calibri is the one font with both bitmaps and
+// outlines for Latin, and its bitmaps space unevenly under subpixel
+// positioning.
+bool BlocksEmbeddedBitmaps(const std::vector<uint8_t>& font)
+{
+    const std::string family = FamilyName(font);
+    return family == "Calibri" || family == "Courier New";
+}
+
 bool HasCbdt(const std::vector<uint8_t>& font)
 {
     return FindTable(font, Tag('C', 'B', 'D', 'T')).data != nullptr;
 }
 
-windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gdi_ppem)
+windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gasp_ppem,
+                                 const int bitmap_ppem)
 {
     windows_path::FontFacts f;
     if (font.empty()) {
@@ -174,21 +226,24 @@ windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gdi
     }
     f.is_hinted = IsHinted(font);
     f.has_cbdt = HasCbdt(font);
+    f.blocks_embedded_bitmaps = BlocksEmbeddedBitmaps(font);
 
     GaspRange range;
-    if (GaspRangeFor(font, gdi_ppem, &range)) {
+    if (GaspRangeFor(font, gasp_ppem, &range)) {
         f.gasp_known = true;
         f.gasp_version_1_or_later = range.version >= 1;
         f.gasp_symmetric_smoothing = SymmetricSmoothing(range.flags);
         f.gasp_gridfit_only = IsGridfitOnly(range.flags);
     }
 
-    // has_bitmap_strike is asked with the gasp range for this ppem, and with
-    // a bare range when that range is not gridfit-only, the same narrowing
-    // SkScalerContext_DW's constructor does before calling it.
-    GaspRange bitmap_range{gdi_ppem, gdi_ppem, 0, 0};
-    if (f.gasp_known && f.gasp_gridfit_only) {
-        bitmap_range = range;
+    // has_bitmap_strike is asked with the gasp range at the truncated ppem,
+    // and with a bare range when that range is not gridfit-only, the same
+    // narrowing SkScalerContext_DW's constructor does before calling it. Its
+    // lookup is its own, at a ppem that need not equal the gasp one.
+    GaspRange bitmap_range{bitmap_ppem, bitmap_ppem, 0, 0};
+    if (GaspRange at_bitmap; GaspRangeFor(font, bitmap_ppem, &at_bitmap) &&
+                             IsGridfitOnly(at_bitmap.flags)) {
+        bitmap_range = at_bitmap;
     }
     f.has_bitmap_strike = HasBitmapStrike(font, bitmap_range);
     return f;

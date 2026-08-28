@@ -93,6 +93,10 @@ struct FontFacts
     bool is_hinted = false;           // a non-empty fpgm, prep or cvt
     bool has_cbdt = false;
 
+    // Blink refuses embedded bitmaps for two families by name, in
+    // bitmap_glyphs_block_list.cc, and asks for them everywhere else.
+    bool blocks_embedded_bitmaps = false;
+
     bool factory2 = true;             // DWriteCore always has IDWriteFactory2
     bool fontface2 = true;
 };

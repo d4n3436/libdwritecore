@@ -85,7 +85,10 @@ Decision Decide(const skia_abi::Rec& rec, const float scale_y, const FontFacts& 
     // bitmap strike if the range is gridfit only and contains a bitmap.
     bool treat_like_bitmap = false;
     bool axis_aligned_bitmap = false;
-    if (rec.WantsEmbeddedBitmaps()) {
+    // Chromium asks for embedded bitmaps whatever fontconfig says, since
+    // FontPlatformData::CreateSkFont sets the flag from the block list after
+    // applying the render style, so the live Linux flag is not the answer.
+    if (!facts.blocks_embedded_bitmaps) {
         treat_like_bitmap = facts.has_bitmap_strike;
         axis_aligned_bitmap = IsAxisAligned(rec);
     }

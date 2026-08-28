@@ -152,6 +152,15 @@ constexpr const char* kMath[] = {"Cambria Math"};
 constexpr const char* kArrowsSimple[] = {"Segoe UI Symbol", "Cambria Math"};
 constexpr const char* kArrows[] = {"Cambria Math", "Segoe UI Symbol"};
 constexpr const char* kBlockElements[] = {"Lucida Sans Unicode", "MS PGothic"};
+
+// The characters Windows answers from the emoji font rather than the symbol
+// font. These are the emoji-presentation ones, and the rows below are the
+// runs DirectWrite was measured to split at.
+constexpr const char* kEmoji[] = {"Segoe UI Emoji"};
+
+// The supplementary Han blocks. Windows answers these from one family
+// whatever the locale, unlike the unified block.
+constexpr const char* kHanSupplementary[] = {"SimSun-ExtB"};
 constexpr const char* kSpecials[] = {"Tahoma"};
 constexpr const char* kSegoeHistoric[] = {"Segoe UI Historic"};
 constexpr const char* kSegoeHistoricOrSymbol[] = {"Segoe UI Historic", "Segoe UI Symbol"};
@@ -238,7 +247,41 @@ const ScriptFonts kScripts[] = {
     DWC_SCRIPT(0x2200, 0x22FF, kMath),                     // Mathematical operators
     DWC_SCRIPT(0x2300, 0x23FF, kMath),                     // Miscellaneous technical
     DWC_SCRIPT(0x2440, 0x245F, kSegoeSymbol),              // Optical character recognition
+    DWC_SCRIPT(0x25FD, 0x25FE, kEmoji),
+    DWC_SCRIPT(0x2614, 0x2615, kEmoji),
+    DWC_SCRIPT(0x261D, 0x261D, kEmoji),
+    DWC_SCRIPT(0x2648, 0x2653, kEmoji),
+    DWC_SCRIPT(0x267F, 0x267F, kEmoji),
+    DWC_SCRIPT(0x2693, 0x2693, kEmoji),
+    DWC_SCRIPT(0x26A1, 0x26A1, kEmoji),
+    DWC_SCRIPT(0x26AA, 0x26AB, kEmoji),
+    DWC_SCRIPT(0x26BD, 0x26BE, kEmoji),
+    DWC_SCRIPT(0x26C4, 0x26C5, kEmoji),
+    DWC_SCRIPT(0x26CE, 0x26CE, kEmoji),
+    DWC_SCRIPT(0x26D4, 0x26D4, kEmoji),
+    DWC_SCRIPT(0x26EA, 0x26EA, kEmoji),
+    DWC_SCRIPT(0x26F2, 0x26F3, kEmoji),
+    DWC_SCRIPT(0x26F5, 0x26F5, kEmoji),
+    DWC_SCRIPT(0x26F9, 0x26FA, kEmoji),
+    DWC_SCRIPT(0x26FD, 0x26FD, kEmoji),
+    DWC_SCRIPT(0x2705, 0x2705, kEmoji),
+    DWC_SCRIPT(0x270A, 0x270D, kEmoji),
+    DWC_SCRIPT(0x2728, 0x2728, kEmoji),
+    DWC_SCRIPT(0x274C, 0x274C, kEmoji),
+    DWC_SCRIPT(0x274E, 0x274E, kEmoji),
+    DWC_SCRIPT(0x2753, 0x2755, kEmoji),
+    DWC_SCRIPT(0x2757, 0x2757, kEmoji),
+    DWC_SCRIPT(0x2795, 0x2797, kEmoji),
+    DWC_SCRIPT(0x27B0, 0x27B0, kEmoji),
+    DWC_SCRIPT(0x27BF, 0x27BF, kEmoji),
+    // The pictograph blocks, which hold no text-presentation characters.
+    DWC_SCRIPT(0x1F300, 0x1F5FF, kEmoji),
+    DWC_SCRIPT(0x1F600, 0x1F64F, kEmoji),
+    DWC_SCRIPT(0x1F680, 0x1F6FF, kEmoji),
+    DWC_SCRIPT(0x1F900, 0x1F9FF, kEmoji),
     DWC_SCRIPT(0x2580, 0x259F, kBlockElements),
+    DWC_SCRIPT(0x2600, 0x27BF, kSegoeSymbol),              // Symbols and dingbats
+    DWC_SCRIPT(0x20000, 0x2FA1F, kHanSupplementary),
     DWC_SCRIPT(0xFFF0, 0xFFFF, kSpecials),
     DWC_SCRIPT(0x1100, 0x11FF, kHangul),        // Hangul Jamo
     DWC_SCRIPT(0xAC00, 0xD7AF, kHangul),        // Hangul syllables
@@ -366,6 +409,7 @@ struct FamilyList
 {
     const char* const* families;
     unsigned count;
+    bool han;
 };
 
 FamilyList ScriptFor(const unsigned codepoint)
@@ -375,14 +419,28 @@ FamilyList ScriptFor(const unsigned codepoint)
             continue;
         }
         if (s.families != kSimplifiedHan) {
-            return {s.families, s.count};
+            return {s.families, s.count, false};
         }
         unsigned count = 0;
         const char* const* families = HanFamilies(&count);
-        return {families, count};
+        return {families, count, true};
     }
-    return {nullptr, 0};
+    return {nullptr, 0, false};
 }
+
+// What FontCache::GetFallbackFamilyNameFromHardcodedChoices walks when no
+// script font covers the character, transcribed from font_cache_skia_win.cc.
+// Both lists keep the fonts no Windows ships, which ShipsWithWindows drops,
+// so the order stays comparable to the source.
+constexpr const char* kCjkLastResort[] = {
+    "arial unicode ms", "ms pgothic", "simsun",         "gulim",     "pmingliu",
+    "wenquanyi zen hei", "ar pl shanheisun uni",        "ar pl zenkai uni",
+    "han nom a",         "code2000"};
+constexpr const char* kCommonLastResort[] = {
+    "tahoma",       "arial unicode ms", "lucida sans unicode", "microsoft sans serif",
+    "palatino linotype", "dejavu serif", "dejavu sasns",       "freeserif",
+    "freesans",     "gentium",          "gentiumalt",          "ms pgothic",
+    "simsun",       "gulim",            "pmingliu",            "code2000"};
 
 // Which families the last sorts turned up, and the charset of each. Small and
 // bounded, since a fallback set is a few hundred fonts at most and only the
@@ -405,7 +463,7 @@ void Remember(const void* charset, const char* family)
         return;
     }
     for (unsigned i = 0; i < g_known_count; ++i) {
-        if (g_known[i].charset == charset) {
+        if (g_known[i].charset == charset && strcasecmp(g_known[i].family, family) == 0) {
             return;
         }
     }
@@ -425,6 +483,18 @@ const char* FamilyOf(const void* charset)
         }
     }
     return nullptr;
+}
+
+// Whether this font answers to that family name. Asked instead of comparing
+// against FamilyOf, which can only report one of the names.
+bool HasFamily(const void* charset, const char* family)
+{
+    for (unsigned i = 0; i < g_known_count; ++i) {
+        if (g_known[i].charset == charset && strcasecmp(g_known[i].family, family) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const void* CharSetOfFamily(const char* family)
@@ -451,14 +521,10 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
     if (!chromium_patch::ParityWanted() || answer == 0) {
         return answer;          // a miss stays a miss
     }
-    const FamilyList script = ScriptFor(codepoint);
-    if (script.families == nullptr) {
-        return answer;
-    }
-    const char* mine = FamilyOf(charset);
-    if (mine == nullptr) {
+    if (FamilyOf(charset) == nullptr) {
         return answer;          // not a font from a fallback sort
     }
+    const FamilyList script = ScriptFor(codepoint);
     // The first candidate that exists and actually covers this character.
     for (unsigned i = 0; i < script.count; ++i) {
         if (!ShipsWithWindows(script.families[i])) {
@@ -468,7 +534,23 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
             candidate == nullptr || real(candidate, codepoint) == 0) {
             continue;
         }
-        return strcasecmp(mine, script.families[i]) == 0 ? 1 : 0;
+        return HasFamily(charset, script.families[i]) ? 1 : 0;
+    }
+    // No script font covers it, which is where Windows walks its last-resort
+    // list. Characters with no script row at all arrive here too, and that is
+    // the same path they take there.
+    const char* const* last = script.han ? kCjkLastResort : kCommonLastResort;
+    const unsigned last_count = script.han ? DWC_COUNT(kCjkLastResort)
+                                           : DWC_COUNT(kCommonLastResort);
+    for (unsigned i = 0; i < last_count; ++i) {
+        if (!ShipsWithWindows(last[i])) {
+            continue;
+        }
+        if (const void* candidate = CharSetOfFamily(last[i]);
+            candidate == nullptr || real(candidate, codepoint) == 0) {
+            continue;
+        }
+        return HasFamily(charset, last[i]) ? 1 : 0;
     }
     return answer;              // none of them, so leave fontconfig's answer
 }
@@ -495,9 +577,18 @@ void NoteFontSet(const void* pattern, void* sorted)
     }
     for (int i = 0; i < set->nfont; ++i) {
         void* charset = nullptr;
-        unsigned char* family = nullptr;
-        if (get_charset(set->fonts[i], "charset", 0, &charset) == kFcResultMatch &&
-            get_string(set->fonts[i], "family", 0, &family) == kFcResultMatch) {
+        if (get_charset(set->fonts[i], "charset", 0, &charset) != kFcResultMatch) {
+            continue;
+        }
+        // A font answers to every name in its family list, and the Windows CJK
+        // families lead with the UI variant. Learning only the first files
+        // Microsoft YaHei under Microsoft YaHei UI, and the table, which asks
+        // for the name Chromium uses, never finds it.
+        for (int n = 0;; ++n) {
+            unsigned char* family = nullptr;
+            if (get_string(set->fonts[i], "family", n, &family) != kFcResultMatch) {
+                break;
+            }
             Remember(charset, reinterpret_cast<const char*>(family));
         }
     }

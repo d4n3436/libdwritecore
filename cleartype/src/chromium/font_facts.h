@@ -31,8 +31,10 @@ bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range);
 bool HasCbdt(const std::vector<uint8_t>& font);
 
 // Everything the Windows decision tree wants to know about this font, at the
-// size it is about to be rendered.
-windows_path::FontFacts Describe(const std::vector<uint8_t>& font, int gdi_ppem);
+// size it is about to be rendered. SkScalerContext_DW rounds gdiTextSize for
+// the gasp lookup and truncates it for the bitmap strike, so both arrive.
+windows_path::FontFacts Describe(const std::vector<uint8_t>& font, int gasp_ppem,
+                                 int bitmap_ppem);
 
 }  // namespace font_facts
 
