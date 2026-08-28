@@ -162,6 +162,8 @@ constexpr size_t kMetricsAdvanceY = 4;
 constexpr size_t kMetricsBounds = 8;      // SkRect
 constexpr size_t kMetricsMaskFormat = 24;
 constexpr size_t kMetricsExtraBits = 26;  // uint16_t
+constexpr size_t kMetricsNeverRequestPath = 28;  // bool
+constexpr size_t kMetricsComputeFromPath = 29;   // bool
 constexpr size_t kMetricsSize = 64;
 
 // SkFontMetrics, filled by generateFontMetrics. All SkScalar but for the
@@ -172,6 +174,7 @@ constexpr size_t kFontMetricsAscent = 8;
 constexpr size_t kFontMetricsDescent = 12;
 constexpr size_t kFontMetricsBottom = 16;
 constexpr size_t kFontMetricsLeading = 20;
+constexpr size_t kFontMetricsAvgCharWidth = 24;
 constexpr size_t kFontMetricsMaxCharWidth = 28;
 constexpr size_t kFontMetricsXMin = 32;
 constexpr size_t kFontMetricsXMax = 36;

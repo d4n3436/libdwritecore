@@ -44,6 +44,13 @@ bool BothZero(const float a, const float b)
 
 }  // namespace
 
+skia_abi::Rec WithWindowsHinting(skia_abi::Rec rec)
+{
+    rec.flags &= static_cast<uint16_t>(~skia_abi::kHintingMask);
+    rec.flags |= static_cast<uint16_t>(skia_abi::kHintingNormal << skia_abi::kHintingShift);
+    return rec;
+}
+
 bool IsAxisAligned(const skia_abi::Rec& rec)
 {
     return rec.pre_skew_x == 0.0f &&
@@ -51,18 +58,108 @@ bool IsAxisAligned(const skia_abi::Rec& rec)
             BothZero(rec.post2x2[0][0], rec.post2x2[1][1]));
 }
 
+namespace {
+
+// SkMatrix22.cpp, SkComputeGivensRotation. G is Q^T for the QR of A, chosen
+// so that GA[0][1] is zero. setSinCos(s, c) lays out as scaleX=c, skewX=-s,
+// skewY=s, scaleY=c.
+Matrix2x2 GivensRotation(const float a, const float b)
+{
+    float c;
+    float s;
+    if (b == 0.0f) {
+        c = std::copysign(1.0f, a);
+        s = 0.0f;
+    } else if (a == 0.0f) {
+        c = 0.0f;
+        s = -std::copysign(1.0f, b);
+    } else if (std::fabs(b) > std::fabs(a)) {
+        const float t = a / b;
+        const float u = std::copysign(std::sqrt(1.0f + t * t), b);
+        s = -1.0f / u;
+        c = -s * t;
+    } else {
+        const float t = b / a;
+        const float u = std::copysign(std::sqrt(1.0f + t * t), a);
+        c = 1.0f / u;
+        s = -c * t;
+    }
+    return Matrix2x2{c, -s, s, c};
+}
+
+// Left-multiply, the 2x2 of SkMatrix::preConcat on a rotation.
+Matrix2x2 Concat(const Matrix2x2& l, const Matrix2x2& r)
+{
+    return Matrix2x2{l.scale_x * r.scale_x + l.skew_x * r.skew_y,
+                     l.scale_x * r.skew_x + l.skew_x * r.scale_y,
+                     l.skew_y * r.scale_x + l.scale_y * r.skew_y,
+                     l.skew_y * r.skew_x + l.scale_y * r.scale_y};
+}
+
+}  // namespace
+
+bool ComputeMatrices(const skia_abi::Rec& rec, float* scale_y, Matrix2x2* remaining)
+{
+    // A is the total matrix getSingleMatrix builds: Scale(size * preScaleX,
+    // size), post-skewed by preSkewX, then post-concatenated with fPost2x2.
+    // Only the 2x2 is needed, and the translation is zero.
+    const float size = rec.text_size;
+    const float lx = size * rec.pre_scale_x;   // local scaleX
+    const float lkx = rec.pre_skew_x * size;   // local skewX
+    const float p00 = rec.post2x2[0][0];
+    const float p01 = rec.post2x2[0][1];
+    const float p10 = rec.post2x2[1][0];
+    const float p11 = rec.post2x2[1][1];
+
+    Matrix2x2 a;
+    a.scale_x = p00 * lx;
+    a.skew_x = p00 * lkx + p01 * size;
+    a.skew_y = p10 * lx;
+    a.scale_y = p10 * lkx + p11 * size;
+
+    const bool skewed_or_flipped =
+        a.skew_x != 0.0f || a.skew_y != 0.0f || a.scale_x < 0.0f || a.scale_y < 0.0f;
+
+    // GA is A with the rotation removed. h is where A maps the horizontal
+    // baseline, which for a vector is the first column.
+    Matrix2x2 ga = a;
+    if (skewed_or_flipped) {
+        ga = Concat(GivensRotation(a.scale_x, a.skew_y), a);
+    }
+
+    // Singular, or so small an em-filling square could not touch a pixel.
+    // Skia zeroes the matrices and renders nothing.
+    constexpr float kNearlyZero = 1.0f / (1 << 12);
+    if (std::fabs(ga.scale_x) <= kNearlyZero || std::fabs(ga.scale_y) <= kNearlyZero ||
+        !std::isfinite(ga.scale_x) || !std::isfinite(ga.scale_y) ||
+        !std::isfinite(ga.skew_x) || !std::isfinite(ga.skew_y)) {
+        *scale_y = 1.0f;
+        *remaining = Matrix2x2{0, 0, 0, 0};
+        return false;
+    }
+
+    // kVertical puts the y-scale in both components.
+    const float y = std::fabs(ga.scale_y);
+    *scale_y = y;
+
+    if (!skewed_or_flipped && a.scale_x == a.scale_y) {
+        *remaining = Matrix2x2{};
+    } else if (!skewed_or_flipped) {
+        *remaining = Matrix2x2{a.scale_x / y, 0, 0, 1};
+    } else {
+        // sA = A with the scale taken out, preScale(1/s.fX, 1/s.fY), and
+        // kVertical made both components y.
+        *remaining = Matrix2x2{a.scale_x / y, a.skew_x / y, a.skew_y / y, a.scale_y / y};
+    }
+    return true;
+}
+
 float DeviceScaleY(const skia_abi::Rec& rec)
 {
-    // computeMatrices(PreMatrixScale::kVertical) puts the whole vertical
-    // device scale into scale.fY, as a magnitude.
-    const float m11 = rec.post2x2[0][0];
-    const float m22 = rec.post2x2[1][1];
-    const float m12 = rec.post2x2[0][1];
-    const float m21 = rec.post2x2[1][0];
-    const float y = std::sqrt(m21 * m21 + m22 * m22);
-    const float fallback = std::sqrt(m11 * m11 + m12 * m12);
-    const float scale = y != 0.0f ? y : fallback != 0.0f ? fallback : 1.0f;
-    return rec.text_size * scale;
+    float y = 0;
+    Matrix2x2 ignored;
+    ComputeMatrices(rec, &y, &ignored);
+    return y;
 }
 
 Decision Decide(const skia_abi::Rec& rec, const float scale_y, const FontFacts& facts)

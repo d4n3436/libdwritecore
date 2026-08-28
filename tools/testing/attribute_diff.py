@@ -11,10 +11,18 @@ deepest last, so each differing pixel belongs to the innermost element that
 covers it. Nothing is sampled: the counts add up to the whole difference, and
 the pixels no element covers are counted too.
 
-  font        the two sides drew the element with different families
-  share       same families, different numbers of glyphs from each
-  metrics     same families, but the element sits or measures differently
-  raster      same families and the same box, so only the pixels differ
+Both machines' maps are used, and the deeper of the two labels wins. An
+element that moved covers different pixels on each side, and its glyphs at the
+place only one side drew them would otherwise be charged to its parent, or to
+nothing at all.
+
+  font        the two sides drew the element with different faces, which the
+              PostScript names catch. Nirmala UI against Nirmala UI Bold is a
+              real face swap and not synthetic bold
+  share       same faces, different numbers of glyphs from each
+  metrics     the element's own box differs, or something inside it moved
+  raster      same faces, same box, nothing inside moved, so only the pixels
+              differ
   chrome      no element covers the pixel: background, image, border or rule
 
 The two machines reach the page server at different addresses, so --url-b
@@ -26,6 +34,7 @@ after a sweep, before either side navigates away.
 
 import argparse
 import json
+import math
 import sys
 
 import numpy as np
@@ -39,18 +48,24 @@ import viewport_protocol as vp
 SNAPSHOT = """
   const out = [];
   const all = document.querySelectorAll('*');
+  const shown = new Map();
   for (let i = 0; i < all.length; ++i) {
     const e = all[i];
+    const parent = e.parentElement ? (shown.get(e.parentElement) ?? -1) : -1;
     const r = e.getBoundingClientRect();
-    if (r.width < 0.01 || r.height < 0.01) continue;
-    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+    if (r.width < 0.01 || r.height < 0.01 ||
+        r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) {
+      shown.set(e, parent);
+      continue;
+    }
+    shown.set(e, i);
     let depth = 0;
     for (let p = e; p; p = p.parentElement) ++depth;
     const cs = getComputedStyle(e);
     out.push([i, e.tagName, depth,
               +r.x.toFixed(2), +r.y.toFixed(2), +r.width.toFixed(2), +r.height.toFixed(2),
               cs.fontFamily.slice(0, 38), cs.fontSize, cs.fontWeight,
-              (e.textContent || '').trim().slice(0, 28)]);
+              (e.textContent || '').trim().slice(0, 28), parent]);
   }
   return JSON.stringify(out);
 """
@@ -80,33 +95,55 @@ def platform_fonts(browser, index):
         fonts = browser.call("CSS.getPlatformFontsForNode", {"nodeId": node}).get("fonts", [])
     except RuntimeError:
         return []
-    return sorted((f["familyName"], f.get("glyphCount", 0)) for f in fonts)
+    merged = {}
+    for f in fonts:
+        face = (f["familyName"], f.get("postScriptName", ""))
+        merged[face] = merged.get(face, 0) + f.get("glyphCount", 0)
+    return sorted((fam, ps, n) for (fam, ps), n in merged.items())
 
 
 def label_map(rows, width, height):
-    """Element index per pixel, innermost wins."""
+    """Element index and its depth per pixel, innermost wins.
+
+    The box is taken outwards to whole pixels. A box starting at x=100.6 is
+    drawn into the pixel at 100, and rounding inwards would hand that pixel,
+    with the antialiased left edge of the first glyph in it, to the parent.
+    """
     labels = np.full((height, width), -1, np.int32)
+    depths = np.zeros((height, width), np.int32)
     for r in sorted(rows.values(), key=lambda r: r[2]):
-        x0, y0 = max(0, int(round(r[3]))), max(0, int(round(r[4])))
-        x1 = min(width, int(round(r[3] + r[5])))
-        y1 = min(height, int(round(r[4] + r[6])))
+        x0, y0 = max(0, int(math.floor(r[3]))), max(0, int(math.floor(r[4])))
+        x1 = min(width, int(math.ceil(r[3] + r[5])))
+        y1 = min(height, int(math.ceil(r[4] + r[6])))
         if x1 > x0 and y1 > y0:
             labels[y0:y1, x0:x1] = r[0]
-    return labels
+            depths[y0:y1, x0:x1] = r[2]
+    return labels, depths
 
 
 def show(fonts):
-    return ", ".join("%s %d" % p for p in fonts) or "-"
+    return ", ".join("%s %d" % (fam, n) for fam, _, n in fonts) or "-"
 
 
-def classify(a, b, fa, fb):
-    if [n for n, _ in fa] != [n for n, _ in fb]:
+def show_faces(fonts):
+    """The same listing by face, for when the family names agree."""
+    return ", ".join("%s %d" % (ps or fam, n) for fam, ps, n in fonts) or "-"
+
+
+def classify(a, b, fa, fb, moved):
+    if [(fam, ps) for fam, ps, _ in fa] != [(fam, ps) for fam, ps, _ in fb]:
+        if [fam for fam, _, _ in fa] == [fam for fam, _, _ in fb]:
+            return "font", "%s vs %s" % (show_faces(fa), show_faces(fb))
         return "font", "%s vs %s" % (show(fa), show(fb))
     if fa != fb:
         return "share", "%s vs %s" % (show(fa), show(fb))
     if a[3:7] != b[3:7]:
         return "metrics", "rect %s vs %s" % (a[3:7], b[3:7])
-    return "raster", "same families and box"
+    if moved is not None:
+        ma, mb = moved
+        return "metrics", "<%s> %r inside sits at %s vs %s" % (
+            ma[1], ma[10], ma[3:7], mb[3:7])
+    return "raster", "same faces and box, nothing inside moved"
 
 
 def main():
@@ -142,9 +179,49 @@ def main():
         rows_a = snapshot(ba, args.url)
         rows_b = snapshot(bb, args.url_b or args.url)
 
-        hit = label_map(rows_a, args.width, args.height)[diff]
+        # The tree, from the recorded-ancestor field, so a box whose own rect
+        # agrees can still be caught holding something that moved.
+        children = {}
+        for r in rows_a.values():
+            children.setdefault(r[11], []).append(r[0])
+
+        def moved_inside(index, band):
+            """A descendant that sits differently, in the rows that differ.
+
+            Text after a run that changed width shifts along with it while
+            its own container keeps its box, so the container's own rect
+            proves nothing. Only descendants overlapping the differing rows
+            count, since a block that moved at the other end of a long
+            container did not put these pixels where they are.
+            """
+            lo, hi = band
+            stack = list(children.get(index, []))
+            while stack:
+                j = stack.pop()
+                stack.extend(children.get(j, []))
+                ja, jb = rows_a.get(j), rows_b.get(j)
+                if ja is None or jb is None or ja[3:7] == jb[3:7]:
+                    continue
+                if min(ja[4], jb[4]) <= hi and max(ja[4] + ja[6], jb[4] + jb[6]) >= lo:
+                    return ja, jb
+            return None
+
+        labels_a, depths_a = label_map(rows_a, args.width, args.height)
+        labels_b, depths_b = label_map(rows_b, args.width, args.height)
+        inner = np.where(depths_b > depths_a, labels_b, labels_a)
+
+        hit = inner[diff]
+        rows_of = np.nonzero(diff)[0]
         counts = {int(i): int(n) for i, n in zip(*np.unique(hit, return_counts=True))}
         chrome = counts.pop(-1, 0)
+
+        # The rows each element's own differing pixels fall in.
+        uniq, index_of = np.unique(hit, return_inverse=True)
+        lo = np.full(uniq.size, 1 << 30, np.int64)
+        hi = np.full(uniq.size, -1, np.int64)
+        np.minimum.at(lo, index_of, rows_of)
+        np.maximum.at(hi, index_of, rows_of)
+        band = {int(u): (int(l), int(h)) for u, l, h in zip(uniq, lo, hi)}
 
         kinds = {}
         detail = []
@@ -155,7 +232,9 @@ def main():
             if ra is None or rb is None:
                 kinds["only-one-side"] = kinds.get("only-one-side", 0) + counts[index]
                 continue
-            kind, why = classify(ra, rb, platform_fonts(ba, index), platform_fonts(bb, index))
+            kind, why = classify(ra, rb, platform_fonts(ba, index),
+                                 platform_fonts(bb, index),
+                                 moved_inside(index, band[index]))
             kinds[kind] = kinds.get(kind, 0) + counts[index]
             detail.append((counts[index], kind, why, ra))
         if chrome:

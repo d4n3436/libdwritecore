@@ -1488,7 +1488,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     // search settled on. A subclass that overrides nothing gets its own table
     // holding the same pointers, and the object Skia hands out may be of that
     // subclass, so patching one table alone leaves the live one untouched.
-    // The neighbours are checked as well, so a table that merely happens to
+    // The neighbors are checked as well, so a table that merely happens to
     // hold this function at some other index is left alone.
     void* const image_fn = *chosen_slot;
     void* const metrics_fn = *(chosen_slot - 1);
@@ -1840,10 +1840,12 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         return;
     }
     const windows_path::Decision d =
-        windows_path::Decide(rec, scale_y, font_facts::Describe(font, gasp_ppem, bitmap_ppem));
+        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
+                             font_facts::Describe(font, gasp_ppem, bitmap_ppem));
 
     float advance = 0;
-    if (!dwrite_raster::GlyphAdvance(typeface, font, g.GlyphId(), d, &advance)) {
+    float advance_y = 0;
+    if (!dwrite_raster::GlyphAdvance(typeface, font, g.GlyphId(), rec, d, &advance, &advance_y)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("DirectWrite would not measure glyph %u; advances stay Skia's",
@@ -1853,6 +1855,40 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
     }
     std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsAdvanceX,
                 &advance, sizeof(advance));
+    std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsAdvanceY,
+                &advance_y, sizeof(advance_y));
+
+    // The bounds too, since generateImage is asked to fill this box. A color
+    // glyph is left alone; the raster path declines those and Skia's own
+    // image has to keep Skia's box.
+    //
+    // Fontations answers every outline glyph with computeFromPath, so Skia
+    // takes the bounds from the path it generated and never reads the ones
+    // here. Clearing it is what makes these the glyph's box, and only the
+    // glyphs the raster path draws carry kFontationsPath.
+    const auto metrics_mask =
+        skia_abi::Read<uint8_t>(result, skia_abi::kMetricsMaskFormat);
+    const auto metrics_bits =
+        skia_abi::Read<uint16_t>(result, skia_abi::kMetricsExtraBits);
+    if (metrics_mask != skia_abi::kARGB32 && metrics_bits == skia_abi::kFontationsPath) {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        if (dwrite_raster::GlyphBounds(typeface, font, g, rec, d, d.rendering_mode,
+                                       d.texture_type, &left, &top, &right, &bottom)) {
+            const float box[4] = {static_cast<float>(left), static_cast<float>(top),
+                                  static_cast<float>(right), static_cast<float>(bottom)};
+            std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsBounds, box,
+                        sizeof(box));
+            constexpr bool kFromPath = false;
+            std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsComputeFromPath,
+                        &kFromPath, sizeof(kFromPath));
+        }
+        // An empty rect is Skia's signal to try another texture type, and it
+        // then draws the glyph a different way. Nothing here follows it that
+        // far, so Skia's own bounds stay and so does its image.
+    }
 
     static std::atomic<uint64_t> count{0};
     if (const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1; n <= 3) {
@@ -1895,7 +1931,8 @@ void OnChromiumFontMetrics(void* context, void* metrics)
         return;
     }
     const windows_path::Decision d =
-        windows_path::Decide(rec, scale_y, font_facts::Describe(font, gasp_ppem, bitmap_ppem));
+        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
+                             font_facts::Describe(font, gasp_ppem, bitmap_ppem));
     if (dwrite_raster::FontMetrics(typeface, font, d, metrics)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
@@ -1945,7 +1982,8 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const windows_path::FontFacts facts =
         chromium_patch::ParityWanted() ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
                                        : windows_path::FontFacts{};
-    const windows_path::Decision d = windows_path::Decide(rec, scale_y, facts);
+    const windows_path::Decision d =
+        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y, facts);
 
     // Enough to see what the tree decides, without a line per glyph forever.
     if (n <= 20 || (n & 0x3ff) == 1) {

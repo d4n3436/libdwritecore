@@ -17,8 +17,9 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
     auto mask_format = skia_abi::Read<uint8_t>(bytes, skia_abi::kRecMaskFormat);
     auto flags = skia_abi::Read<uint16_t>(bytes, skia_abi::kRecFlags);
 
-    // kGenA8FromLCD says the surface cannot show subpixel text at all, which
-    // Windows declines to override too.
+    // kGenA8FromLCD says the surface cannot show subpixel text at all, and
+    // Windows does not override it either. MakeRecAndEffects also sets it for
+    // text too_big_for_lcd, which is how a large heading arrives as A8.
     const bool surface_refused_lcd =
         (flags_before_filter & skia_abi::kGenA8FromLCD) != 0;
     if (mask_format == skia_abi::kA8 && !surface_refused_lcd) {
@@ -26,12 +27,19 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
         flags &= static_cast<uint16_t>(~skia_abi::kLCD_BGROrder);
         flags &= static_cast<uint16_t>(~skia_abi::kLCD_Vertical);
         flags &= static_cast<uint16_t>(~skia_abi::kGenA8FromLCD);
+    } else if (surface_refused_lcd) {
+        // SkTypeface_Fontations::onFilterRec clears this flag on every rec.
+        // DWriteFontTypeface leaves it alone, so Windows still fills the A8
+        // mask from a ClearType texture and averages it.
+        flags |= static_cast<uint16_t>(skia_abi::kGenA8FromLCD);
     }
 
-    // HINTING_MEDIUM. Linux answers hintfull, the one value that stops
-    // web_font_render_style.cc force-enabling subpixel positioning.
+    // Windows answers HINTING_MEDIUM, but Fontations would hint its outlines
+    // from this field and Windows never does. The live rec says none, and
+    // windows_path::WithWindowsHinting restores the Windows value where the
+    // grid fit mode is chosen.
     flags &= static_cast<uint16_t>(~skia_abi::kHintingMask);
-    flags |= static_cast<uint16_t>(skia_abi::kHintingNormal << skia_abi::kHintingShift);
+    flags |= static_cast<uint16_t>(skia_abi::kHintingNone << skia_abi::kHintingShift);
 
     flags |= kSubpixelPositioning;
 

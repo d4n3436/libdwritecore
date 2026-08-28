@@ -126,13 +126,43 @@ const char* MeasuringModeName(MeasuringMode m);
 // y-scale, which is the size DirectWrite is actually asked for.
 Decision Decide(const skia_abi::Rec& rec, float scale_y, const FontFacts& facts);
 
-// The device y-scale, from the same rec fields computeMatrices reads. Only
-// the axis-aligned case is exact here; a rotated or skewed matrix needs the
-// full decomposition, and Decide is told when the answer is approximate.
+// The 2x2 part of an SkMatrix, named as SkMatrix names it.
+struct Matrix2x2
+{
+    float scale_x = 1;
+    float skew_x = 0;
+    float skew_y = 0;
+    float scale_y = 1;
+};
+
+// SkScalerContextRec::computeMatrices(PreMatrixScale::kVertical), from
+// src/core/SkScalerContext.cpp.
+//
+// `scale_y` is scale.fY, the size DirectWrite is asked for. `remaining` is
+// sA, the total matrix with that scale taken out, which is the transform the
+// glyph run analysis gets and the one advances are mapped through.
+//
+// A skewed or flipped matrix is factored by a Givens rotation first, so a
+// scale read off `fPost2x2` alone is only right when there is nothing to
+// factor. Returns false when the matrix is singular, matching Skia, which
+// then renders nothing.
+bool ComputeMatrices(const skia_abi::Rec& rec, float* scale_y, Matrix2x2* remaining);
+
+// The device y-scale alone, for callers that do not need the remainder.
 float DeviceScaleY(const skia_abi::Rec& rec);
 
 // src/ports/SkScalerContext_win_dw.cpp, is_axis_aligned.
 bool IsAxisAligned(const skia_abi::Rec& rec);
+
+// The rec as Windows would have carried it, for Decide alone.
+//
+// The hinting field means two different things on the two platforms. Windows
+// reads it only to pick a grid fit mode, and the outlines it hands out come
+// from GetGlyphRunOutline, which grid fits nothing. Fontations reads the same
+// field in its constructor and hints every outline it produces, which moves
+// the intercepts a skip-ink underline breaks on. So the live rec says no
+// hinting and this puts Windows' value back for the decision that needs it.
+skia_abi::Rec WithWindowsHinting(skia_abi::Rec rec);
 
 }  // namespace windows_path
 

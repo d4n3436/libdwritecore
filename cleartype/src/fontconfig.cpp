@@ -58,6 +58,7 @@
 #include <pthread.h>
 
 #include "chromium/fallback_order.h"
+#include "chromium/family_match.h"
 #include "chromium/parity_gate.h"
 #include "parity_mode.h"
 #include "shim_exports.h"
@@ -702,6 +703,8 @@ FcFontSet* FcFontSort(FcConfig* config, FcPattern* pattern, const FcBool trim,
     // The Chromium half watches the result to learn which family carries which
     // charset. It substitutes nothing, so it runs after the sort either way.
     fallback_order::NoteFontSet(pattern, set);
+    // A named-family sort is then reordered so DirectWrite's pick sits first.
+    family_match::ReorderForWindows(pattern, set);
     return set;
 }
 

@@ -183,6 +183,95 @@ bool Available()
     return EnsureFactory();
 }
 
+// SkScalerContext_DW::generateDWMetrics. The run is one glyph with a zero
+// advance at the origin and the sub-pixel position in the transform, exactly
+// as the raster path builds it, so the box asked for here is the box the
+// glyph is later drawn into.
+bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                 const skia_abi::Glyph& glyph, const skia_abi::Rec& rec,
+                 const windows_path::Decision& decision,
+                 const windows_path::RenderingMode rendering_mode,
+                 const windows_path::TextureType texture_type, int* left, int* top,
+                 int* right, int* bottom)
+{
+    if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) {
+        return false;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes);
+    if (face == nullptr) {
+        return false;
+    }
+
+    DWRITE_MATRIX transform{};
+    float scale_y = 0;
+    windows_path::Matrix2x2 remaining;
+    if (!windows_path::ComputeMatrices(rec, &scale_y, &remaining)) {
+        return false;
+    }
+    transform.m11 = remaining.scale_x;
+    transform.m12 = remaining.skew_y;
+    transform.m21 = remaining.skew_x;
+    transform.m22 = remaining.scale_y;
+    transform.dx = static_cast<float>(glyph.SubX()) / 4.0f;
+    transform.dy = static_cast<float>(glyph.SubY()) / 4.0f;
+
+    FLOAT advance = 0.0f;
+    UINT16 index = glyph.GlyphId();
+    DWRITE_GLYPH_OFFSET offset{};
+    DWRITE_GLYPH_RUN run{};
+    run.glyphCount = 1;
+    run.glyphAdvances = &advance;
+    run.fontFace = face;
+    run.fontEmSize = decision.text_size_render;
+    run.bidiLevel = 0;
+    run.glyphIndices = &index;
+    run.isSideways = FALSE;
+    run.glyphOffsets = &offset;
+
+    IDWriteGlyphRunAnalysis* analysis = nullptr;
+    HRESULT hr = E_FAIL;
+    if (g_dw.factory2 != nullptr &&
+        (decision.grid_fit_mode == windows_path::kGridFitDisabled ||
+         decision.anti_alias_mode == windows_path::kAntiAliasGrayscale)) {
+        hr = g_dw.factory2->CreateGlyphRunAnalysis(
+            &run, &transform, static_cast<DWRITE_RENDERING_MODE>(rendering_mode),
+            static_cast<DWRITE_MEASURING_MODE>(decision.measuring_mode),
+            static_cast<DWRITE_GRID_FIT_MODE>(decision.grid_fit_mode),
+            static_cast<DWRITE_TEXT_ANTIALIAS_MODE>(decision.anti_alias_mode), 0.0f, 0.0f,
+            &analysis);
+    } else if (g_dw.factory5 != nullptr) {
+        hr = g_dw.factory5->CreateGlyphRunAnalysis(
+            &run, 1.0f, &transform, static_cast<DWRITE_RENDERING_MODE>(rendering_mode),
+            static_cast<DWRITE_MEASURING_MODE>(decision.measuring_mode), 0.0f, 0.0f,
+            &analysis);
+    }
+    if (FAILED(hr) || analysis == nullptr) {
+        return false;
+    }
+
+    RECT bbox{};
+    hr = analysis->GetAlphaTextureBounds(static_cast<DWRITE_TEXTURE_TYPE>(texture_type),
+                                         &bbox);
+    analysis->Release();
+    if (FAILED(hr)) {
+        return false;
+    }
+    // GetAlphaTextureBounds succeeds but sometimes returns an empty rect for
+    // small but not quite zero and large but not really large glyphs.
+    if (bbox.left >= bbox.right || bbox.top >= bbox.bottom) {
+        return false;
+    }
+    *left = bbox.left;
+    *top = bbox.top;
+    *right = bbox.right;
+    *bottom = bbox.bottom;
+    return true;
+}
+
 // SkScalerContext_DW::generateMetrics' advance, which is what decides where
 // the next glyph goes. A GDI measuring mode takes it from
 // GetGdiCompatibleGlyphMetrics and rounds the result; anything else takes it
@@ -192,10 +281,10 @@ bool Available()
 // linear in the text size. That is why Windows advances step by exactly the
 // same amount per pixel of size and a grid-fitted scaler's do not.
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
-                  const uint16_t glyph_id, const windows_path::Decision& decision,
-                  float* advance)
+                  const uint16_t glyph_id, const skia_abi::Rec& rec,
+                  const windows_path::Decision& decision, float* advance_x, float* advance_y)
 {
-    if (advance == nullptr) {
+    if (advance_x == nullptr || advance_y == nullptr) {
         return false;
     }
     const std::lock_guard lock(g_mutex);
@@ -237,7 +326,16 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
         // result is not always an integer as it would be with GDI.
         x = std::round(x);
     }
-    *advance = x;
+
+    // The advance is then mapped through sA, the same matrix the analysis
+    // gets. That is the identity for ordinary axis-aligned text; for anything
+    // stretched, skewed or rotated an unmapped advance puts every following
+    // glyph in the wrong place.
+    float scale_y = 0;
+    windows_path::Matrix2x2 remaining;
+    windows_path::ComputeMatrices(rec, &scale_y, &remaining);
+    *advance_x = remaining.scale_x * x;
+    *advance_y = remaining.skew_y * x;
     return true;
 }
 
@@ -311,6 +409,13 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
              skia_abi::kStrikeoutThicknessValid | skia_abi::kStrikeoutPositionValid;
     std::memcpy(m + skia_abi::kFontMetricsFlags, &flags, sizeof(flags));
 
+    // SkScalerContext_DW leaves fAvgCharWidth alone, so on Windows it reaches
+    // Blink as zero and SimpleFontData::PlatformInit measures 'x' instead.
+    // Fontations fills it from OS/2, which Blink then prefers, and an input
+    // with no size attribute is laid out from it.
+    constexpr float kNoAvgCharWidth = 0;
+    std::memcpy(m + skia_abi::kFontMetricsAvgCharWidth, &kNoAvgCharWidth, sizeof(float));
+
     // fTop, fBottom, fXMin and fXMax bound the ink rather than the line, and
     // Skia's own values are already in the struct.
     return true;
@@ -342,20 +447,18 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
 
     // getDWMaskBits: the transform carries the sub-pixel offset, and the run
     // is one glyph with a zero advance at the origin.
+    //
+    // The matrix is sA, the total matrix with the vertical scale taken out,
+    // since Skia normalizes that scale into the em size and DirectWrite must
+    // not apply it twice. DWRITE_MATRIX transposes the skews.
     DWRITE_MATRIX transform{};
-    transform.m11 = rec.post2x2[0][0];
-    transform.m12 = rec.post2x2[0][1];
-    transform.m21 = rec.post2x2[1][0];
-    transform.m22 = rec.post2x2[1][1];
-    // Skia normalizes the vertical scale into the em size, so the matrix
-    // handed to DirectWrite must not apply it twice.
-    if (const float y = decision.real_text_size / (rec.text_size != 0 ? rec.text_size : 1.0f);
-        y != 0.0f) {
-        transform.m11 /= y;
-        transform.m12 /= y;
-        transform.m21 /= y;
-        transform.m22 /= y;
-    }
+    float scale_y = 0;
+    windows_path::Matrix2x2 remaining;
+    windows_path::ComputeMatrices(rec, &scale_y, &remaining);
+    transform.m11 = remaining.scale_x;
+    transform.m12 = remaining.skew_y;
+    transform.m21 = remaining.skew_x;
+    transform.m22 = remaining.scale_y;
     transform.dx = static_cast<float>(glyph.SubX()) / 4.0f;
     transform.dy = static_cast<float>(glyph.SubY()) / 4.0f;
 
