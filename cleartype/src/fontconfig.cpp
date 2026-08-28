@@ -58,6 +58,7 @@
 #include <pthread.h>
 
 #include "chromium/fallback_order.h"
+#include "chromium/parity_gate.h"
 #include "parity_mode.h"
 #include "shim_exports.h"
 #include "windows_fonts.h"
@@ -604,12 +605,62 @@ FcFontSet* FcConfigGetFonts(FcConfig* config, const int set)
     return WindowsOnlySet(all);
 }
 
+// A family this machine carries and Windows does not, asked for by name.
+// SkFontConfigInterfaceDirect::matchFamilyName decides a match is acceptable
+// by comparing the family it asked for against the family it got, so renaming
+// the request to something nothing is called makes the match fail and Blink
+// moves on to the next family in the CSS list, which is what Windows does.
+constexpr const char* kNoSuchFamily = "DWriteCoreNoSuchFamily";
+
+// The cursive row of font_defaults.cc goes to a script Linux has no row for,
+// so cursive reaches here as the family the WebPreferences constructor holds.
+// locale_settings_win.grd reads Comic Sans MS for it.
+constexpr const char* kConstructorCursive = "Script";
+constexpr const char* kWindowsCursive = "Comic Sans MS";
+
+bool ReplaceFamily(FcPattern* pattern, const char* with)
+{
+    static auto del = Next<FcPatternDelFn>("FcPatternDel");
+    static auto add_string = Next<FcPatternAddStringFn>("FcPatternAddString");
+    if (del == nullptr || add_string == nullptr) {
+        return false;
+    }
+    (void)del(pattern, "family");
+    (void)add_string(pattern, "family", reinterpret_cast<const FcChar8*>(with));
+    return true;
+}
+
+bool HideFromChromium(FcPattern* pattern)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    if (get_string == nullptr || pattern == nullptr) {
+        return false;
+    }
+    FcChar8* first = nullptr;
+    if (get_string(pattern, "family", 0, &first) != kFcResultMatch || first == nullptr) {
+        return false;
+    }
+    const auto* name = reinterpret_cast<const char*>(first);
+    if (std::strcmp(name, kConstructorCursive) == 0) {
+        (void)ReplaceFamily(pattern, kWindowsCursive);
+        return false;
+    }
+    if (IsGenericRequest(name) || ShipsWithWindows(name)) {
+        return false;
+    }
+    return ReplaceFamily(pattern, kNoSuchFamily);
+}
+
 extern "C" __attribute__((visibility("default")))
 FcBool FcConfigSubstitute(FcConfig* config, FcPattern* pattern, const int kind)
 {
     static auto real = Next<FcConfigSubstituteFn>("FcConfigSubstitute");
     if (real == nullptr) {
         return 0;
+    }
+    if (chromium_patch::ParityWanted() && kind == kFcMatchPattern &&
+        HideFromChromium(pattern)) {
+        return real(config, pattern, kind);
     }
     if (!Answering() || kind != kFcMatchPattern) {
         return real(config, pattern, kind);

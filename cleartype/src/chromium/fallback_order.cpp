@@ -98,9 +98,7 @@ bool ShipsWithWindows(const char* name)
     return false;
 }
 
-// The lists from font_fallback_win.cc, verbatim and in their order. Only the
-// scripts a page can actually reach are here; the historic and symbol ones
-// all resolve to Segoe UI variants that fontconfig picks anyway.
+// The lists from font_fallback_win.cc, verbatim and in their order.
 constexpr const char* kKatakanaOrHiragana[] = {"Noto Sans JP", "Noto Sans CJK JP", "Meiryo",
                                            "Yu Gothic", "MS PGothic", "Microsoft YaHei"};
 constexpr const char* kTraditionalHan[] = {"Noto Sans TC", "Noto Sans CJK TC",
@@ -125,6 +123,40 @@ constexpr const char* kSinhala[] = {"Iskoola Pota", "AksharUnicode", "Nirmala UI
 constexpr const char* kThai[] = {"Tahoma", "Leelawadee UI", "Leelawadee"};
 constexpr const char* kLao[] = {"Leelawadee UI", "Lao UI"};
 constexpr const char* kKhmer[] = {"Leelawadee UI", "Khmer UI", "Khmer OS", "MoolBoran", "DaunPenh"};
+
+constexpr const char* kMyanmar[] = {"Myanmar Text", "Padauk", "Parabaik", "Myanmar3",
+                                    "Code2000"};
+constexpr const char* kEthiopic[] = {"Nyala", "Abyssinica SIL", "Ethiopia Jiret",
+                                     "Visual Geez Unicode", "GF Zemen Unicode", "Ebrima"};
+constexpr const char* kCherokee[] = {"Gadugi", "Plantagenet"};
+constexpr const char* kCanadianAboriginal[] = {"Gadugi", "Euphemia"};
+constexpr const char* kMongolian[] = {"Mongolian Baiti"};
+constexpr const char* kTibetan[] = {"Microsoft Himalaya", "Jomolhari", "Tibetan Machine Uni"};
+constexpr const char* kYi[] = {"Microsoft Yi Baiti", "Nuosu SIL", "Code2000"};
+constexpr const char* kEbrima[] = {"Ebrima"};
+constexpr const char* kNirmala[] = {"Nirmala UI"};
+constexpr const char* kJavanese[] = {"Javanese Text"};
+constexpr const char* kLisu[] = {"Segoe UI"};
+constexpr const char* kTaiLe[] = {"Microsoft Tai Le"};
+constexpr const char* kNewTaiLue[] = {"Microsoft New Tai Lue"};
+constexpr const char* kPhagsPa[] = {"Microsoft PhagsPa"};
+constexpr const char* kSegoeSymbol[] = {"Segoe UI Symbol"};
+
+// font_fallback_win.cc has no list for the symbol and math blocks, so these
+// are what DirectWrite's own MapCharacters settles on for the characters the
+// requested font does not cover. Order matters the same way the script lists
+// do: the first family that covers the character wins, which is how the
+// arrows split between Cambria Math and Segoe UI Symbol and the block
+// elements between Lucida Sans Unicode and MS PGothic.
+constexpr const char* kMath[] = {"Cambria Math"};
+constexpr const char* kArrowsSimple[] = {"Segoe UI Symbol", "Cambria Math"};
+constexpr const char* kArrows[] = {"Cambria Math", "Segoe UI Symbol"};
+constexpr const char* kBlockElements[] = {"Lucida Sans Unicode", "MS PGothic"};
+constexpr const char* kSpecials[] = {"Tahoma"};
+constexpr const char* kSegoeHistoric[] = {"Segoe UI Historic"};
+constexpr const char* kSegoeHistoricOrSymbol[] = {"Segoe UI Historic", "Segoe UI Symbol"};
+constexpr const char* kSyriac[] = {"Estrangelo Edessa", "Estrangelo Nisibin", "Code2000"};
+constexpr const char* kThaana[] = {"MV Boli"};
 
 // Where each script lives. The unified Han block is filled in by HanFamilies()
 // below, since Windows picks its list from the locale rather than fixing one.
@@ -155,8 +187,62 @@ const ScriptFonts kScripts[] = {
     DWC_SCRIPT(0x0E00, 0x0E7F, kThai),
     DWC_SCRIPT(0x0E80, 0x0EFF, kLao),
     DWC_SCRIPT(0x1780, 0x17FF, kKhmer),
+    DWC_SCRIPT(0x0700, 0x074F, kSyriac),
+    DWC_SCRIPT(0x0780, 0x07BF, kThaana),
+    DWC_SCRIPT(0x07C0, 0x07FF, kEbrima),          // N'Ko
+    DWC_SCRIPT(0x0F00, 0x0FFF, kTibetan),
+    DWC_SCRIPT(0x1000, 0x109F, kMyanmar),
+    DWC_SCRIPT(0xA9E0, 0xA9FF, kMyanmar),         // Myanmar extended-B
+    DWC_SCRIPT(0xAA60, 0xAA7F, kMyanmar),         // Myanmar extended-A
+    DWC_SCRIPT(0x1200, 0x139F, kEthiopic),
+    DWC_SCRIPT(0x2D80, 0x2DDF, kEthiopic),        // Ethiopic extended
+    DWC_SCRIPT(0x13A0, 0x13FF, kCherokee),
+    DWC_SCRIPT(0xAB70, 0xABBF, kCherokee),        // Cherokee supplement
+    DWC_SCRIPT(0x1400, 0x167F, kCanadianAboriginal),
+    DWC_SCRIPT(0x18B0, 0x18FF, kCanadianAboriginal),
+    DWC_SCRIPT(0x1800, 0x18AF, kMongolian),
+    DWC_SCRIPT(0x1950, 0x197F, kTaiLe),
+    DWC_SCRIPT(0x1980, 0x19DF, kNewTaiLue),
+    DWC_SCRIPT(0x1C50, 0x1C7F, kNirmala),         // Ol Chiki
+    DWC_SCRIPT(0x2800, 0x28FF, kSegoeSymbol),     // Braille
+    DWC_SCRIPT(0x2C80, 0x2CFF, kSegoeSymbol),     // Coptic
+    DWC_SCRIPT(0x2D30, 0x2D7F, kEbrima),          // Tifinagh
+    DWC_SCRIPT(0xA000, 0xA4CF, kYi),
+    DWC_SCRIPT(0xA4D0, 0xA4FF, kLisu),
+    DWC_SCRIPT(0xA500, 0xA63F, kEbrima),          // Vai
+    DWC_SCRIPT(0xA840, 0xA87F, kPhagsPa),
+    DWC_SCRIPT(0xA980, 0xA9DF, kJavanese),
+    DWC_SCRIPT(0x1680, 0x169F, kSegoeHistoricOrSymbol),    // Ogham
+    DWC_SCRIPT(0x16A0, 0x16FF, kSegoeHistoricOrSymbol),    // Runic
+    DWC_SCRIPT(0x2C00, 0x2C5F, kSegoeHistoricOrSymbol),    // Glagolitic
+    DWC_SCRIPT(0x10300, 0x1032F, kSegoeHistoricOrSymbol),  // Old Italic
+    DWC_SCRIPT(0x10330, 0x1034F, kSegoeHistoricOrSymbol),  // Gothic
+    DWC_SCRIPT(0x10C00, 0x10C4F, kSegoeHistoricOrSymbol),  // Orkhon
+    DWC_SCRIPT(0x109A0, 0x109FF, kSegoeHistoricOrSymbol),  // Meroitic cursive
+    DWC_SCRIPT(0x1E000, 0x1E02F, kSegoeHistoricOrSymbol),  // Glagolitic supplement
+    DWC_SCRIPT(0x102A0, 0x102DF, kSegoeHistoric),          // Carian
+    DWC_SCRIPT(0x103A0, 0x103DF, kSegoeHistoric),          // Old Persian
+    DWC_SCRIPT(0x10450, 0x1047F, kSegoeHistoric),          // Shavian
+    DWC_SCRIPT(0x10800, 0x1083F, kSegoeHistoric),          // Cypriot
+    DWC_SCRIPT(0x10840, 0x1085F, kSegoeHistoric),          // Imperial Aramaic
+    DWC_SCRIPT(0x10A00, 0x10A5F, kSegoeHistoric),          // Kharoshthi
+    DWC_SCRIPT(0x10A60, 0x10A7F, kSegoeHistoric),          // Old South Arabian
+    DWC_SCRIPT(0x10B40, 0x10B5F, kSegoeHistoric),          // Inscriptional Parthian
+    DWC_SCRIPT(0x10B60, 0x10B7F, kSegoeHistoric),          // Inscriptional Pahlavi
+    DWC_SCRIPT(0x11000, 0x1107F, kSegoeHistoric),          // Brahmi
+    DWC_SCRIPT(0x12000, 0x1254F, kSegoeHistoric),          // Cuneiform
+    DWC_SCRIPT(0x13000, 0x1342F, kSegoeHistoric),          // Egyptian hieroglyphs
+    DWC_SCRIPT(0x10400, 0x1044F, kSegoeSymbol),            // Deseret
+    DWC_SCRIPT(0x2190, 0x219F, kArrowsSimple),
+    DWC_SCRIPT(0x21A0, 0x21FF, kArrows),
+    DWC_SCRIPT(0x2200, 0x22FF, kMath),                     // Mathematical operators
+    DWC_SCRIPT(0x2300, 0x23FF, kMath),                     // Miscellaneous technical
+    DWC_SCRIPT(0x2440, 0x245F, kSegoeSymbol),              // Optical character recognition
+    DWC_SCRIPT(0x2580, 0x259F, kBlockElements),
+    DWC_SCRIPT(0xFFF0, 0xFFFF, kSpecials),
     DWC_SCRIPT(0x1100, 0x11FF, kHangul),        // Hangul Jamo
     DWC_SCRIPT(0xAC00, 0xD7AF, kHangul),        // Hangul syllables
+    DWC_SCRIPT(0x3100, 0x312F, kTraditionalHan),   // Bopomofo
     DWC_SCRIPT(0x3040, 0x309F, kKatakanaOrHiragana),
     DWC_SCRIPT(0x30A0, 0x30FF, kKatakanaOrHiragana),
     DWC_SCRIPT(0x31F0, 0x31FF, kKatakanaOrHiragana),
@@ -306,7 +392,10 @@ struct Known
     const void* charset;
     char family[64];
 };
-constexpr unsigned kMaxKnown = 512;
+// A fallback sort returns every scalable font on the machine, and a family
+// this table names is unreachable unless its charset was remembered, so the
+// bound has to cover the whole set rather than a prefix of it.
+constexpr unsigned kMaxKnown = 4096;
 Known g_known[kMaxKnown];
 unsigned g_known_count = 0;
 

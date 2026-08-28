@@ -1,5 +1,5 @@
-// Deliberately plain. No command-line switches, no window flags beyond the
-// size, so both sides run the defaults and what differs is the platform.
+// Deliberately plain. Nothing here changes how text is drawn, so both sides
+// run the defaults and what differs is the platform.
 //
 // The content size is set here and not over the DevTools protocol. Electron
 // does not implement Chromium's Browser domain, and setContentSize sets the
@@ -9,6 +9,11 @@ const { app, BrowserWindow } = require('electron');
 // Neither side has a GPU worth using, and Electron aborts when its GPU
 // process cannot start. Disabling it here keeps both sides identical.
 app.disableHardwareAcceleration();
+
+// Animated images are captured at whatever frame the two machines happen to
+// have reached, which shows up as a difference no font change can fix.
+// kImageAnimationPolicyNoAnimation holds every image on its first frame.
+app.commandLine.appendSwitch('blink-settings', 'imageAnimationPolicy=2');
 
 const W = parseInt(process.env.DWC_W || '900', 10);
 const H = parseInt(process.env.DWC_H || '700', 10);

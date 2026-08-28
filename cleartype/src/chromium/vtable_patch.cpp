@@ -76,6 +76,9 @@
 
 #include <elf.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/syscall.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -718,6 +721,85 @@ constexpr unsigned kRecognizeSecond = 6;   // generateFontMetrics
 // generateImage's place in that table, which is where chosen_slot points.
 constexpr unsigned kScalerImageSlot = 3;
 
+// head is 54 bytes in every font and carries a fixed magic number, so a slot
+// that answers with both is onGetTableData and not something that happens to
+// return 54.
+constexpr uint32_t kHeadTag = 0x68656164;
+constexpr size_t kHeadSize = 54;
+constexpr uint32_t kHeadMagic = 0x5F0F3CF5;
+constexpr size_t kHeadMagicAt = 12;
+
+// Finding onGetTableData means calling a slot to see what it answers, and a
+// slot that is not onGetTableData takes a pointer where the tag goes and
+// writes through 0x68656164. The fault is caught so a wrong guess costs the
+// resolve instead of the process.
+sigjmp_buf g_probe_jmp;
+std::atomic<long> g_probe_tid{0};
+struct sigaction g_probe_old_segv;
+struct sigaction g_probe_old_bus;
+std::atomic g_probe_faulted{false};
+
+void ProbeFaultHandler(int sig, siginfo_t* info, void* uc)
+{
+    // Only this thread faulting on the tag itself belongs to the guard.
+    // Anything else is a real crash and goes to the handler already there,
+    // which is the one that would have run had the guard not been installed.
+    const bool mine =
+        info != nullptr && syscall(SYS_gettid) == g_probe_tid.load(std::memory_order_acquire) &&
+        reinterpret_cast<uintptr_t>(info->si_addr) == kHeadTag;
+    if (!mine) {
+        const struct sigaction& old = sig == SIGBUS ? g_probe_old_bus : g_probe_old_segv;
+        if ((old.sa_flags & SA_SIGINFO) != 0 && old.sa_sigaction != nullptr) {
+            old.sa_sigaction(sig, info, uc);
+        } else if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) {
+            old.sa_handler(sig);
+        } else {
+            (void)sigaction(sig, &old, nullptr);
+        }
+        return;
+    }
+    siglongjmp(g_probe_jmp, 1);
+}
+
+// Reads head through the candidate slot. False means the call faulted or the
+// bytes are not head, and either way the slot is not the one.
+bool ReadsHeadTable(const GetTableDataFn probe, const void* typeface)
+{
+    // Only kHeadSize is asked for, but the callee is not known to be
+    // onGetTableData yet, and one that ignores the length writes a whole
+    // table. The slack keeps that inside the buffer.
+    unsigned char head[512] = {};
+    struct sigaction guard = {};
+    guard.sa_sigaction = &ProbeFaultHandler;
+    guard.sa_flags = SA_SIGINFO | SA_NODEFER;
+    (void)sigemptyset(&guard.sa_mask);
+    if (sigaction(SIGSEGV, &guard, &g_probe_old_segv) != 0) {
+        return false;
+    }
+    if (sigaction(SIGBUS, &guard, &g_probe_old_bus) != 0) {
+        (void)sigaction(SIGSEGV, &g_probe_old_segv, nullptr);
+        return false;
+    }
+    g_probe_tid.store(syscall(SYS_gettid), std::memory_order_release);
+    size_t got = 0;
+    bool called = false;
+    if (sigsetjmp(g_probe_jmp, 1) == 0) {
+        got = probe(typeface, kHeadTag, 0, kHeadSize, head);
+        called = true;
+    } else {
+        g_probe_faulted.store(true, std::memory_order_release);
+    }
+    g_probe_tid.store(0, std::memory_order_release);
+    (void)sigaction(SIGSEGV, &g_probe_old_segv, nullptr);
+    (void)sigaction(SIGBUS, &g_probe_old_bus, nullptr);
+    if (!called || got != kHeadSize) {
+        return false;
+    }
+    uint32_t magic = 0;
+    std::memcpy(&magic, head + kHeadMagicAt, sizeof(magic));
+    return __builtin_bswap32(magic) == kHeadMagic;
+}
+
 std::atomic g_typeface_resolved{false};
 
 // The typeface vtable, taken off a live scaler context rather than searched
@@ -771,28 +853,34 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
             continue;
         }
         // How far the table calls sit past this virtual moves between Skia
-        // revisions, so the slot answers for itself. SkTypeface's getTableSize
-        // is onGetTableData(tag, 0, ~0U, nullptr), and head is 54 bytes in
-        // every font.
-        constexpr uint32_t kHeadTag = 0x68656164;
-        constexpr size_t kHeadSize = 54;
-        // Only the distances Skia has used, newest first. A wider sweep
-        // would call virtuals that take a pointer where the tag goes.
-        constexpr size_t kTableDistances[] = {kColrToTableTags, 12};
+        // revisions, so the slot answers for itself. Every distance is tried
+        // and the guard absorbs the ones that land on a virtual taking a
+        // pointer where the tag goes.
+        // Only the distances Skia has actually used, nearest first. Calling a
+        // slot that is not onGetTableData is destructive even when the fault
+        // is caught, because unwinding out of a half-run Skia virtual leaves
+        // its state broken, so a version matching neither refuses instead of
+        // guessing. 12 leads because on the revisions where it is wrong it
+        // returns harmlessly, while a wrong 14 writes through the tag.
+        constexpr size_t kKnownDistances[] = {12, kColrToTableTags};
         size_t tags_at = 0;
-        for (const size_t d : kTableDistances) {
+        for (const size_t d : kKnownDistances) {
             const size_t at = i + d;
-            if (reinterpret_cast<unsigned char*>(slots + at + 2) > g_image.relro.end) {
-                break;
+            if (at + 2 > typeface_bridge::kMaxSlotSearched ||
+                reinterpret_cast<unsigned char*>(slots + at + 2) > g_image.relro.end) {
+                continue;
             }
             if (!InText(g_image, slots[at]) || !InText(g_image, slots[at + 1])) {
                 continue;
             }
-            const auto probe = reinterpret_cast<GetTableDataFn>(slots[at + 1]);
-            if (probe(typeface, kHeadTag, 0, ~0U, nullptr) == kHeadSize) {
+            if (ReadsHeadTable(reinterpret_cast<GetTableDataFn>(slots[at + 1]), typeface)) {
                 tags_at = at;
                 break;
             }
+        }
+        if (g_probe_faulted.load(std::memory_order_acquire)) {
+            Report("a vtable slot faulted while being probed for onGetTableData; "
+                   "the search went on past it");
         }
         if (tags_at == 0) {
             return;
@@ -804,8 +892,8 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         typeface_bridge::SetSlotHint(vptr, static_cast<unsigned>(tags_at),
                                      static_cast<unsigned>(tags_at + 1));
         Report("typeface vtable %p resolved from a live scaler context: "
-               "onGetTableTags slot %zu, onGetTableData %zu",
-               static_cast<void*>(base), tags_at, tags_at + 1);
+               "COLR slot %u, onGetTableTags slot %zu, onGetTableData %zu",
+               static_cast<void*>(base), i, tags_at, tags_at + 1);
         // The table slots are left alone. Skia dispatches through them while
         // a scaler context is alive, and the bridge reads the tables through
         // the slots it was told about.

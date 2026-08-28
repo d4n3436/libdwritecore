@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 
@@ -51,6 +52,13 @@ struct Substitution
 };
 
 constexpr Substitution kSubstitutions[] = {
+    {"Latin Modern Math", ",Cambria Math", nullptr},
+    // Windows swaps the fixed family for IDS_FIXED_FONT_FAMILY_ALT_WIN when the
+    // shipped one is Courier and ClearType smoothing is on (font_defaults.cc).
+    {"Monospace", ",Consolas", nullptr},
+    {"Noto Sans Devanagari", ",Nirmala UI", nullptr},
+    {"Noto Serif Devanagari", ",Nirmala UI", nullptr},
+
     {",Noto Sans JP,Noto Sans CJK JP,Arial", ",Meiryo,Yu Gothic",
      "webkit.webprefs.fonts.sansserif.Jpan"},
     {",Noto Sans JP,Noto Sans CJK JP,Times New Roman", ",Meiryo,Yu Gothic",
@@ -64,6 +72,10 @@ constexpr Substitution kSubstitutions[] = {
      "webkit.webprefs.fonts.standard.Hang"},
     {",Noto Serif KR,Noto Serif CJK KR,Times New Roman", ",Batang",
      "webkit.webprefs.fonts.serif.Hang"},
+
+    // Arabic has no sans-serif family on Linux to rewrite, so the Japanese
+    // fixed one carries Segoe UI for the row below.
+    {"Noto Sans Mono CJK JP", ",Segoe UI", "webkit.webprefs.fonts.sansserif.Arab"},
 
     {",Noto Sans SC,Noto Sans CJK SC,Arial", ",Microsoft YaHei",
      "webkit.webprefs.fonts.sansserif.Hans"},
@@ -144,11 +156,11 @@ unsigned PatchBundle(void* base, const size_t length)
                 std::memcmp(bytes + start, s.platform, size) != 0) {
                 continue;
             }
-            // Only a list for a list. A build that does not resolve one
-            // takes the whole value as a family name, so a plain name stays
-            // one.
+            // A value that starts with a comma is a list, which Blink resolves
+            // in GenericFontFamilySettings::GenericFontFamilyForScript through
+            // FontCache::FirstAvailableOrFirst, so a plain name can become one.
             const size_t wanted = std::strlen(s.windows);
-            if (wanted > size || s.platform[0] != ',') {
+            if (wanted > size) {
                 break;
             }
             std::memcpy(bytes + start, s.windows, wanted);
@@ -170,20 +182,59 @@ unsigned PatchBundle(void* base, const size_t length)
 namespace {
 
 // Which entries kFontDefaults has is also decided at build time, and a Linux
-// build has only the seven script-less ones (font_defaults.cc). A row can be
-// repointed at a script Windows covers when losing it costs nothing. The
-// second loop there blanks every pref name listed in kFontFamilyMap that the
-// first loop did not set, wiping the WebPreferences constructor default. That
-// list covers cursive, fixed, sansserif, serif and standard, so fantasy is the
-// one row that can be spared, and its constructor default is already what
-// Windows resolves it to.
-constexpr const char* kSpareRow = "webkit.webprefs.fonts.fantasy.Zyyy";
+// build has only the seven script-less ones (font_defaults.cc). Rows are
+// repointed at scripts Windows covers when losing them costs nothing.
+//
+// font_defaults.cc reads a row through FamilyMapByName, which lists cursive,
+// fixed, sansserif, serif and standard, so the fantasy and math rows are read
+// by nothing and are free.
+//
+// standard, serif and sansserif carry a Zyyy value the WebPreferences
+// constructor already holds, so those rows go too, but only once
+// kFontFamilyMap stops blanking the pref, which is safe on a host with no
+// pref registry. Cursive goes the same way: the constructor says Script where
+// Windows says Comic Sans MS, and fontconfig.cpp renames the one to the other
+// when it arrives as a family.
+struct Spare
+{
+    const char* pref;
+    bool blanked;      // whether kFontFamilyMap lists it
+};
+
+constexpr Spare kSpares[] = {
+    {"webkit.webprefs.fonts.fantasy.Zyyy", false},
+    {"webkit.webprefs.fonts.math.Zyyy", false},
+    {"webkit.webprefs.fonts.standard.Zyyy", true},
+    {"webkit.webprefs.fonts.serif.Zyyy", true},
+    {"webkit.webprefs.fonts.sansserif.Zyyy", true},
+    {"webkit.webprefs.fonts.cursive.Zyyy", true},
+};
+
+// Chrome registers every kFontFamilyMap name in a pref registry and reads them
+// back, so a name this stops the second loop blanking is a name Chrome never
+// registers, and the first read of it ends the process. Electron builds
+// WebPreferences straight from the table and has no registry. Browser prefs
+// only a full PrefService carries tell the two apart.
+constexpr const char* kBrowserPrefs[] = {
+    "bookmark_bar.show_on_all_tabs",
+    "browser.show_home_button",
+};
+
+// The row the array is found by, and what a blanked pref name is pointed at.
+// Its family is not one FamilyMapByName carries, so the second loop skips it.
+constexpr const char* kInertPref = "webkit.webprefs.fonts.fantasy.Zyyy";
+
 constexpr const char* kPrefPrefix = "webkit.webprefs.fonts.";
 constexpr size_t kRowSize = 16;   // const char* then int, padded
 
-// The row to hand the spare to, highest value first.
+// The rows to hand the spares to, highest value first.
 constexpr const char* kWanted[] = {
+    "webkit.webprefs.fonts.sansserif.Hans",
+    "webkit.webprefs.fonts.sansserif.Arab",
+    "webkit.webprefs.fonts.sansserif.Hang",
     "webkit.webprefs.fonts.sansserif.Jpan",
+    "webkit.webprefs.fonts.standard.Jpan",
+    "webkit.webprefs.fonts.serif.Hans",
 };
 
 struct Executable
@@ -206,6 +257,17 @@ constexpr unsigned kMaxSegments = 8;
 Segment g_data[kMaxSegments];
 unsigned g_data_count = 0;
 
+// Both tables hold relocated pointers, so both live in the relro span. Writes
+// are kept inside it: a page outside is one the process may still write, and
+// closing it again read-only would fault the next time it does.
+Segment g_relro{};
+
+bool InRelro(const void* p)
+{
+    const auto* at = static_cast<const unsigned char*>(p);
+    return g_relro.begin != nullptr && at >= g_relro.begin && at < g_relro.end;
+}
+
 int NoteExecutable(dl_phdr_info* info, size_t, void* data)
 {
     if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
@@ -214,7 +276,7 @@ int NoteExecutable(dl_phdr_info* info, size_t, void* data)
     auto* image = static_cast<Executable*>(data);
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         const ElfW(Phdr)& header = info->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD) {
+        if (header.p_type != PT_LOAD && header.p_type != PT_GNU_RELRO) {
             continue;
         }
         const auto* from = reinterpret_cast<const unsigned char*>(info->dlpi_addr +
@@ -225,6 +287,10 @@ int NoteExecutable(dl_phdr_info* info, size_t, void* data)
         }
         if (to > image->end) {
             image->end = to;
+        }
+        if (header.p_type == PT_GNU_RELRO) {
+            g_relro = {from, from + header.p_memsz};
+            continue;
         }
         if ((header.p_flags & PF_X) == 0 && g_data_count < kMaxSegments) {
             g_data[g_data_count++] = {from, to};
@@ -283,10 +349,64 @@ bool WriteRow(unsigned char* row, const char* pref, const uint16_t resource)
     return true;
 }
 
+bool WritePointer(unsigned char* at, const char* value)
+{
+    auto* page = reinterpret_cast<unsigned char*>(
+        reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(0xFFF));
+    const size_t span = static_cast<size_t>(at + sizeof(value) - page);
+    if (mprotect(page, span, PROT_READ | PROT_WRITE) != 0) {
+        return false;
+    }
+    std::memcpy(at, &value, sizeof(value));
+    (void)mprotect(page, span, PROT_READ);
+    return true;
+}
+
+// Whether a slot holds a pointer to a pref name.
+bool HoldsPrefName(const unsigned char* at)
+{
+    if (!InExecutable(at) || !InExecutable(at + sizeof(void*) - 1)) {
+        return false;
+    }
+    const char* name = nullptr;
+    std::memcpy(&name, at, sizeof(name));
+    return InExecutable(name) &&
+           std::strncmp(name, kPrefPrefix, std::strlen(kPrefPrefix)) == 0;
+}
+
+// Whether a slot sits in kFontFamilyMap. That array is one pref name per
+// script per family, so a slot of it lies in a long run of them; the other
+// pref-name arrays in the image are far shorter, and a kFontDefaults row is
+// not a run at all, since it carries a resource id on either side of its name.
+// kFontFamilyMap is grouped by family, one entry per script, so a slot of it
+// has a neighbour naming the same family and a different script. The other
+// pref-name arrays in the image mix families, and a kFontDefaults row has a
+// resource id on either side of its name rather than a name at all.
+bool SharesFamily(const unsigned char* at, const char* pref, const size_t family)
+{
+    if (!HoldsPrefName(at)) {
+        return false;
+    }
+    const char* held = nullptr;
+    std::memcpy(&held, at, sizeof(held));
+    return std::strncmp(held, pref, family) == 0 && std::strcmp(held, pref) != 0;
+}
+
+bool IsMapSlot(const unsigned char* at, const char* pref)
+{
+    const char* dot = std::strrchr(pref, '.');
+    if (dot == nullptr) {
+        return false;
+    }
+    const size_t family = static_cast<size_t>(dot - pref) + 1;
+    return SharesFamily(at - sizeof(void*), pref, family) ||
+           SharesFamily(at + sizeof(void*), pref, family);
+}
+
 // Whether a row holds a pointer to a pref name.
 bool IsRow(const unsigned char* at)
 {
-    if (!InExecutable(at) || !InExecutable(at + kRowSize - 1)) {
+    if (!InRelro(at) || !InExecutable(at + kRowSize - 1)) {
         return false;
     }
     const char* name = nullptr;
@@ -323,8 +443,36 @@ bool IsBrowserProcess()
     return n > 0;
 }
 
-// Hands the spare row to the first script Windows covers that this build does
-// not. Silent when the table cannot be recognized.
+// The second loop in font_defaults.cc's MakeDefaultFontCopier writes an empty
+// family for every pref kFontFamilyMap lists that no row set, which would wipe
+// the constructor value the row being given away was carrying. Pointing that
+// slot at a family FamilyMapByName does not carry leaves the value in place.
+unsigned NeutralizeMapEntry(const char* pref, const char* inert,
+                            const unsigned char* first, const unsigned char* last)
+{
+    unsigned written = 0;
+    // By content, not by address. kFontFamilyMap builds its names by pasting
+    // literals together, so they are their own objects and not the ones
+    // pref_names.h holds and kFontDefaults points at.
+    for (unsigned i = 0; i < g_data_count; ++i) {
+        for (const unsigned char* at = g_data[i].begin;
+             at + sizeof(void*) <= g_data[i].end; at += sizeof(void*)) {
+            if (at >= first && at <= last) {
+                continue;
+            }
+            const char* held = nullptr;
+            std::memcpy(&held, at, sizeof(held));
+            if (InRelro(at) && HoldsPrefName(at) && std::strcmp(held, pref) == 0 &&
+                IsMapSlot(at, pref) && WritePointer(const_cast<unsigned char*>(at), inert)) {
+                ++written;
+            }
+        }
+    }
+    return written;
+}
+
+// Hands the spare rows to the scripts Windows covers that this build does not.
+// Silent when the table cannot be recognized.
 void PatchFontDefaults()
 {
     static bool done = false;
@@ -336,11 +484,11 @@ void PatchFontDefaults()
         return;
     }
 
-    const unsigned char* spare = FindInData(kSpareRow, std::strlen(kSpareRow) + 1);
-    if (spare == nullptr) {
+    const unsigned char* anchor = FindInData(kInertPref, std::strlen(kInertPref) + 1);
+    if (anchor == nullptr) {
         return;
     }
-    const unsigned char* row = FindInData(&spare, sizeof(spare));
+    const unsigned char* row = FindInData(&anchor, sizeof(anchor));
     // A row of kFontDefaults, not a bare pointer in some other table.
     if (row == nullptr || !IsRow(row) || !IsRow(row - kRowSize) ||
         !IsRow(row + kRowSize)) {
@@ -354,7 +502,15 @@ void PatchFontDefaults()
     while (IsRow(last + kRowSize)) {
         last += kRowSize;
     }
+    bool registry = false;
+    for (const char* pref : kBrowserPrefs) {
+        registry = registry || FindInData(pref, std::strlen(pref) + 1) != nullptr;
+    }
 
+    const auto* inert = reinterpret_cast<const char*>(
+        FindInData(kInertPref, std::strlen(kInertPref) + 1));
+
+    unsigned next_spare = 0;
     for (const char* wanted : kWanted) {
         const unsigned char* name = FindInData(wanted, std::strlen(wanted) + 1);
         if (name == nullptr) {
@@ -372,13 +528,47 @@ void PatchFontDefaults()
         if (present) {
             continue;
         }
+        uint16_t resource = 0;
         for (unsigned i = 0; i < g_learned_count; ++i) {
             if (std::strcmp(g_learned[i].pref, wanted) == 0) {
-                WriteRow(const_cast<unsigned char*>(row),
-                         reinterpret_cast<const char*>(name), g_learned[i].resource);
-                return;
+                resource = g_learned[i].resource;
+                break;
             }
         }
+        if (resource == 0) {
+            continue;
+        }
+        // The next spare row still holding its own pref name, and still safe
+        // to give away.
+        unsigned char* give = nullptr;
+        while (next_spare < sizeof(kSpares) / sizeof(kSpares[0]) && give == nullptr) {
+            const Spare& candidate = kSpares[next_spare++];
+            unsigned char* found = nullptr;
+            for (const unsigned char* at = first; at <= last && found == nullptr;
+                 at += kRowSize) {
+                const char* held = nullptr;
+                std::memcpy(&held, at, sizeof(held));
+                if (held != nullptr && std::strcmp(held, candidate.pref) == 0) {
+                    found = const_cast<unsigned char*>(at);
+                }
+            }
+            if (found == nullptr) {
+                continue;
+            }
+            // While the name is still in the row to be found by. A row whose
+            // pref would go on being blanked stays where it is: losing its
+            // value outright is worse than not covering the script.
+            if (candidate.blanked &&
+                (registry || inert == nullptr ||
+                 NeutralizeMapEntry(candidate.pref, inert, first, last) == 0)) {
+                continue;
+            }
+            give = found;
+        }
+        if (give == nullptr) {
+            break;
+        }
+        (void)WriteRow(give, reinterpret_cast<const char*>(name), resource);
     }
 }
 
