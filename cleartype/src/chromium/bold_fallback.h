@@ -42,17 +42,18 @@ void MapAtLoad();
 // leaving it the shape Windows would have carried. Called from filterRec,
 // which runs before the typeface's own turns the flag into a stroke.
 //
-// The rec is marked by leaving fFrameWidth at a value of its own. Skia only
-// tests that field's sign, so any negative reads as no stroke, and the later
-// hooks have no other way to tell this run from a plain one.
-//
-// A run the page already gave a stroke is left alone, since the mark would
-// overwrite the width. Blink draws such text in two passes, so the fill still
-// gets the real face and only its outline stays synthetic.
+// The rec is marked in fReservedAlign, a padding byte Skia never reads, since
+// the later hooks have no other way to tell this run from a plain one. A run
+// the page already gave a stroke keeps its width, which is why the mark does
+// not live in fFrameWidth.
 bool ClearSyntheticBold(void* rec, const std::vector<uint8_t>& font);
 
 // Whether ClearSyntheticBold marked this rec.
-bool WasMarked(float frame_width);
+bool WasMarked(const void* rec);
+
+// Whether the rec carries synthetic italic. Blink writes it as the SkFont's
+// skew and SkScalerContext copies it into fPreSkewX.
+bool IsOblique(float pre_skew_x);
 
 // A face inside a mapped file. `bytes` is the whole file, which for a
 // collection holds several faces and needs `face_index` to say which.
@@ -60,12 +61,19 @@ struct Face
 {
     const std::vector<uint8_t>* bytes = nullptr;
     uint32_t face_index = 0;
+
+    // Draw the font already in hand, with DirectWrite's bold simulation, which
+    // is what Windows keeps for a face carrying bitmap strikes. The simulation
+    // widens advances, so it is not the same as Skia's synthetic bold.
+    bool simulate = false;
 };
 
 // The face DirectWrite would have answered with for the family `font` belongs
-// to. Empty when the family has nothing heavier than the face already in
-// hand, which is the case Windows also renders with synthetic bold.
-Face RealBoldFor(const std::vector<uint8_t>& font);
+// to. `oblique` is whether the run carries synthetic italic. Empty when the
+// family has nothing heavier than the face already in hand, which is the case
+// Windows also renders with synthetic bold, and empty for an oblique run whose
+// family has an italic face, which Windows answers with that face instead.
+Face RealBoldFor(const std::vector<uint8_t>& font, bool oblique);
 
 }  // namespace bold_fallback
 

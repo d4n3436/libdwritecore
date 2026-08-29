@@ -7,8 +7,9 @@
 #   run_electron_side.sh stop
 #
 # Started detached with a pidfile, because the process has to outlive the
-# shell that launched it and pattern-matching for it does not work: a pgrep
-# for the binary path also matches the very command line that starts it.
+# shell that launched it and pattern-matching for it does not work, since a
+# pgrep for the binary path also matches the very command line that starts
+# it.
 #
 # electron-app beside this script is the app to point it at, and the same one
 # belongs on the other machine.
@@ -53,10 +54,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# No distribution agrees on where a system Electron lives, and several ship
-# none at all, so there is nothing to default to. $PATH first, then the
-# versioned directories Arch and its derivatives use, and otherwise say what
-# to set rather than failing later with a confusing error.
+# There is no agreed place a system Electron lives, so there is nothing to
+# default to. $PATH first, then the versioned install directories, and
+# otherwise say what to set rather than failing later with a confusing error.
 if [ -z "$BINARY" ]; then
     BINARY="$(command -v electron 2>/dev/null || true)"
 fi
@@ -73,14 +73,14 @@ fi
 mkdir -p "$STATE"
 "$0" stop
 
-# Only what the capture needs is set here. No rendering switches: the two
-# sides are supposed to run the defaults, so that what differs between them is
-# the platform.
+# Only what the capture needs is set here, and no rendering switches. The
+# two sides are supposed to run the defaults, so that what differs between
+# them is the platform.
 #
 # WAYLAND_DISPLAY has to go, and the platform has to be named. Ozone prefers
 # Wayland when the session offers it, so an Electron started from a desktop
 # session ignores DISPLAY entirely, opens its window on the real desktop, and
-# leaves the Xvfb screen empty - which reads downstream as "no window manager
+# leaves the Xvfb screen empty, which reads downstream as "no window manager
 # mapped the window". Unsetting it is not enough on its own, so the platform
 # is stated outright.
 # The --unset comes first because env takes its options before any
@@ -90,8 +90,13 @@ env_args=(--unset=WAYLAND_DISPLAY
 [ -n "$LIBDIR" ]  && env_args+=(LD_LIBRARY_PATH="$LIBDIR")
 [ -n "$PRELOAD" ] && env_args+=(LD_PRELOAD="$PRELOAD" CHROMIUM_PATCH_DWRITE=1)
 
+# Occlusion throttling stays off because a sharded sweep runs two instances
+# on one screen, one window fully covering the other, and a covered window's
+# requestAnimationFrame is otherwise throttled to a stop, which stalls every
+# capture from it.
 setsid nohup env "${env_args[@]}" "$BINARY" \
-    --ozone-platform=x11 --remote-debugging-port="$PORT" "$APP" \
+    --ozone-platform=x11 --disable-backgrounding-occluded-windows \
+    --remote-debugging-port="$PORT" "$APP" \
     > "$STATE/electron.log" 2>&1 < /dev/null &
 echo $! > "$PIDFILE"
 

@@ -5,14 +5,19 @@ Compare two screenshots taken by capture_viewport.sh, whatever page they show.
     tools/testing/compare_viewport.py <width> <height> \
         <a_marked.png> <a_clean.png> <b_marked.png> <b_clean.png> \
         [--diff out.png] [--bands N] [--rows LO,HI] [--clusters N]
+    tools/testing/compare_viewport.py <width> <height> <a.png> <b.png> [...]
     tools/testing/compare_viewport.py --marker <shot.png>
     tools/testing/compare_viewport.py --fonts <font-dir>
 
-The two screenshots do not line up: different window chrome, different window
+Whole-screen shots do not line up: different window chrome, different window
 position, different screen. So this does not diff them directly. Each marked
 shot carries an eight-pixel magenta square at the viewport origin; this finds
 it on each side, crops width x height from there in both clean shots, and
 compares those.
+
+The four-argument form takes shots that are already the viewport, as
+Page.captureScreenshot returns them, and compares the pair with no marker
+and no crop.
 
 capture_viewport.py draws that marker on whatever page it is given, so this
 works on any page the browser can load.
@@ -238,19 +243,27 @@ def main():
         i = args.index("--diff")
         diff_path = args[i + 1]
         args = args[:i] + args[i + 2:]
-    if len(args) != 6:
+    if len(args) not in (4, 6):
         sys.exit(__doc__.strip())
 
     w, h = int(args[0]), int(args[1])
-    ax, ay, an = origin(args[2])
-    bx, by, bn = origin(args[4])
-    print("marker A (%d,%d) %d px   B (%d,%d) %d px" % (ax, ay, an, bx, by, bn))
-    if an != bn:
-        print("  note: the marker is a different size on the two sides, which "
-              "means display scaling differs and the comparison is not valid")
+    if len(args) == 4:
+        # Both shots are already the viewport, so there is no marker to find
+        # and nothing to crop away.
+        ax = ay = bx = by = 0
+        a_clean, b_clean = args[2], args[3]
+        print("direct capture %dx%d" % (w, h))
+    else:
+        ax, ay, an = origin(args[2])
+        bx, by, bn = origin(args[4])
+        print("marker A (%d,%d) %d px   B (%d,%d) %d px" % (ax, ay, an, bx, by, bn))
+        if an != bn:
+            print("  note: the marker is a different size on the two sides, which "
+                  "means display scaling differs and the comparison is not valid")
+        a_clean, b_clean = args[3], args[5]
 
-    a = crop(args[3], ax, ay, w, h)
-    b = crop(args[5], bx, by, w, h)
+    a = crop(a_clean, ax, ay, w, h)
+    b = crop(b_clean, bx, by, w, h)
 
     if row_range is not None:
         lo, hi = row_range

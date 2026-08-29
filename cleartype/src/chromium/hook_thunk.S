@@ -212,4 +212,61 @@ chromium_font_metrics_thunk:
     .cfi_endproc
 .size chromium_font_metrics_thunk, . - chromium_font_metrics_thunk
 
+// SkScalerContext::generatePath(const SkGlyph&) returns
+// std::optional<GeneratedPath>, 32 bytes, so like generateMetrics it comes
+// back through a hidden pointer:
+//
+//   rdi  the buffer the result is written into
+//   rsi  the scaler context
+//   rdx  the glyph
+//
+// The original runs first and builds a valid path; the handler then sees it
+// with all three arguments still in place and may rewrite its points. rax must
+// come back holding the buffer.
+
+.text
+.globl chromium_path_thunk
+.hidden chromium_path_thunk
+.type chromium_path_thunk, @function
+chromium_path_thunk:
+    .cfi_startproc
+    push %rbp
+    .cfi_adjust_cfa_offset 8
+    mov %rsp, %rbp
+    .cfi_def_cfa_register %rbp
+    push %rdi
+    .cfi_adjust_cfa_offset 8
+    push %rsi
+    .cfi_adjust_cfa_offset 8
+    push %rdx
+    .cfi_adjust_cfa_offset 8
+    sub $8, %rsp
+    .cfi_adjust_cfa_offset 8
+    movq g_original_path(%rip), %rax
+    call *%rax
+    add $8, %rsp
+    .cfi_adjust_cfa_offset -8
+    pop %rdx
+    .cfi_adjust_cfa_offset -8
+    pop %rsi
+    .cfi_adjust_cfa_offset -8
+    pop %rdi
+    .cfi_adjust_cfa_offset -8
+    // Sixteen bytes rather than a push, which would leave the stack
+    // misaligned and fault on the callee's first SSE spill.
+    sub $16, %rsp
+    .cfi_adjust_cfa_offset 16
+    mov %rdi, (%rsp)
+    call OnChromiumPath@PLT
+    mov (%rsp), %rax
+    add $16, %rsp
+    .cfi_adjust_cfa_offset -16
+    mov %rbp, %rsp
+    pop %rbp
+    .cfi_def_cfa_register %rsp
+    .cfi_adjust_cfa_offset -8
+    ret
+    .cfi_endproc
+.size chromium_path_thunk, . - chromium_path_thunk
+
 .section .note.GNU-stack,"",@progbits

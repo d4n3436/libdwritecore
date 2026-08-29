@@ -44,23 +44,49 @@ constexpr uint32_t Tag(const char a, const char b, const char c, const char d)
            static_cast<unsigned char>(d);
 }
 
+// No face by that index, or nothing that parses as a font.
+constexpr size_t kNoDirectory = static_cast<size_t>(-1);
+
 // gasp range behavior bits, from src/sfnt/SkOTTable_gasp.h.
 constexpr uint16_t kGaspGridfit = 1u << 0;
 constexpr uint16_t kGaspSymmetricSmoothing = 1u << 3;
 
-}  // namespace
-
-Span FindTable(const std::vector<uint8_t>& font, const uint32_t tag)
+// Where one face's table directory starts. A single face is its own directory
+// at zero; a collection puts a 'ttcf' header there instead, holding an offset
+// per face. Reading a collection as if it were a single face finds no table at
+// all, since what sits where the table count belongs is half of a version.
+size_t DirectoryAt(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
     if (font.size() < 12) {
+        return kNoDirectory;
+    }
+    if (Be32(font.data()) != Tag('t', 't', 'c', 'f')) {
+        return face_index == 0 ? 0 : kNoDirectory;
+    }
+    const uint32_t faces = Be32(font.data() + 8);
+    if (face_index >= faces ||
+        font.size() < 12 + static_cast<size_t>(faces) * 4) {
+        return kNoDirectory;
+    }
+    const uint32_t at = Be32(font.data() + 12 + static_cast<size_t>(face_index) * 4);
+    return static_cast<uint64_t>(at) + 12 <= font.size() ? at : kNoDirectory;
+}
+
+}  // namespace
+
+Span FindTable(const std::vector<uint8_t>& font, const uint32_t tag,
+               const uint32_t face_index)
+{
+    const size_t base = DirectoryAt(font, face_index);
+    if (base == kNoDirectory) {
         return {};
     }
-    const uint16_t num_tables = Be16(font.data() + 4);
-    if (font.size() < 12 + static_cast<size_t>(num_tables) * 16) {
+    const uint16_t num_tables = Be16(font.data() + base + 4);
+    if (font.size() < base + 12 + static_cast<size_t>(num_tables) * 16) {
         return {};
     }
     for (uint16_t i = 0; i < num_tables; ++i) {
-        const uint8_t* entry = font.data() + 12 + static_cast<size_t>(i) * 16;
+        const uint8_t* entry = font.data() + base + 12 + static_cast<size_t>(i) * 16;
         if (Be32(entry) != tag) {
             continue;
         }
@@ -75,9 +101,9 @@ Span FindTable(const std::vector<uint8_t>& font, const uint32_t tag)
 }
 
 // is_hinted: a version 1.0 maxp whose maxSizeOfInstructions is not zero.
-bool IsHinted(const std::vector<uint8_t>& font)
+bool IsHinted(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
-    const Span maxp = FindTable(font, Tag('m', 'a', 'x', 'p'));
+    const Span maxp = FindTable(font, Tag('m', 'a', 'x', 'p'), face_index);
     // version(4) then twelve uint16 before maxSizeOfInstructions at 26.
     if (maxp.data == nullptr || maxp.size < 28) {
         return false;
@@ -89,9 +115,10 @@ bool IsHinted(const std::vector<uint8_t>& font)
 }
 
 // get_gasp_range: the first range whose maxPPEM is at or above this size.
-bool GaspRangeFor(const std::vector<uint8_t>& font, const int ppem, GaspRange* out)
+bool GaspRangeFor(const std::vector<uint8_t>& font, const int ppem, GaspRange* out,
+                  const uint32_t face_index)
 {
-    const Span gasp = FindTable(font, Tag('g', 'a', 's', 'p'));
+    const Span gasp = FindTable(font, Tag('g', 'a', 's', 'p'), face_index);
     if (gasp.data == nullptr || gasp.size < 4) {
         return false;
     }
@@ -131,9 +158,10 @@ bool SymmetricSmoothing(const uint16_t flags)
 
 // has_bitmap_strike: an EBLC with a square strike inside the gasp range that
 // covers at least three glyphs.
-bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range)
+bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range,
+                     const uint32_t face_index)
 {
-    const Span eblc = FindTable(font, Tag('E', 'B', 'L', 'C'));
+    const Span eblc = FindTable(font, Tag('E', 'B', 'L', 'C'), face_index);
     if (eblc.data == nullptr || eblc.size < 8) {
         return false;
     }
@@ -165,9 +193,9 @@ bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range)
 // The typeface family name, which is name ID 1. Unicode and Windows records
 // are UTF-16BE and Macintosh ones are single byte, and all are read since a
 // font need not carry any one of them.
-std::string FamilyName(const std::vector<uint8_t>& font)
+std::string FamilyName(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
-    const Span name = FindTable(font, Tag('n', 'a', 'm', 'e'));
+    const Span name = FindTable(font, Tag('n', 'a', 'm', 'e'), face_index);
     if (name.data == nullptr || name.size < 6) {
         return {};
     }
@@ -206,30 +234,30 @@ std::string FamilyName(const std::vector<uint8_t>& font)
 // bitmap_glyphs_block_list.cc. Calibri is the one font with both bitmaps and
 // outlines for Latin, and its bitmaps space unevenly under subpixel
 // positioning.
-bool BlocksEmbeddedBitmaps(const std::vector<uint8_t>& font)
+bool BlocksEmbeddedBitmaps(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
-    const std::string family = FamilyName(font);
+    const std::string family = FamilyName(font, face_index);
     return family == "Calibri" || family == "Courier New";
 }
 
-bool HasCbdt(const std::vector<uint8_t>& font)
+bool HasCbdt(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
-    return FindTable(font, Tag('C', 'B', 'D', 'T')).data != nullptr;
+    return FindTable(font, Tag('C', 'B', 'D', 'T'), face_index).data != nullptr;
 }
 
 windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gasp_ppem,
-                                 const int bitmap_ppem)
+                                 const int bitmap_ppem, const uint32_t face_index)
 {
     windows_path::FontFacts f;
     if (font.empty()) {
         return f;
     }
-    f.is_hinted = IsHinted(font);
-    f.has_cbdt = HasCbdt(font);
-    f.blocks_embedded_bitmaps = BlocksEmbeddedBitmaps(font);
+    f.is_hinted = IsHinted(font, face_index);
+    f.has_cbdt = HasCbdt(font, face_index);
+    f.blocks_embedded_bitmaps = BlocksEmbeddedBitmaps(font, face_index);
 
     GaspRange range;
-    if (GaspRangeFor(font, gasp_ppem, &range)) {
+    if (GaspRangeFor(font, gasp_ppem, &range, face_index)) {
         f.gasp_known = true;
         f.gasp_version_1_or_later = range.version >= 1;
         f.gasp_symmetric_smoothing = SymmetricSmoothing(range.flags);
@@ -241,11 +269,11 @@ windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gas
     // narrowing SkScalerContext_DW's constructor does before calling it. Its
     // lookup is its own, at a ppem that need not equal the gasp one.
     GaspRange bitmap_range{bitmap_ppem, bitmap_ppem, 0, 0};
-    if (GaspRange at_bitmap; GaspRangeFor(font, bitmap_ppem, &at_bitmap) &&
+    if (GaspRange at_bitmap; GaspRangeFor(font, bitmap_ppem, &at_bitmap, face_index) &&
                              IsGridfitOnly(at_bitmap.flags)) {
         bitmap_range = at_bitmap;
     }
-    f.has_bitmap_strike = HasBitmapStrike(font, bitmap_range);
+    f.has_bitmap_strike = HasBitmapStrike(font, bitmap_range, face_index);
     return f;
 }
 

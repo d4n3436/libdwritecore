@@ -61,6 +61,14 @@
        Chromium's fallback reaches the family Windows' table names. */
     FcCharSetHasChar;
 
+    /* Not FreeType: a bold fallback run is shaped with the regular face's
+       GPOS unless it is caught here. Exported for a build that links HarfBuzz
+       as a shared library; one that compiles it in is patched instead. See
+       src/chromium/bold_shaping.cpp. */
+    hb_shape;
+    hb_font_set_funcs;
+    hb_font_destroy;
+
     /* Not FreeType: the per-script generic families are compiled into
        Chromium's resource bundle, so the bundle is edited as it is mapped.
        Anything that is not a read-only shared mapping of a .pak passes

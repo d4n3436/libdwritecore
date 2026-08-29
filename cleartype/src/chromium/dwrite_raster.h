@@ -20,6 +20,8 @@
 #include "skia_abi.h"
 #include "windows_path.h"
 
+#include "path_abi.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -43,7 +45,7 @@ bool Available();
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   uint16_t glyph_id, const skia_abi::Rec& rec,
                   const windows_path::Decision& decision, float* advance_x, float* advance_y,
-                  uint32_t face_index = 0);
+                  uint32_t face_index = 0, bool simulate_bold = false);
 
 // SkScalerContext_DW::generateDWMetrics, the box DirectWrite will fill.
 // Fontations instead rounds out an unhinted outline, which can sit a pixel
@@ -57,18 +59,29 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision,
                  windows_path::RenderingMode rendering_mode,
                  windows_path::TextureType texture_type,
-                 int* left, int* top, int* right, int* bottom, uint32_t face_index = 0);
+                 int* left, int* top, int* right, int* bottom, uint32_t face_index = 0, bool simulate_bold = false);
 
 // The font-wide metrics Windows would report, written into an SkFontMetrics.
 // False when they cannot be had, and the caller keeps Skia's own.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision, void* sk_font_metrics,
-                 uint32_t face_index = 0);
+                 uint32_t face_index = 0, bool simulate_bold = false);
+
+// SkScalerContext_DW::generatePath, the outline DirectWrite hands Skia on
+// Windows. `size` is fTextSizeRender, and the verbs and points come back in
+// Skia's own order and convention, since SkDWriteGeometrySink is what
+// translates them there and is mirrored here.
+//
+// False when the outline cannot be had, and the caller keeps skrifa's.
+bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                  uint16_t glyph_id, float size, std::vector<uint8_t>* verbs,
+                  std::vector<path_abi::Point>* points, uint32_t face_index = 0,
+                  bool simulate_bold = false);
 
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer, uint32_t face_index = 0);
+                 void* image_buffer, uint32_t face_index = 0, bool simulate_bold = false);
 
 }  // namespace dwrite_raster
 

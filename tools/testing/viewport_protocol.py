@@ -42,12 +42,14 @@ import urllib.request
 INNER = ("return [window.innerWidth, window.innerHeight, "
          "window.outerWidth, window.outerHeight];")
 
+# readyState reaches complete before font loading has settled, and a capture
+# taken in between catches the page laid out with the fonts it had at the time.
 PAGE_LOADED = """
-return document.readyState === 'complete';
+return document.readyState === 'complete' && document.fonts.status === 'loaded';
 """
 
 # Fonts loaded and no pending layout. document.fonts.ready alone is not
-# enough: it resolves before the first paint that uses them.
+# enough, since it resolves before the first paint that uses them.
 VIEWPORT_READY = """
 return document.fonts.status === 'loaded' &&
        Math.abs(window.scrollY - arguments[0]) <= 1;
@@ -75,6 +77,18 @@ return [window.innerWidth, window.innerHeight, window.scrollY,
 UNMARK = ("const d = document.getElementById('__dwc_origin_mark'); "
           "if (d) d.remove(); return 1;")
 
+# An extra rule sheet, applied to both sides of a comparison to take one
+# suspected cause out of the picture. `font-kerning: none` prices what the two
+# sides' kerning is worth, `font-weight: 400` what their bold is. The sheet
+# goes in last, so a rule the caller marks !important beats the page's own.
+EXTRA_CSS = """
+const s = document.createElement('style');
+s.id = '__dwc_extra_css';
+s.textContent = arguments[0];
+document.head.appendChild(s);
+return 1;
+"""
+
 # Resolves after the next paint, so the screenshot is taken of a frame that
 # includes whatever was just changed.
 PAINTED = """
@@ -90,8 +104,9 @@ WORK_TIMEOUT = 240.0
 # ---------------------------------------------------------------------------
 # A minimal DevTools client.
 #
-# Neither websockets nor websocket-client is present, and the protocol needed
-# here is small: one connection, text frames, no extensions, no continuation.
+# Neither websockets nor websocket-client is present, and the protocol
+# needed here is small. One connection, text frames, no extensions, no
+# continuation.
 # Everything below is RFC 6455 for that case only, and will not serve as a
 # general client.
 # ---------------------------------------------------------------------------
@@ -239,6 +254,12 @@ class CdpBrowser(Browser):
                                  session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
+        # A fixture that changed on disk is otherwise served out of the
+        # browser's own cache, and only on the side that already had it, so the
+        # two machines compare different bytes and the difference reads as a
+        # rendering one.
+        self.call("Network.enable")
+        self.call("Network.setCacheDisabled", {"cacheDisabled": True})
         # Electron implements only part of the Browser domain: window
         # management there belongs to BrowserWindow, not Chromium, so
         # Browser.getWindowForTarget is simply absent. When it is, the window
@@ -398,17 +419,86 @@ def park_pointer(browser):
                  {"type": "mouseMoved", "x": 1, "y": 1, "buttons": 0})
 
 
-def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT):
+def hide_scrollbars(browser):
+    """Take the scrollbars out of the picture before anything is measured.
+
+    Chromium draws overlay scrollbars inside the viewport and over the content,
+    so they land in the crop. One stays drawn while the pointer is over it or a
+    scroll is still fading, and that is not the same moment on two machines, so
+    a thumb counts as a difference wherever it is caught. They are window
+    furniture and are hidden instead of compared. Overlay scrollbars take no
+    layout space, so nothing moves. Only the CDP driver can do this.
+    """
+    if not hasattr(browser, "call"):
+        return
+    browser.call("Emulation.setScrollbarsHidden", {"hidden": True})
+
+
+# The scroll part of MARK, without the marker. Scrollbars are already hidden
+# session-wide through Emulation.setScrollbarsHidden, so this writes no style,
+# since a per-page style write on the root element costs a full recalc on a
+# large document.
+SETTLE = """
+window.scrollTo({top: arguments[0], left: 0, behavior: 'instant'});
+return 1;
+"""
+
+
+def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
+                   deadline=WORK_TIMEOUT, css=None):
+    """Put the page into the compared state and read the frame back over CDP.
+
+    Page.captureScreenshot returns exactly the viewport, so there is no
+    marker to plant, no whole-screen photograph and no crop. It reads back
+    the compositor's frame, which is not byte-identical to a photograph of
+    the screen, so both sides of a comparison must be captured the same way
+    and the two routes are never mixed.
+
+    CDP only. The Marionette route keeps the marker handshake in capture().
+    """
+    browser.navigate(url)
+    await_condition(browser, PAGE_LOADED, deadline, "the page never finished loading")
+    if css:
+        browser.script(EXTRA_CSS, [css])
+        await_condition(browser, PAGE_LOADED, deadline,
+                        "the page never settled after the extra css")
+    browser.script(SETTLE, [scroll])
+    await_condition(browser, VIEWPORT_READY, deadline,
+                    "the viewport never settled after scrolling", [scroll])
+    # A navigation re-derives :hover from where the machine's own pointer
+    # sits, and whatever is under it renders hovered until the pointer is
+    # moved again, so the park is per page.
+    park_pointer(browser)
+    browser.script_async(PAINTED)
+    # optimizeForSpeed trades PNG size for encode time. Lossless either way,
+    # and the encode is the whole cost of a busy frame without it.
+    shot = browser.call("Page.captureScreenshot",
+                        {"format": "png", "fromSurface": True,
+                         "optimizeForSpeed": True})
+    with open(out_png, "wb") as handle:
+        handle.write(base64.b64decode(shot["data"]))
+
+
+def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT,
+            css=None):
     """Put the browser into the compared state and hand off for two shots.
 
     Writes "<tag>.marked" once the page is ready with the origin marker in
     place, waits for the caller to delete it, removes the marker, writes
     "<tag>.clean", and waits again. The caller screenshots between those.
+
+    `css` is an extra rule sheet, for isolating a cause. It has to be the same
+    on both sides or the comparison stops meaning anything.
     """
     browser.navigate("about:blank")
+    hide_scrollbars(browser)
     converge_inner_size(browser, want_w, want_h, SETUP_TIMEOUT)
     browser.navigate(url)
     await_condition(browser, PAGE_LOADED, deadline, "the page never finished loading")
+    if css:
+        browser.script(EXTRA_CSS, [css])
+        await_condition(browser, PAGE_LOADED, deadline,
+                        "the page never settled after the extra css")
 
     state = browser.script(MARK, [scroll])
     await_condition(browser, VIEWPORT_READY, deadline,

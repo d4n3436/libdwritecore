@@ -112,10 +112,11 @@ def save_by_fetching(base, out_dir):
     # Carry the charset into the document.
     #
     # A server may declare it only in the Content-Type header, and a page that
-    # relies on that has no <meta charset> of its own. Saved to a file and served
-    # by something that does not repeat the header, it decodes as Latin-1 - and
-    # the failure is quiet: the page still renders, in mojibake, and a comparison
-    # of two machines rendering the same mojibake looks like a font problem.
+    # relies on that has no <meta charset> of its own. Saved to a file and
+    # served by something that does not repeat the header, it decodes as
+    # Latin-1, and quietly, since the page still renders, in mojibake, and a
+    # comparison of two machines rendering the same mojibake looks like a
+    # font problem.
     declared = ""
     for part in page_ctype.split(";"):
         if part.strip().lower().startswith("charset="):
@@ -192,6 +193,91 @@ def save_by_fetching(base, out_dir):
 # The browser route
 # ---------------------------------------------------------------------------
 
+# Extensions a browser rasterizes as a picture. Font extensions stay out of
+# the list, since a @font-face src is a url() too and must survive.
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp",
+                  ".ico", ".svg")
+
+# url() targets that name one, including the inlined form.
+IMAGE_URL = re.compile(
+    r"url\(\s*['\"]?\s*(?:data:image/[^)]*|[^)'\"]*(?:%s))\s*['\"]?\s*\)"
+    % "|".join(suffix.replace(".", r"\.") for suffix in IMAGE_SUFFIXES),
+    re.IGNORECASE)
+
+
+def strip_images(soup):
+    """Drop everything that renders as a picture, and say how many.
+
+    A picture is not what any of this measures, and it does not render the
+    same twice. A downscaled image is drawn at a cheap filter first and
+    redrawn at the full one a few frames later, so two machines captured at
+    the same moment disagree along its edges.
+
+    Inline <svg> goes the same way when it is an icon, and stays when it
+    holds text. Pages exist to compare SVG text against the same glyphs
+    drawn as HTML, and emptying those would leave nothing to compare.
+    """
+    dropped = 0
+    for tag in soup.find_all(["img", "picture", "source", "video", "audio"]):
+        tag.decompose()
+        dropped += 1
+    for tag in soup.find_all("svg"):
+        if not tag.find(["text", "tspan", "textPath"]):
+            tag.decompose()
+            dropped += 1
+    for tag in soup.find_all(style=True):
+        stripped = IMAGE_URL.sub("none", tag["style"])
+        if stripped != tag["style"]:
+            tag["style"] = stripped
+            dropped += 1
+    for tag in soup.find_all("style"):
+        if tag.string:
+            stripped = IMAGE_URL.sub("none", tag.string)
+            if stripped != tag.string:
+                tag.string.replace_with(stripped)
+                dropped += 1
+    return dropped
+
+
+def strip_image_files(out_dir):
+    """Delete the picture files themselves, now that nothing points at them."""
+    removed = 0
+    for root, _, names in os.walk(out_dir):
+        for name in names:
+            if name.lower().endswith(IMAGE_SUFFIXES):
+                os.remove(os.path.join(root, name))
+                removed += 1
+    return removed
+
+
+def strip_saved(out_dir):
+    """Apply both to a directory that was saved earlier."""
+    index = os.path.join(out_dir, "index.html")
+    if not os.path.isfile(index):
+        return None
+    with open(index, encoding="utf-8", errors="replace") as handle:
+        soup = BeautifulSoup(handle.read(), "html.parser")
+    dropped = strip_images(soup)
+    for root, _, names in os.walk(out_dir):
+        for name in names:
+            if not name.lower().endswith(".css"):
+                continue
+            path = os.path.join(root, name)
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+            stripped = IMAGE_URL.sub("none", text)
+            if stripped != text:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(stripped)
+    # A page with no pictures in it is left exactly as it was. Rewriting it
+    # would serialize the parse instead, which rewrites entities and tag forms
+    # in hand-written fixtures for no gain.
+    if dropped:
+        with open(index, "w", encoding="utf-8") as handle:
+            handle.write(str(soup))
+    return dropped, strip_image_files(out_dir)
+
+
 def find_firefox():
     """The same search run_parity_firefox.sh does, in the same order."""
     for candidate in ("firefox", "firefox-esr", "librewolf"):
@@ -227,6 +313,7 @@ def tidy(saved_html, assets_dir, out_dir):
 
     soup = BeautifulSoup(raw, "html.parser")
     scripts = len(soup.find_all("script"))
+    pictures = strip_images(soup)
     for tag in soup.find_all("script"):
         tag.decompose()
     for tag in soup.find_all("base"):
@@ -278,9 +365,11 @@ def tidy(saved_html, assets_dir, out_dir):
         handle.write(html)
     os.remove(saved_html)
 
+    strip_image_files(out_dir)
     assets = len(os.listdir(assets_out)) if os.path.isdir(assets_out) else 0
-    print("saved %s %d bytes; %d assets; dropped %d script(s) and %d that stayed remote"
-          % (index, os.path.getsize(index), assets, scripts, remote))
+    print("saved %s %d bytes; %d assets; dropped %d script(s), %d picture(s) "
+          "and %d that stayed remote"
+          % (index, os.path.getsize(index), assets, scripts, pictures, remote))
 
 
 def save_by_browser(url, out_dir):
@@ -331,7 +420,7 @@ def save_by_browser(url, out_dir):
         client.call("Marionette:SetContext", {"value": "content"})
         client.call("WebDriver:Navigate", {"url": url})
         # The save takes the DOM as it stands, so wait for the page to have
-        # stopped changing it: parsing done, then the fonts it asked for.
+        # stopped changing it, parsing done and its fonts loaded.
         try:
             client.script("return document.fonts.ready.then(() => true);")
         except Exception:
@@ -371,9 +460,20 @@ def save_by_browser(url, out_dir):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("url")
+    ap.add_argument("url", nargs="?")
     ap.add_argument("out")
+    ap.add_argument("--strip-images", action="store_true",
+                    help="drop the pictures from a directory saved earlier, "
+                         "leaving everything else alone")
     args = ap.parse_args()
+
+    if args.strip_images:
+        result = strip_saved(args.out)
+        if result is None:
+            sys.exit("no index.html in " + args.out)
+        print("%s: dropped %d picture(s), removed %d file(s)"
+              % (args.out, result[0], result[1]))
+        return
 
     os.makedirs(os.path.join(args.out, "a"), exist_ok=True)
     if save_by_browser(args.url, args.out):

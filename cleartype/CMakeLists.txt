@@ -23,6 +23,8 @@ add_library(cleartype SHARED
   src/chromium/fallback_order.cpp
   src/chromium/family_match.cpp
   src/chromium/bold_fallback.cpp
+  src/chromium/bold_shaping.cpp
+  src/chromium/hb_abi.cpp
   src/chromium/generic_families.cpp
   src/chromium/hook_thunk.S)
 

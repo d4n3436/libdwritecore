@@ -12,9 +12,12 @@
 #include "compat.h"
 #include "dwrite_3.h"
 #include "dwrite_core.h"
+#include "geometry_sink.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <unordered_map>
 
@@ -114,14 +117,39 @@ bool EnsureFactory()
     return true;
 }
 
+// What identifies one font face: the bytes it was built from, which face of a
+// collection it is, and whether DirectWrite is simulating bold on it.
+struct FaceKey
+{
+    const void* typeface;
+    uint32_t face_index;
+    bool simulate_bold;
+
+    bool operator==(const FaceKey& other) const = default;
+};
+
+struct KeyHash
+{
+    size_t operator()(const FaceKey& k) const
+    {
+        return std::hash<const void*>{}(k.typeface) ^
+               (std::hash<uint32_t>{}(k.face_index) << 1) ^
+               static_cast<size_t>(k.simulate_bold);
+    }
+};
+
 // One font face per typeface, built from the bytes typeface_bridge rebuilt,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
 IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes,
-                         const uint32_t face_index)
+                         const uint32_t face_index, const bool simulate_bold)
 {
-    static std::unordered_map<const void*, IDWriteFontFace*> faces;
-    if (const auto it = faces.find(typeface); it != faces.end()) {
+    // A simulated face is a different face for the same bytes, and so is every
+    // other face of a collection, whose bytes are the whole file and therefore
+    // the same for all of them.
+    static std::unordered_map<FaceKey, IDWriteFontFace*, KeyHash> faces;
+    const FaceKey key{typeface, face_index, simulate_bold};
+    if (const auto it = faces.find(key); it != faces.end()) {
         return it->second;
     }
     // A collection carries 'ttcf' where a single face carries its SFNT
@@ -137,13 +165,14 @@ IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes
         SUCCEEDED(g_dw.loader->CreateInMemoryFontFileReference(
             g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()), nullptr, &file)) &&
         file != nullptr) {
-        if (FAILED(g_dw.factory5->CreateFontFace(type, 1, &file, face_index,
-                                                 DWRITE_FONT_SIMULATIONS_NONE, &face))) {
+        const DWRITE_FONT_SIMULATIONS sims = simulate_bold ? DWRITE_FONT_SIMULATIONS_BOLD
+                                                          : DWRITE_FONT_SIMULATIONS_NONE;
+        if (FAILED(g_dw.factory5->CreateFontFace(type, 1, &file, face_index, sims, &face))) {
             face = nullptr;
         }
         file->Release();
     }
-    faces[typeface] = face;
+    faces[key] = face;
     if (face == nullptr) {
         Say("could not build a font face from the rebuilt bytes");
     }
@@ -177,6 +206,142 @@ uint16_t Pack888ToRGB16(const uint8_t r, const uint8_t g, const uint8_t b)
     return static_cast<uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
 
+// SkDWriteGeometrySink, src/utils/win/SkDWriteGeometrySink.cpp. DirectWrite
+// only ever emits lines and cubics, so Skia recovers the quadratics itself
+// before the path is built. Reproducing that recovery is what makes the verb
+// sequence comparable with skrifa's, which emits quadratics directly.
+class Sink final : public IDWriteGeometrySink
+{
+public:
+    Sink(std::vector<uint8_t>* verbs, std::vector<path_abi::Point>* points)
+        : verbs_(verbs), points_(points)
+    {
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** object) override
+    {
+        *object = this;
+        return S_OK;
+    }
+    // Stack allocated for the length of one call, so the count is never read.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    void STDMETHODCALLTYPE SetFillMode(D2D1_FILL_MODE) override {}
+    void STDMETHODCALLTYPE SetSegmentFlags(D2D1_PATH_SEGMENT) override {}
+
+    void STDMETHODCALLTYPE BeginFigure(const D2D1_POINT_2F start, D2D1_FIGURE_BEGIN) override
+    {
+        started_ = false;
+        current_ = start;
+    }
+
+    void STDMETHODCALLTYPE AddLines(const D2D1_POINT_2F* points, const UINT32 count) override
+    {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (CurrentIsNot(points[i])) {
+                GoingTo(points[i]);
+                Emit(path_abi::kLine, {points[i]});
+            }
+        }
+    }
+
+    void STDMETHODCALLTYPE AddBeziers(const D2D1_BEZIER_SEGMENT* beziers,
+                                      const UINT32 count) override
+    {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (!CurrentIsNot(beziers[i].point1) && !CurrentIsNot(beziers[i].point2) &&
+                !CurrentIsNot(beziers[i].point3)) {
+                continue;
+            }
+            const D2D1_POINT_2F from = current_;
+            GoingTo(beziers[i].point3);
+            if (D2D1_POINT_2F quad_control{};
+                IsQuadratic(from, beziers[i], &quad_control)) {
+                Emit(path_abi::kQuad, {quad_control, beziers[i].point3});
+            } else {
+                Emit(path_abi::kCubic, {beziers[i].point1, beziers[i].point2, beziers[i].point3});
+            }
+        }
+    }
+
+    void STDMETHODCALLTYPE EndFigure(D2D1_FIGURE_END) override
+    {
+        if (started_) {
+            verbs_->push_back(path_abi::kClose);
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE Close() override { return S_OK; }
+
+private:
+    void GoingTo(const D2D1_POINT_2F pt)
+    {
+        if (!started_) {
+            started_ = true;
+            Emit(path_abi::kMove, {current_});
+        }
+        current_ = pt;
+    }
+
+    bool CurrentIsNot(const D2D1_POINT_2F pt) const
+    {
+        return current_.x != pt.x || current_.y != pt.y;
+    }
+
+    void Emit(const uint8_t verb, const std::initializer_list<D2D1_POINT_2F> pts)
+    {
+        verbs_->push_back(verb);
+        for (const D2D1_POINT_2F& p : pts) {
+            points_->push_back({p.x, p.y});
+        }
+    }
+
+    // SkFloatingPoint<float, 10>::AlmostEquals, src/utils/SkFloatUtils.h: the
+    // two values must be within ten units in the last place of each other.
+    static bool AlmostEquals(const float a, const float b)
+    {
+        uint32_t ia = 0;
+        uint32_t ib = 0;
+        std::memcpy(&ia, &a, sizeof(ia));
+        std::memcpy(&ib, &b, sizeof(ib));
+        constexpr uint32_t kSign = 0x80000000u;
+        if ((ia & 0x7F800000u) == 0x7F800000u && (ia & 0x007FFFFFu) != 0) { return false; }
+        if ((ib & 0x7F800000u) == 0x7F800000u && (ib & 0x007FFFFFu) != 0) { return false; }
+        const uint32_t biased_a = (ia & kSign) != 0 ? ~ia + 1 : kSign | ia;
+        const uint32_t biased_b = (ib & kSign) != 0 ? ~ib + 1 : kSign | ib;
+        const uint32_t dist = biased_a >= biased_b ? biased_a - biased_b : biased_b - biased_a;
+        return dist <= 10;
+    }
+
+    // check_quadratic, the same file: a cubic that is an exact promotion of a
+    // quadratic has both control points two thirds of the way to one shared
+    // point, which is the quadratic's own control point.
+    static bool IsQuadratic(const D2D1_POINT_2F from, const D2D1_BEZIER_SEGMENT& b,
+                            D2D1_POINT_2F* control)
+    {
+        const float dx10 = b.point1.x - from.x;
+        const float dx23 = b.point2.x - b.point3.x;
+        const float mid_x = from.x + dx10 * 3 / 2;
+        if (!AlmostEquals(mid_x, dx23 * 3 / 2 + b.point3.x)) {
+            return false;
+        }
+        const float dy10 = b.point1.y - from.y;
+        const float dy23 = b.point2.y - b.point3.y;
+        const float mid_y = from.y + dy10 * 3 / 2;
+        if (!AlmostEquals(mid_y, dy23 * 3 / 2 + b.point3.y)) {
+            return false;
+        }
+        *control = {mid_x, mid_y};
+        return true;
+    }
+
+    std::vector<uint8_t>* verbs_;
+    std::vector<path_abi::Point>* points_;
+    bool started_ = false;
+    D2D1_POINT_2F current_{};
+};
+
 }  // namespace
 
 bool Preload()
@@ -200,7 +365,8 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision,
                  const windows_path::RenderingMode rendering_mode,
                  const windows_path::TextureType texture_type, int* left, int* top,
-                 int* right, int* bottom, const uint32_t face_index)
+                 int* right, int* bottom, const uint32_t face_index,
+                 const bool simulate_bold)
 {
     if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) {
         return false;
@@ -209,7 +375,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
     if (face == nullptr) {
         return false;
     }
@@ -291,7 +457,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   const uint16_t glyph_id, const skia_abi::Rec& rec,
                   const windows_path::Decision& decision, float* advance_x, float* advance_y,
-                  const uint32_t face_index)
+                  const uint32_t face_index, const bool simulate_bold)
 {
     if (advance_x == nullptr || advance_y == nullptr) {
         return false;
@@ -300,7 +466,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
     if (face == nullptr) {
         return false;
     }
@@ -357,7 +523,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
 // disagreement here becomes a whole pixel of line height.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision, void* sk_font_metrics,
-                 const uint32_t face_index)
+                 const uint32_t face_index, const bool simulate_bold)
 {
     if (sk_font_metrics == nullptr) {
         return false;
@@ -366,7 +532,7 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
     if (face == nullptr) {
         return false;
     }
@@ -431,10 +597,37 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     return true;
 }
 
+// SkScalerContext_DW::generatePath. DirectWrite is asked for the outline at
+// fTextSizeRender with no hinting, exactly as the comment there says, and the
+// sink above turns it into Skia's verbs.
+bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
+                  const uint16_t glyph_id, const float size, std::vector<uint8_t>* verbs,
+                  std::vector<path_abi::Point>* points, const uint32_t face_index,
+                  const bool simulate_bold)
+{
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    if (face == nullptr) {
+        return false;
+    }
+    verbs->clear();
+    points->clear();
+    Sink sink(verbs, points);
+    UINT16 id = glyph_id;
+    if (FAILED(face->GetGlyphRunOutline(size, &id, nullptr, nullptr, 1, FALSE, FALSE, &sink))) {
+        return false;
+    }
+    return !verbs->empty();
+}
+
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer, const uint32_t face_index)
+                 void* image_buffer, const uint32_t face_index,
+                 const bool simulate_bold)
 {
     // Only a plain outline glyph. COLRv0, COLRv1 and embedded bitmaps are
     // drawn by Skia through paths an alpha texture cannot stand in for.
@@ -450,7 +643,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
     if (face == nullptr) {
         return false;
     }

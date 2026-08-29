@@ -33,6 +33,8 @@ def main():
     ap.add_argument("height", type=int)
     ap.add_argument("tag")
     ap.add_argument("--scroll", type=int, default=0)
+    ap.add_argument("--css", default=None,
+                    help="extra rule sheet, applied to both sides alike")
     ap.add_argument("--connect-timeout", type=float, default=30.0)
     args = ap.parse_args()
 
@@ -43,7 +45,8 @@ def main():
         sys.exit("could not attach to DevTools on %s:%d: %s"
                  % (args.host, args.port, exc))
     try:
-        vp.capture(browser, args.url, args.width, args.height, args.tag, args.scroll)
+        vp.capture(browser, args.url, args.width, args.height, args.tag, args.scroll,
+                   css=args.css)
     finally:
         browser.close()
 

@@ -3,7 +3,7 @@
 # capture_viewport.sh - drive one browser and take the two screenshots.
 #
 #   capture_viewport.sh <backend> <out-prefix> <host> <port> <url> \
-#                       <width> <height> [--wait S] [--scroll Y]
+#                       <width> <height> [--wait S] [--scroll Y] [--css RULES]
 #
 # backend is how to photograph the screen the browser is on:
 #
@@ -14,9 +14,10 @@
 # locates the viewport, the clean one is what gets compared -
 # compare_viewport.py takes all four files.
 #
-# Run it once per machine with the same width, height, url and scroll, then
-# compare. The two runs are independent; neither side has to know about the
-# other.
+# Run it once per machine with the same width, height, url, scroll and --css,
+# then compare. The two runs are independent; neither side has to know about
+# the other. --css adds a rule sheet on top of the page, which is how a
+# suspected cause is taken out of both sides at once.
 #
 # There is no fixed settle here. What a settle would be waiting for is visible
 # in the photograph itself: the marked stage is done when the marker is in the
@@ -50,13 +51,14 @@ TAG="$(mktemp -u "${TMPDIR:-/tmp}/dwc-capture-XXXXXX")"
 # always paid.
 ATTEMPTS="${CAPTURE_ATTEMPTS:-60}"
 
+
 case "$BACKEND" in
     x11:*)     DISPLAY_NAME="${BACKEND#x11:}" ;;
     libvirt:*) DOMAIN="${BACKEND#libvirt:}" ;;
     *) echo "backend must be x11:<display> or libvirt:<domain>"; exit 2 ;;
 esac
 
-# ImageMagick 7 renamed the tools: convert became magick, and import became
+# ImageMagick 7 renamed the tools, convert to magick and import to
 # magick import. Both generations are still shipped, and mixing the two
 # spellings works only where the newer one was installed with its legacy
 # links, so which is present is settled once here.
@@ -86,21 +88,18 @@ shoot() {                                  # shoot <path.png>
 }
 
 # Retake until the frame shows what this stage is waiting for, and has stopped
-# changing. Two separate conditions, and both are needed:
+# changing. Two conditions, and both are needed. The marker being present
+# ("marker") or gone ("none") proves the frame is on the far side of the DOM
+# change. Two consecutive shots being byte-identical proves nothing else is
+# still arriving, since Firefox fades its scrollbar out a moment after a
+# scroll and a shot taken mid-fade puts a hundred pixels of widget into the
+# comparison.
 #
-#   the marker is present ("marker") or gone ("none") - which proves the frame
-#   is on the far side of the DOM change;
-#
-#   two consecutive shots are byte-identical - which proves nothing else is
-#   still arriving. Firefox fades its scrollbar out a moment after a scroll, so
-#   without this the shot catches the thumb mid-fade and two machines disagree
-#   about a hundred pixels of widget that is not what anyone is measuring.
-#
-# "uniform" is the blank-framebuffer failure - no window manager, or a browser
-# on another display - and is never accepted, because it has no marker either
+# "uniform" is the blank-framebuffer failure, no window manager or a browser
+# on another display, and is never accepted, because it has no marker either
 # and would otherwise read as a perfectly good clean shot.
-capture_until() {                          # capture_until <path.png> <want>
-    local path="$1" want="$2" state=""
+capture_until() {                 # capture_until <path.png> <want> [steady?]
+    local path="$1" want="$2" need_steady="${3:-1}" state=""
     local prev="$1.prev"
     local i=0 steady=0
     rm -f "$prev"
@@ -110,7 +109,7 @@ capture_until() {                          # capture_until <path.png> <want>
         # marker check is a Python process with an image decode in it. On a
         # settled screen the second shot is already steady, so this asks the
         # expensive question once per stage instead of once per shot.
-        steady=0
+        steady="$((1 - need_steady))"
         [ -f "$prev" ] && cmp -s "$path" "$prev" && steady=1
         if [ "$steady" = 1 ]; then
             state="$(python3 "$HERE/compare_viewport.py" --marker "$path" | cut -d' ' -f1)"
@@ -134,8 +133,9 @@ capture_until() {                          # capture_until <path.png> <want>
 }
 
 # Exit 3 from the driver means the page reflowed under the capture, so the two
-# shots are of different layouts. Rare - the browser is warmed at startup - and
-# retryable, because the reflow has landed by the time the retry starts.
+# shots are of different layouts. Rare, since the browser is warmed at
+# startup, and retryable, because the reflow has landed by the time the
+# retry starts.
 RETRIES="${CAPTURE_RETRIES:-2}"
 
 attempt() {
@@ -173,8 +173,12 @@ for stage in marked clean; do
         waited=$((waited + 1))
         sleep 0.05
     done
-    want="none"; [ "$stage" = "marked" ] && want="marker"
-    capture_until "${OUT}_${stage}.png" "$want" || return 1
+    # The marked shot is read for the marker's position and nothing else, so
+    # it does not have to be of a settled screen. Only the clean shot is
+    # compared pixel for pixel, and only it pays for the extra screenshot.
+    want="none"; steady=1
+    if [ "$stage" = "marked" ]; then want="marker"; steady=0; fi
+    capture_until "${OUT}_${stage}.png" "$want" "$steady" || return 1
     rm -f "$TAG.$stage"
 done
 

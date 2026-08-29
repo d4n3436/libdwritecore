@@ -10,9 +10,9 @@
 #   (cd <corpus-dir> && python3 -m http.server 8080 --bind 0.0.0.0)
 #   tools/testing/compare_pages.sh tools/testing/parity.plan
 #
-# --no-prefs on the guest side: the parity prefs carry Windows' own values, so
-# applying them there answers with what they say instead of with what Windows
-# does.
+# The guest side takes --no-prefs, because the parity prefs carry Windows'
+# own values, and applying them there answers with what they say instead of
+# with what Windows does.
 #
 # The corpus is yours to assemble and is not in this repository. Save the pages
 # instead of pointing at live ones, so both machines get identical bytes;
@@ -20,8 +20,14 @@
 # across many scripts are what the comparison is for.
 size 2200 1150
 
-# side <name> <backend> <host> <marionette-port> <base-url>
+# side <name> <backend> <host> <port> <base-url> [driver]
 #   backend is x11:<display> here, or libvirt:<domain> for a guest.
+#   driver is marionette, the default, or cdp for Chromium and Electron, and
+#   the port is that driver's, Marionette's or --remote-debugging-port.
+#   A cdp side may list several ports comma-separated, one running browser
+#   instance each, and the sweep spreads the pages across them.
+#   Start a Chromium side with run_electron_side.sh rather than
+#   run_parity_firefox.sh.
 side linux x11::99            127.0.0.1       2828 http://127.0.0.1:8080
 side win   libvirt:<domain>   <guest-ip>      2828 http://<host-ip>:8080
 
@@ -30,8 +36,8 @@ page example/index.html       0
 page example-long/index.html  0 1000 4600
 
 # Not saved pages: tools/testing/pages/svg-text*.html and svg-text-badge.svg,
-# copied into the corpus together. Keep them in every plan - a saved-page
-# corpus has no SVG text, and SVG text is rasterized through a consumer of its
+# copied into the corpus together. Keep them in every plan, since a saved
+# corpus has no SVG text and SVG text is rasterized through a consumer of its
 # own. One color per page, because two inline <svg> on a page reroute the text
 # to WebRender.
 page svg-text/svg-text.html           0

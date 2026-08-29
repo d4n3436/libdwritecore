@@ -54,9 +54,11 @@
 // ReSharper disable RadGlobal
 
 #include "skia_abi.h"
+#include "path_abi.h"
 #include "typeface_bridge.h"
 #include "font_facts.h"
 #include "bold_fallback.h"
+#include "bold_shaping.h"
 #include "dwrite_raster.h"
 #include "render_params.h"
 #include "parity_gate.h"
@@ -90,8 +92,10 @@ void chromium_hook_thunk();
 void chromium_filter_rec_thunk();
 void chromium_metrics_thunk();
 void chromium_font_metrics_thunk();
+void chromium_path_thunk();
 void OnChromiumFontMetrics(void* context, void* metrics);
 void OnChromiumMetrics(void* result, void* context, const void* glyph);
+void OnChromiumPath(void* result, void* context, const void* glyph);
 size_t ChromiumGetTableData(const void* self, uint32_t tag, size_t offset, size_t length,
                             void* data);
 bool OnChromiumFilterRec(void* self, void* rec);
@@ -102,6 +106,7 @@ void* g_original = nullptr;
 void* g_original_filter_rec = nullptr;
 void* g_original_metrics = nullptr;
 void* g_original_font_metrics = nullptr;
+void* g_original_path = nullptr;
 }
 
 namespace {
@@ -1493,6 +1498,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     // hold this function at some other index is left alone.
     void* const image_fn = *chosen_slot;
     void* const metrics_fn = *(chosen_slot - 1);
+    void* const path_fn = *(chosen_slot + 1);
     void* const font_metrics_fn = *(chosen_slot + 3);
 
     std::vector<void**> tables;
@@ -1510,6 +1516,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     g_original = reinterpret_cast<void*>(chosen_fn);
     g_original_metrics = metrics_fn;
     g_original_font_metrics = font_metrics_fn;
+    g_original_path = path_fn;
     bool any = false;
     for (void** slot : tables) {
         if (chromium_patch::ParityWanted() && InText(image, reinterpret_cast<uintptr_t>(metrics_fn))) {
@@ -1518,6 +1525,13 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         if (chromium_patch::ParityWanted() &&
             InText(image, reinterpret_cast<uintptr_t>(font_metrics_fn))) {
             (void)WriteSlot(slot + 3, reinterpret_cast<void*>(&chromium_font_metrics_thunk));
+        }
+        // Only where the table names the same generatePath, since the thunk
+        // tail-calls that one function and a subclass that overrides it would
+        // otherwise be sent to its sibling's implementation.
+        if (chromium_patch::ParityWanted() && *(slot + 1) == path_fn &&
+            InText(image, reinterpret_cast<uintptr_t>(path_fn))) {
+            (void)WriteSlot(slot + 1, reinterpret_cast<void*>(&chromium_path_thunk));
         }
         if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_hook_thunk))) {
             any = true;
@@ -1531,6 +1545,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         g_original = nullptr;
         g_original_metrics = nullptr;
         g_original_font_metrics = nullptr;
+        g_original_path = nullptr;
     }
 }
 
@@ -1746,6 +1761,27 @@ windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int 
 
 }  // namespace
 
+// The font behind a typeface, for bold_shaping.cpp. It answers only for a
+// typeface the scaler hooks have already read, which is what makes it safe to
+// call on a pointer that is only believed to be one: it looks the address up
+// and never follows it. A typeface's virtuals cannot be probed on a guess,
+// since a wrong guess is a segmentation fault rather than a wrong answer.
+//
+// Answering out of the same cache also means shaping and drawing cannot
+// disagree about which runs carry a substituted face.
+//
+// The pointer stays good: entries are never erased, and an unordered_map
+// keeps element addresses across a rehash.
+const std::vector<uint8_t>* ChromiumFontBytes(void* typeface)
+{
+    const std::lock_guard lock(g_font_mutex);
+    const auto font = g_fonts.find(typeface);
+    if (font == g_fonts.end() || font->second.empty()) {
+        return nullptr;
+    }
+    return &font->second;
+}
+
 // Runs before the typeface's own onFilterRec. Returns whether the caller
 // should go on to run that, which it always should. This only needs to see
 // the flags first, because Fontations clears kGenA8FromLCD_Flag and that flag
@@ -1819,13 +1855,390 @@ void OnChromiumFilterRecDone(void* rec)
 // bold_fallback's table for the life of the process.
 static bold_fallback::Face BoldSubstitute(const void* context, const std::vector<uint8_t>& font)
 {
-    const float frame_width = skia_abi::Read<float>(
-        static_cast<const unsigned char*>(context) + skia_abi::kContextRec,
-        skia_abi::kRecFrameWidth);
-    if (!bold_fallback::WasMarked(frame_width)) {
+    const auto* rec = static_cast<const unsigned char*>(context) + skia_abi::kContextRec;
+    if (!bold_fallback::WasMarked(rec)) {
         return {};
     }
-    return bold_fallback::RealBoldFor(font);
+    const bool oblique =
+        bold_fallback::IsOblique(skia_abi::Read<float>(rec, skia_abi::kRecPreSkewX));
+    return bold_fallback::RealBoldFor(font, oblique);
+}
+
+// The outline Skia is about to stroke or fill from. Windows takes it from
+// IDWriteFontFace::GetGlyphRunOutline and Linux from skrifa, and the two
+// disagree by a fraction of a pixel per point, which every glyph drawn from
+// its path shows as a scatter along each edge.
+//
+// SkPathData owns its point array as trailing storage and is otherwise
+// immutable, so DirectWrite's points can be written straight into it when the
+// two agree on the verbs. Nothing is allocated and no count changes.
+//
+// The write is declined unless every check below passes, and declining leaves
+// skrifa's path exactly as it was.
+namespace {
+
+struct PathView
+{
+    unsigned char* data = nullptr;
+    path_abi::Point* points = nullptr;
+    size_t point_count = 0;
+    const uint8_t* verbs = nullptr;
+    size_t verb_count = 0;
+};
+
+// Everything the layout guarantees about itself, checked before anything is
+// written. A build whose SkPathData moved a field fails at least one of these
+// and gets left alone.
+bool MirrorHolds(const PathView& v)
+{
+    if (v.point_count == 0 || v.verb_count == 0) {
+        return false;
+    }
+    // The reference count is SkNVRefCnt's, and a path shared with anything
+    // else must not be edited underneath it.
+    if (skia_abi::Read<int32_t>(v.data, path_abi::kDataRefCnt) != 1) {
+        return false;
+    }
+    if (!path_abi::PlausibleUniqueID(skia_abi::Read<uint32_t>(v.data, path_abi::kDataUniqueID))) {
+        return false;
+    }
+    // A rect, oval or rrect caches geometry the points would no longer agree
+    // with.
+    if (skia_abi::Read<uint8_t>(v.data, path_abi::kDataType) != path_abi::kIsAGeneral) {
+        return false;
+    }
+    // Conic weights live in their own array, which is not rewritten, so a
+    // path holding any is out of scope. Neither source emits them.
+    if (skia_abi::Read<size_t>(v.data, path_abi::kDataConics + path_abi::kSpanCount) != 0) {
+        return false;
+    }
+    // The three arrays are trailing storage laid out points, conics, verbs.
+    if (reinterpret_cast<unsigned char*>(v.points) != v.data + path_abi::kDataSize ||
+        v.verbs != reinterpret_cast<const uint8_t*>(v.points + v.point_count)) {
+        return false;
+    }
+    size_t implied = 0;
+    for (size_t i = 0; i < v.verb_count; ++i) {
+        const int n = path_abi::PointsForVerb(v.verbs[i]);
+        if (n < 0) {
+            return false;
+        }
+        implied += static_cast<size_t>(n);
+    }
+    return implied == v.point_count;
+}
+
+// SkPathData::finishInit's bounds, which are the bounds of every point,
+// control points included, not the tight bounds of the curves.
+void PointBounds(const path_abi::Point* p, const size_t count, float* out)
+{
+    out[0] = out[2] = p[0].x;
+    out[1] = out[3] = p[0].y;
+    for (size_t i = 1; i < count; ++i) {
+        out[0] = std::min(out[0], p[i].x);
+        out[1] = std::min(out[1], p[i].y);
+        out[2] = std::max(out[2], p[i].x);
+        out[3] = std::max(out[3], p[i].y);
+    }
+}
+
+// The two outlines are meant to be the same shape a fraction of a pixel
+// apart. Anything further means they are not the same glyph in the same
+// place, whatever the verbs say, and the safe answer is skrifa's path.
+constexpr float kMaxPointDelta = 1.0f;
+
+// Whether the two verb sequences describe the same path with only quads and
+// cubics traded, which is the one disagreement check_quadratic can produce:
+// DirectWrite hands Skia a cubic, and Skia folds it back to a quadratic only
+// when the control points land within 10 ULPs. Any other difference is a
+// different outline and not something to rewrite.
+bool CurveOnlyDifference(const uint8_t* a, const uint8_t* b, const size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (a[i] == b[i]) {
+            continue;
+        }
+        const bool curves = (a[i] == path_abi::kQuad || a[i] == path_abi::kCubic) &&
+                            (b[i] == path_abi::kQuad || b[i] == path_abi::kCubic);
+        if (!curves) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One line per power of two, so a page says how many outlines came from
+// DirectWrite without a line per glyph.
+void Replaced(const uint16_t glyph, const float worst, const bool regrown)
+{
+    static std::atomic<uint64_t> count{0};
+    if (const uint64_t n = count.fetch_add(1) + 1; (n & (n - 1)) == 0) {
+        Report("outline for glyph %u is DirectWrite's (%.3f px from skrifa's%s): %lu so far",
+               glyph, static_cast<double>(worst), regrown ? ", regrown" : "", n);
+    }
+}
+
+// The listener list owns nothing and refers only to itself, which is what
+// makes a byte copy of it valid. Empty, pointed at its own inline element,
+// and not owning heap storage: an object holding a listener or a grown array
+// fails this and is left alone. A path built by generatePath has had no
+// chance to acquire either.
+bool ListIsCopyable(const unsigned char* data)
+{
+    return skia_abi::Read<int32_t>(data, path_abi::kListSize) == 0 &&
+           skia_abi::Read<const unsigned char*>(data, path_abi::kListData) ==
+               data + path_abi::kListInline &&
+           (skia_abi::Read<uint32_t>(data, path_abi::kListCapacity) & 1) == 0;
+}
+
+uint8_t SegmentMaskFor(const uint8_t* verbs, const size_t count)
+{
+    uint8_t mask = 0;
+    for (size_t i = 0; i < count; ++i) {
+        switch (verbs[i]) {
+            case path_abi::kLine: mask |= path_abi::kLineMask; break;
+            case path_abi::kQuad: mask |= path_abi::kQuadMask; break;
+            case path_abi::kConic: mask |= path_abi::kConicMask; break;
+            case path_abi::kCubic: mask |= path_abi::kCubicMask; break;
+            default: break;
+        }
+    }
+    return mask;
+}
+
+// Gives the SkPath a new SkPathData holding these verbs and points, for the
+// glyphs whose outlines are the same shape but not the same length.
+//
+// SkPathData::Alloc takes the object and its trailing arrays out of one
+// ::operator new and points the spans inside it, so a replacement is that
+// same allocation made again at the new size. Everything the old object holds
+// that is not geometry is copied: the reference count, which MirrorHolds has
+// already read as 1, the listener list, and the unique id, which is free to
+// inherit because the old object is released here and its id retired with it.
+// The one pointer that has to move is the listener list's own, which points
+// at storage inside the object.
+//
+// ::operator new here is the executable's, which exports both it and the
+// unsized ::operator delete SkPathData::operator delete calls, so the memory
+// this hands to Skia comes from the allocator Skia will hand it back to.
+bool ReplacePathData(void* path, const PathView& v, const std::vector<uint8_t>& verbs,
+                     const std::vector<path_abi::Point>& points, const float* bounds)
+{
+    if (!ListIsCopyable(v.data)) {
+        return false;
+    }
+    const size_t size = path_abi::kDataSize + points.size() * sizeof(path_abi::Point) +
+                        verbs.size();
+    auto* fresh = static_cast<unsigned char*>(::operator new(size));
+    std::memcpy(fresh, v.data, path_abi::kDataSize);
+
+    unsigned char* const inline_element = fresh + path_abi::kListInline;
+    std::memcpy(fresh + path_abi::kListData, &inline_element, sizeof(inline_element));
+
+    unsigned char* const trailing = fresh + path_abi::kDataSize;
+    unsigned char* const verb_data = trailing + points.size() * sizeof(path_abi::Point);
+    const size_t point_count = points.size();
+    const size_t conic_count = 0;
+    const size_t verb_count = verbs.size();
+    std::memcpy(fresh + path_abi::kDataPoints, &trailing, sizeof(trailing));
+    std::memcpy(fresh + path_abi::kDataPoints + path_abi::kSpanCount, &point_count,
+                sizeof(point_count));
+    std::memcpy(fresh + path_abi::kDataConics, &verb_data, sizeof(verb_data));
+    std::memcpy(fresh + path_abi::kDataConics + path_abi::kSpanCount, &conic_count,
+                sizeof(conic_count));
+    std::memcpy(fresh + path_abi::kDataVerbs, &verb_data, sizeof(verb_data));
+    std::memcpy(fresh + path_abi::kDataVerbs + path_abi::kSpanCount, &verb_count,
+                sizeof(verb_count));
+    std::memcpy(trailing, points.data(), points.size() * sizeof(path_abi::Point));
+    std::memcpy(verb_data, verbs.data(), verbs.size());
+
+    std::memcpy(fresh + path_abi::kDataBounds, bounds, 4 * sizeof(float));
+    const uint8_t mask = SegmentMaskFor(verbs.data(), verbs.size());
+    std::memcpy(fresh + path_abi::kDataSegmentMask, &mask, sizeof(mask));
+    constexpr uint8_t unknown = path_abi::kConvexityUnknown;
+    std::memcpy(fresh + path_abi::kDataConvexity, &unknown, sizeof(unknown));
+
+    std::memcpy(static_cast<unsigned char*>(path) + path_abi::kPathData, &fresh, sizeof(fresh));
+    // The destructor is a debug-only write to the unique id plus the listener
+    // list's, and the list has just been shown to hold nothing and own
+    // nothing, so releasing the storage is all there is to do.
+    ::operator delete(v.data);
+    return true;
+}
+
+}  // namespace
+
+void OnChromiumPath(void* result, void* context, const void* glyph)
+{
+    static const bool enabled = !EnvDisables("DWC_DW_OUTLINE");
+    static const bool log = std::getenv("DWC_PATH_LOG") != nullptr;
+    static const bool realloc = !EnvDisables("DWC_PATH_REGROW");
+    if (result == nullptr || context == nullptr || glyph == nullptr ||
+        !chromium_patch::ParityWanted() || !enabled) {
+        return;
+    }
+    auto* out = static_cast<unsigned char*>(result);
+    if (skia_abi::Read<uint8_t>(out, path_abi::kGeneratedEngaged) == 0) {
+        return;
+    }
+    PathView v;
+    v.data = skia_abi::Read<unsigned char*>(out, path_abi::kGeneratedPath + path_abi::kPathData);
+    if (v.data == nullptr) {
+        return;
+    }
+    v.points = skia_abi::Read<path_abi::Point*>(v.data, path_abi::kDataPoints);
+    v.point_count = skia_abi::Read<size_t>(v.data, path_abi::kDataPoints + path_abi::kSpanCount);
+    v.verbs = skia_abi::Read<const uint8_t*>(v.data, path_abi::kDataVerbs);
+    v.verb_count = skia_abi::Read<size_t>(v.data, path_abi::kDataVerbs + path_abi::kSpanCount);
+    if (v.points == nullptr || v.verbs == nullptr || !MirrorHolds(v)) {
+        static std::atomic said{false};
+        if (!said.exchange(true)) {
+            Report("the SkPathData layout does not check out; outlines stay with skrifa");
+        }
+        return;
+    }
+
+    const skia_abi::Glyph g = skia_abi::Glyph::From(glyph);
+    auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    if (!g.packed_id_known || typeface == nullptr) {
+        return;
+    }
+    const skia_abi::Rec rec = skia_abi::Rec::From(context);
+    float scale_y = 0;
+    windows_path::Matrix2x2 remaining;
+    if (!windows_path::ComputeMatrices(rec, &scale_y, &remaining)) {
+        return;
+    }
+    const float gdi_text_size = std::round(scale_y * 64.0f) / 64.0f;
+    const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
+    const int bitmap_ppem = static_cast<int>(gdi_text_size);
+
+    std::vector<uint8_t> font;
+    {
+        const std::lock_guard lock(g_font_mutex);
+        font = FontBytesLocked(typeface);
+    }
+    if (font.empty()) {
+        return;
+    }
+    const std::vector<uint8_t>* use = &font;
+    const void* face_key = typeface;
+    uint32_t face_index = 0;
+    bool simulate_bold = false;
+    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+        bold.bytes != nullptr || bold.simulate) {
+        simulate_bold = bold.simulate;
+        if (bold.bytes != nullptr) {
+            use = bold.bytes;
+            face_key = bold.bytes->data();
+            face_index = bold.face_index;
+        }
+    }
+    // A substituted face draws a different shape on purpose, so the checks
+    // below have nothing to compare its outline against and would throw it
+    // away. The swap is the same one the mask takes, and it is settled before
+    // the outline is asked for, so the path is replaced whole instead. It
+    // cannot be rewritten in place across a shape change: the verb sequence
+    // and the point count are both the array's own.
+    const bool substituted = use != &font;
+
+    const windows_path::Decision d =
+        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
+                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
+
+    static thread_local std::vector<uint8_t> dw_verbs;
+    static thread_local std::vector<path_abi::Point> dw_points;
+    if (!dwrite_raster::GlyphOutline(face_key, *use, g.GlyphId(), d.text_size_render, &dw_verbs,
+                                     &dw_points, face_index, simulate_bold)) {
+        return;
+    }
+    // Both scaler contexts generate at scale.fY and then apply what
+    // computeMatrices left over, so DirectWrite's outline needs the same
+    // matrix before it can be compared with the one already in the path.
+    for (path_abi::Point& p : dw_points) {
+        p = {remaining.scale_x * p.x + remaining.skew_x * p.y,
+             remaining.skew_y * p.x + remaining.scale_y * p.y};
+    }
+
+    if (!substituted &&
+        (dw_verbs.size() != v.verb_count ||
+         !CurveOnlyDifference(dw_verbs.data(), v.verbs, v.verb_count))) {
+        if (log) {
+            Report("path: glyph %u verbs differ (%zu/%zu against %zu/%zu); kept skrifa's",
+                   g.GlyphId(), dw_verbs.size(), dw_points.size(), v.verb_count, v.point_count);
+        }
+        return;
+    }
+
+    float bounds[4];
+    PointBounds(dw_points.data(), dw_points.size(), bounds);
+
+    // Rewriting points in place leaves the verbs alone, so it is only correct
+    // where they already agree. Two offsetting swaps would keep the count and
+    // change the sequence, and DirectWrite's points under skrifa's verbs is a
+    // different curve.
+    if (!substituted && dw_points.size() == v.point_count &&
+        std::memcmp(dw_verbs.data(), v.verbs, v.verb_count) == 0) {
+        float worst = 0;
+        for (size_t i = 0; i < dw_points.size(); ++i) {
+            worst = std::max(worst, std::abs(dw_points[i].x - v.points[i].x));
+            worst = std::max(worst, std::abs(dw_points[i].y - v.points[i].y));
+        }
+        if (worst > kMaxPointDelta) {
+            if (log) {
+                Report("path: glyph %u is %.3f px away from skrifa's; kept skrifa's",
+                       g.GlyphId(), static_cast<double>(worst));
+            }
+            return;
+        }
+        std::memcpy(v.points, dw_points.data(), dw_points.size() * sizeof(path_abi::Point));
+        std::memcpy(v.data + path_abi::kDataBounds, bounds, sizeof(bounds));
+        // Convexity is derived from the points and was computed, if at all,
+        // from the ones just replaced.
+        constexpr uint8_t unknown = path_abi::kConvexityUnknown;
+        std::memcpy(v.data + path_abi::kDataConvexity, &unknown, sizeof(unknown));
+        Replaced(g.GlyphId(), worst, false);
+        return;
+    }
+
+    // A quad on one side against a cubic on the other, so the arrays are not
+    // the same length and the object cannot hold both. With no point to pair
+    // off against, the two outlines are held to be the same glyph in the same
+    // place by their bounds.
+    if (!realloc) {
+        if (log) {
+            Report("path: glyph %u needs %zu points where %zu fit; kept skrifa's", g.GlyphId(),
+                   dw_points.size(), v.point_count);
+        }
+        return;
+    }
+    float worst = 0;
+    if (!substituted) {
+        float existing[4];
+        PointBounds(v.points, v.point_count, existing);
+        for (int i = 0; i < 4; ++i) {
+            worst = std::max(worst, std::abs(bounds[i] - existing[i]));
+        }
+        if (worst > kMaxPointDelta) {
+            if (log) {
+                Report("path: glyph %u is %.3f px away from skrifa's; kept skrifa's", g.GlyphId(),
+                       static_cast<double>(worst));
+            }
+            return;
+        }
+    }
+    if (!ReplacePathData(out + path_abi::kGeneratedPath, v, dw_verbs, dw_points, bounds)) {
+        if (log) {
+            Report("path: glyph %u holds a listener, so its path stays skrifa's", g.GlyphId());
+        }
+        return;
+    }
+    // The path is no longer the one the font would draw, which is what this
+    // flag says. It reaches PDF output and glyph serialization, not the
+    // raster.
+    constexpr bool kModified = true;
+    std::memcpy(out + path_abi::kGeneratedModified, &kModified, sizeof(kModified));
+    Replaced(g.GlyphId(), worst, true);
 }
 
 void OnChromiumMetrics(void* result, void* context, const void* glyph)
@@ -1878,21 +2291,25 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
     const std::vector<uint8_t>* use = &font;
     const void* face_key = typeface;
     uint32_t face_index = 0;
+    bool simulate_bold = false;
     if (const bold_fallback::Face bold = BoldSubstitute(context, font);
-        bold.bytes != nullptr) {
-        use = bold.bytes;
-        face_key = bold.bytes->data();
-        face_index = bold.face_index;
+        bold.bytes != nullptr || bold.simulate) {
+        simulate_bold = bold.simulate;
+        if (bold.bytes != nullptr) {
+            use = bold.bytes;
+            face_key = bold.bytes->data();
+            face_index = bold.face_index;
+        }
     }
 
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem));
+                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
 
     float advance = 0;
     float advance_y = 0;
     if (!dwrite_raster::GlyphAdvance(face_key, *use, g.GlyphId(), rec, d, &advance,
-                                     &advance_y, face_index)) {
+                                     &advance_y, face_index, simulate_bold)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("DirectWrite would not measure glyph %u; advances stay Skia's",
@@ -1927,7 +2344,7 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         int bottom = 0;
         if (dwrite_raster::GlyphBounds(face_key, *use, g, rec, d, d.rendering_mode,
                                        d.texture_type, &left, &top, &right, &bottom,
-                                       face_index)) {
+                                       face_index, simulate_bold)) {
             const float box[4] = {static_cast<float>(left), static_cast<float>(top),
                                   static_cast<float>(right), static_cast<float>(bottom)};
             std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsBounds, box,
@@ -1991,17 +2408,21 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     const std::vector<uint8_t>* use = &font;
     const void* face_key = typeface;
     uint32_t face_index = 0;
+    bool simulate_bold = false;
     if (const bold_fallback::Face bold = BoldSubstitute(context, font);
-        bold.bytes != nullptr) {
-        use = bold.bytes;
-        face_key = bold.bytes->data();
-        face_index = bold.face_index;
+        bold.bytes != nullptr || bold.simulate) {
+        simulate_bold = bold.simulate;
+        if (bold.bytes != nullptr) {
+            use = bold.bytes;
+            face_key = bold.bytes->data();
+            face_index = bold.face_index;
+        }
     }
 
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem));
-    if (dwrite_raster::FontMetrics(face_key, *use, d, metrics, face_index)) {
+                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
+    if (dwrite_raster::FontMetrics(face_key, *use, d, metrics, face_index, simulate_bold)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("font metrics now DirectWrite's");
@@ -2056,11 +2477,15 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const std::vector<uint8_t>* use = &font;
     const void* face_key = typeface;
     uint32_t face_index = 0;
+    bool simulate_bold = false;
     if (const bold_fallback::Face bold = BoldSubstitute(context, font);
-        bold.bytes != nullptr) {
-        use = bold.bytes;
-        face_key = bold.bytes->data();
-        face_index = bold.face_index;
+        bold.bytes != nullptr || bold.simulate) {
+        simulate_bold = bold.simulate;
+        if (bold.bytes != nullptr) {
+            use = bold.bytes;
+            face_key = bold.bytes->data();
+            face_index = bold.face_index;
+        }
     }
 
     // Without DirectWrite the tree takes the branch Skia takes for a font with
@@ -2068,7 +2493,7 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const windows_path::FontFacts facts =
         chromium_patch::ParityWanted()
             ? (use == &font ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
-                            : font_facts::Describe(*use, gasp_ppem, bitmap_ppem))
+                            : font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index))
             : windows_path::FontFacts{};
     const windows_path::Decision d =
         windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y, facts);
@@ -2115,10 +2540,28 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
         return false;
     }
 
+    // Says whether the box Skia is asking to have filled is the one
+    // OnChromiumMetrics wrote, which is what Windows draws into.
+    if (static const bool box_log = std::getenv("DWC_BOX_LOG") != nullptr; box_log) {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        if (dwrite_raster::GlyphBounds(face_key, *use, g, rec, d, d.rendering_mode,
+                                       d.texture_type, &left, &top, &right, &bottom,
+                                       face_index, simulate_bold) &&
+            (left != g.left || top != g.top || right - left != g.width ||
+             bottom - top != g.height)) {
+            Report("box: glyph %u sub=(%u,%u) skia %d,%d %ux%u against dwrite %d,%d %dx%d",
+                   g.GlyphId(), g.SubX(), g.SubY(), g.left, g.top, g.width, g.height, left,
+                   top, right - left, bottom - top);
+        }
+    }
+
     const skia_abi::PreBlend preblend = skia_abi::PreBlend::From(context);
     const bool drawn =
         dwrite_raster::RenderGlyph(face_key, *use, rec, g, preblend, d, image_buffer,
-                                   face_index);
+                                   face_index, simulate_bold);
     static std::atomic<uint64_t> drawn_count{0};
     static std::atomic<uint64_t> declined_count{0};
     const uint64_t seen =
@@ -2175,6 +2618,9 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 __attribute__((constructor)) static void ChromiumPatchInit()
 {
     ScanLoadedImages();
+    // Reading a symbol table needs the filesystem, and a build that compiles
+    // HarfBuzz in is only reachable through one.
+    bold_shaping::InstallAtLoad();
     // Mapping the bold faces needs the filesystem too, and a renderer forked
     // from here inherits the mappings it can no longer make for itself.
     bold_fallback::MapAtLoad();

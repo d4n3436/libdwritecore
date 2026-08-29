@@ -53,6 +53,10 @@ constexpr size_t kRecFrameWidth = 32;   // float
 constexpr size_t kRecLumBits = 44;      // uint32_t
 constexpr size_t kRecDeviceGamma = 48;  // uint8_t, 2.6 fixed point
 constexpr size_t kRecContrast = 50;     // uint8_t, 0.8 fixed point
+// fReservedAlign, a padding byte Skia declares const, initializes to zero and
+// then only ever passes to sk_ignore_unused_variable. Nothing reads it, so a
+// hook can leave a value of its own there.
+constexpr size_t kRecReserved = 51;     // uint8_t
 constexpr size_t kRecMaskFormat = 52;   // uint8_t
 constexpr size_t kRecFlags = 54;        // uint16_t
 

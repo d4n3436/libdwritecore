@@ -18,7 +18,7 @@ __pycache__/
 build-stock/
 
 # A parity plan names a guest, its address and a local corpus.
-tools/testing/parity.plan
+tools/testing/*.plan
 
 # Written into the working directory by cleartype_sample, per the README.
 *.ppm

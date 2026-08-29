@@ -17,12 +17,22 @@ place only one side drew them would otherwise be charged to its parent, or to
 nothing at all.
 
   font        the two sides drew the element with different faces, which the
-              PostScript names catch. Nirmala UI against Nirmala UI Bold is a
-              real face swap and not synthetic bold
+              PostScript names catch, and the families differ too
+  bold-sub    the same families drawing the same glyph counts, split across
+              different faces, and either the element asked for a bold weight
+              or the face names read as a regular and bold pair. This is the
+              bold fallback substitution seen from above Blink. Windows names
+              the bold face because Chromium picked it, and Linux names the
+              regular one because the swap happens in the scaler, below the
+              DOM. The label says the substitution is in play on these pixels,
+              not that it failed. A difference here is usually the shaping
+              ceiling, since Blink shapes with the regular face's tables
+              either way. DWC_BOLD_FALLBACK=0 is the control
   share       same faces, different numbers of glyphs from each
   metrics     the element's own box differs, or something inside it moved
-  raster      same faces, same box, nothing inside moved, so only the pixels
-              differ
+  raster      same faces, same box, nothing inside moved, and no substituted
+              element close enough for its marks to have reached these pixels,
+              so only the pixels differ
   chrome      no element covers the pixel: background, image, border or rule
 
 The two machines reach the page server at different addresses, so --url-b
@@ -35,6 +45,7 @@ after a sweep, before either side navigates away.
 import argparse
 import json
 import math
+import os
 import sys
 
 import numpy as np
@@ -130,10 +141,69 @@ def show_faces(fonts):
     return ", ".join("%s %d" % (ps or fam, n) for fam, ps, n in fonts) or "-"
 
 
+def size(row):
+    """The element's font size in pixels, which bounds how far its ink reaches."""
+    try:
+        return float(row[8].removesuffix("px"))
+    except ValueError:
+        return 16.0
+
+
+def weight(row):
+    """The weight the element asked for. Computed style, so always a number."""
+    try:
+        return int(row[9])
+    except ValueError:
+        return 400
+
+
+def by_family(fonts):
+    """The same listing with each family's faces merged.
+
+    A run split across a regular and a bold face of one family reads the
+    same here as one that was not split, which is what tells a face swap
+    apart from a different family being picked.
+    """
+    merged = {}
+    for fam, _, n in fonts:
+        merged[fam] = merged.get(fam, 0) + n
+    return sorted(merged.items())
+
+
+def bolder_faces(fa, fb):
+    """Every face only one side names is the other's name with a suffix.
+
+    Ebrima against Ebrima-Bold, NirmalaUI against NirmalaUI-Bold. Reading
+    the names catches a container whose own weight is 400 while the bold
+    text inside it is what differs, and it holds in both directions since
+    an ancestor's listing merges a direct bold match with a fallback one.
+    """
+    def paired(name, others):
+        return any(o != name and (name.startswith(o) or o.startswith(name))
+                   for o in others)
+    a = {ps for _, ps, _ in fa}
+    b = {ps for _, ps, _ in fb}
+    return bool(a ^ b) and all(paired(ps, b) for ps in a - b) \
+        and all(paired(ps, a) for ps in b - a)
+
+
+def substituted(a, fa, fb):
+    """Whether a face difference is the bold substitution.
+
+    The families and their glyph counts have to agree, so only the split
+    across faces differs, and the run has to be bold: by the element's own
+    weight, or by the names reading as a regular and bold pair.
+    """
+    return (by_family(fa) == by_family(fb)
+            and (weight(a) >= 600 or bolder_faces(fa, fb)))
+
+
 def classify(a, b, fa, fb, moved):
     if [(fam, ps) for fam, ps, _ in fa] != [(fam, ps) for fam, ps, _ in fb]:
-        if [fam for fam, _, _ in fa] == [fam for fam, _, _ in fb]:
-            return "font", "%s vs %s" % (show_faces(fa), show_faces(fb))
+        if by_family(fa) == by_family(fb):
+            bold = weight(a) >= 600 or bolder_faces(fa, fb)
+            return "bold-sub" if bold else "font", \
+                   "%s vs %s" % (show_faces(fa), show_faces(fb))
         return "font", "%s vs %s" % (show(fa), show(fb))
     if fa != fb:
         return "share", "%s vs %s" % (show(fa), show(fb))
@@ -146,6 +216,35 @@ def classify(a, b, fa, fb, moved):
     return "raster", "same faces and box, nothing inside moved"
 
 
+def viewport_origin(base):
+    """Where the viewport starts in this side's clean shot.
+
+    A shot taken over CDP is the viewport and nothing else, and has no marked
+    companion; one photographed off a screen carries the marker's position in
+    the marked shot beside it.
+    """
+    marked = base + "_marked.png"
+    if not os.path.exists(marked):
+        return 0, 0
+    x, y, _ = cv.origin(marked)
+    return x, y
+
+
+def side_base(shots, tag, page):
+    """Where one side's screenshots are, under either name they are written by.
+
+    compare_pages.sh gives every cell its own directory and names the shots
+    after the side alone; capture_viewport.sh puts a whole run in one directory
+    and adds the page to tell them apart. The page is dropped when nothing is
+    written under it.
+    """
+    with_page = "%s/%s_%s" % (shots, tag, page)
+    if os.path.exists(with_page + "_marked.png") or \
+            os.path.exists(with_page + "_clean.png"):
+        return with_page
+    return "%s/%s" % (shots, tag)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("shots")
@@ -154,16 +253,17 @@ def main():
     ap.add_argument("url")
     ap.add_argument("--url-b", default=None)
     ap.add_argument("--a", default="127.0.0.1:9222")
-    ap.add_argument("--b", default="192.168.122.206:9223")
+    ap.add_argument("--b", required=True,
+                    help="host:port of the second side's driver")
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--limit", type=int, default=14)
     args = ap.parse_args()
 
-    base = "%s/%s_%s" % (args.shots, args.tag, args.page)
-    other = "%s/%sW_%s" % (args.shots, args.tag, args.page)
-    ax, ay, _ = cv.origin(base + "_marked.png")
-    bx, by, _ = cv.origin(other + "_marked.png")
+    base = side_base(args.shots, args.tag, args.page)
+    other = side_base(args.shots, args.tag + "W", args.page)
+    ax, ay = viewport_origin(base)
+    bx, by = viewport_origin(other)
     a = cv.crop(base + "_clean.png", ax, ay, args.width, args.height).astype(int)
     b = cv.crop(other + "_clean.png", bx, by, args.width, args.height).astype(int)
     diff = (a != b).any(axis=2)
@@ -211,7 +311,7 @@ def main():
         inner = np.where(depths_b > depths_a, labels_b, labels_a)
 
         hit = inner[diff]
-        rows_of = np.nonzero(diff)[0]
+        rows_of, cols_of = np.nonzero(diff)
         counts = {int(i): int(n) for i, n in zip(*np.unique(hit, return_counts=True))}
         chrome = counts.pop(-1, 0)
 
@@ -219,9 +319,14 @@ def main():
         uniq, index_of = np.unique(hit, return_inverse=True)
         lo = np.full(uniq.size, 1 << 30, np.int64)
         hi = np.full(uniq.size, -1, np.int64)
+        cl = np.full(uniq.size, 1 << 30, np.int64)
+        cr = np.full(uniq.size, -1, np.int64)
         np.minimum.at(lo, index_of, rows_of)
         np.maximum.at(hi, index_of, rows_of)
+        np.minimum.at(cl, index_of, cols_of)
+        np.maximum.at(cr, index_of, cols_of)
         band = {int(u): (int(l), int(h)) for u, l, h in zip(uniq, lo, hi)}
+        span = {int(u): (int(l), int(r)) for u, l, r in zip(uniq, cl, cr)}
 
         kinds = {}
         detail = []
@@ -232,15 +337,52 @@ def main():
             if ra is None or rb is None:
                 kinds["only-one-side"] = kinds.get("only-one-side", 0) + counts[index]
                 continue
-            kind, why = classify(ra, rb, platform_fonts(ba, index),
-                                 platform_fonts(bb, index),
-                                 moved_inside(index, band[index]))
-            kinds[kind] = kinds.get(kind, 0) + counts[index]
-            detail.append((counts[index], kind, why, ra))
+            fa, fb = platform_fonts(ba, index), platform_fonts(bb, index)
+            kind, why = classify(ra, rb, fa, fb, moved_inside(index, band[index]))
+            detail.append([counts[index], kind, why, ra, index, fa, fb])
+
+        # Devanagari and Thai marks sit above the inline box and reach past
+        # its edges, so a substituted run's own differing pixels can land on
+        # an element that is not its ancestor and whose faces agree. Once
+        # everything is classified, a raster verdict is withdrawn if a
+        # substituted element's box, grown by its font size, reaches the
+        # pixels, that being how far a glyph's ink can go.
+        def reaches(r, lo, hi, left, right):
+            reach = size(r)
+            return (r[4] - reach <= hi and r[4] + r[6] + reach >= lo
+                    and r[3] - reach <= right and r[3] + r[5] + reach >= left)
+
+        known = {row[4]: (row[3], row[5], row[6]) for row in detail}
+        for row in detail:
+            if row[1] != "raster":
+                continue
+            lo, hi = band[row[4]]
+            left, right = span[row[4]]
+            # Nearest first, so the element whose ink most plausibly reached
+            # these pixels is the one asked about, and the search stops there.
+            near = sorted((r for j, r in rows_a.items()
+                           if j != row[4] and j in rows_b and reaches(r, lo, hi, left, right)),
+                          key=lambda r: r[5] * r[6])
+            for ra_near in near[:8]:
+                j = ra_near[0]
+                if j in known:
+                    _, fa, fb = known[j]
+                else:
+                    fa, fb = platform_fonts(ba, j), platform_fonts(bb, j)
+                    known[j] = (ra_near, fa, fb)
+                if fa != fb and substituted(ra_near, fa, fb):
+                    row[1] = "bold-sub"
+                    row[2] = ("<%s> %r beside it is substituted and its marks reach "
+                              "past its box (%s vs %s)"
+                              % (ra_near[1], ra_near[10], show_faces(fa), show_faces(fb)))
+                    break
+
+        for n, kind, _, _, _, _, _ in detail:
+            kinds[kind] = kinds.get(kind, 0) + n
         if chrome:
             kinds["chrome"] = kinds.get("chrome", 0) + chrome
 
-        for n, kind, why, ra in detail[:args.limit]:
+        for n, kind, why, ra, _, _, _ in detail[:args.limit]:
             print("  %6d px  <%s> %r  %s %s  %s" % (n, ra[1], ra[10], ra[8], ra[9], ra[7]))
             print("            %-8s %s" % (kind, why))
         if chrome:

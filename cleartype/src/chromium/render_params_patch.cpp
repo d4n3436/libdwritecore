@@ -37,9 +37,8 @@
 #include <utility>
 #include <vector>
 
-#include <sys/mman.h>
-#include <unistd.h>
 
+#include "code_patch.h"
 #include "render_params_patch.h"
 
 namespace render_params_patch {
@@ -111,37 +110,6 @@ extern "C" void ChromiumFontRenderParams(void*, void* param_out)
     const int subpixel = kSubpixelRenderingRgb;
     std::memcpy(p + kHinting, &hinting, sizeof(hinting));
     std::memcpy(p + kSubpixelRendering, &subpixel, sizeof(subpixel));
-}
-
-// movabs rax, imm64 ; jmp rax
-bool WriteDetour(unsigned char* at, void* to)
-{
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return false;
-    }
-    constexpr size_t kPatch = 12;
-    const auto start = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
-    const uintptr_t last =
-        (reinterpret_cast<uintptr_t>(at) + kPatch - 1) & ~static_cast<uintptr_t>(page - 1);
-    const size_t len = last - start + static_cast<size_t>(page);
-    auto* base = reinterpret_cast<void*>(start);
-    if (mprotect(base, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        Say("the page would not open for writing; leaving the function alone");
-        return false;
-    }
-    unsigned char code[kPatch] = {0x48, 0xB8};
-    const auto target = reinterpret_cast<uint64_t>(to);
-    std::memcpy(code + 2, &target, sizeof(target));
-    code[10] = 0xFF;
-    code[11] = 0xE0;
-    std::memcpy(at, code, kPatch);
-    if (mprotect(base, len, PROT_READ | PROT_EXEC) != 0) {
-        Say("the page would not close again");
-    }
-    __builtin___clear_cache(reinterpret_cast<char*>(at),
-                            reinterpret_cast<char*>(at + kPatch));
-    return true;
 }
 
 // Every copy of a name, and every position it appears at.
@@ -311,13 +279,16 @@ void Apply(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum)
                            best - base, second_n);
         return;
     }
-    if (WriteDetour(reinterpret_cast<unsigned char*>(best),
-                    reinterpret_cast<void*>(&ChromiumFontRenderParams))) {
+    const char* why = nullptr;
+    if (code_patch::WriteDetour(reinterpret_cast<void*>(best),
+                                reinterpret_cast<void*>(&ChromiumFontRenderParams), &why)) {
         (void)std::fprintf(stderr,
                            "chromium-patch: render params: "
                            "GetFontRenderParamsFromFcPattern +%#lx now answers what "
                            "Windows would; runner-up reads %d\n",
                            best - base, second_n);
+    } else {
+        Say(why);
     }
 }
 
