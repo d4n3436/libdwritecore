@@ -37,6 +37,7 @@
     FT_Get_Sfnt_Table;
     FT_Set_Pixel_Sizes;
     FT_Request_Size;
+    FT_MulFix;
 
     /* Not FreeType: the hook that notices libxul being loaded. */
     dlopen;

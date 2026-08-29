@@ -35,6 +35,7 @@
 #endif
 
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <strings.h>
 #include <errno.h>
@@ -105,6 +106,87 @@ namespace {
 // and there it crashes a JVM. Asking the object directly is the fallback.
 // ---------------------------------------------------------------------------
 
+// Whether the FreeType this library interposes is the one the host draws
+// with. A build that compiles FreeType in imports none of its symbols, so the
+// host's calls never reach these entry points and the only callers left are
+// other libraries in the process drawing their own widgets. Serving those
+// rasterizes text the host never asked about, against face state that belongs
+// to nobody, so the interposer stands down instead.
+bool HostUsesThisFreeType()
+{
+    static const bool uses = [] {
+        // Any image in the link map that imports FreeType, other than this
+        // one. dlsym cannot answer, since this library exports FT_Load_Glyph
+        // and the global scope therefore always has one.
+        //
+        // The main image alone is not enough. Firefox's executable is a
+        // launcher whose DT_NEEDED lists only libc and libstdc++, while
+        // libxul.so carries the FreeType dependency, so asking the main image
+        // stands the rasterizer down in every Gecko process.
+        Dl_info self{};
+        const void* self_base = nullptr;
+        if (dladdr(reinterpret_cast<const void*>(&HostUsesThisFreeType), &self) != 0) {
+            self_base = self.dli_fbase;
+        }
+
+        struct Ask
+        {
+            const void* self_base;
+            bool found;
+        } ask{self_base, false};
+
+        dl_iterate_phdr(
+            [](dl_phdr_info* info, size_t, void* data) {
+                auto* a = static_cast<Ask*>(data);
+                if (a->self_base != nullptr &&
+                    reinterpret_cast<const void*>(info->dlpi_addr) == a->self_base) {
+                    return 0;           // this library's own dependency
+                }
+                for (int i = 0; i < info->dlpi_phnum; ++i) {
+                    if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) {
+                        continue;
+                    }
+                    const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                        info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+                    const char* strtab = nullptr;
+                    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+                        if (d->d_tag == DT_STRTAB) {
+                            strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
+                        }
+                    }
+                    if (strtab == nullptr) {
+                        continue;
+                    }
+                    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+                        if (d->d_tag == DT_NEEDED &&
+                            std::strncmp(strtab + d->d_un.d_val, "libfreetype", 11) == 0) {
+                            a->found = true;
+                            return 1;
+                        }
+                    }
+                }
+                return 0;
+            },
+            &ask);
+        if (ask.found) {
+            return true;
+        }
+        // The scan runs while this library loads, before the host has opened
+        // anything of its own, so a launcher that dlopens its shared library
+        // later has no importer in the link map yet. ParityActive answers from
+        // the installation layout instead, which is known at that point.
+        return dwcft::ParityActive();
+    }();
+    return uses;
+}
+
+// Whether the interposer should do anything at all in this process.
+bool InterposerWanted()
+{
+    static const bool wanted = dwcft::Enabled() && HostUsesThisFreeType();
+    return wanted;
+}
+
 void* FreeTypeSymbol(const char* name)
 {
     static void* handle = [] {
@@ -142,6 +224,7 @@ using ft_set_pixel_sizes_fn = FT_Error (*)(FT_Face, FT_UInt, FT_UInt);
 using ft_request_size_fn = FT_Error (*)(FT_Face, FT_Size_Request);
 using ft_get_sfnt_table_fn = void* (*)(FT_Face, FT_Sfnt_Tag);
 using ft_load_sfnt_table_fn = FT_Error (*)(FT_Face, FT_ULong, FT_Long, FT_Byte*, FT_ULong*);
+using ft_mulfix_fn = FT_Long (*)(FT_Long, FT_Long);
 
 // ---------------------------------------------------------------------------
 // Which FreeType entry points are interposed, and why
@@ -172,6 +255,10 @@ using ft_load_sfnt_table_fn = FT_Error (*)(FT_Face, FT_ULong, FT_Long, FT_Byte*,
 //   FT_Request_Size          scratch.
 //   FT_Get_Sfnt_Table        a per-size OS/2 copy; the font is never modified,
 //                            so the raw-table path shaping uses is unaffected.
+//   FT_MulFix                only watched. Gecko computes a synthetic-bold
+//                            strength with it, which is the one sign a load
+//                            carries that the instance asking for the glyph is
+//                            emboldened; see ApplyWindowsBoldAdvance.
 //
 // Variable fonts need no entry point of their own, since the axis position is
 // read with FT_Get_Var_Design_Coordinates at render time.
@@ -224,12 +311,31 @@ DEFINE_REAL(ft_set_char_size_fn, FT_Set_Char_Size)
 DEFINE_REAL(ft_set_pixel_sizes_fn, FT_Set_Pixel_Sizes)
 DEFINE_REAL(ft_request_size_fn, FT_Request_Size)
 DEFINE_REAL(ft_get_sfnt_table_fn, FT_Get_Sfnt_Table)
+DEFINE_REAL(ft_mulfix_fn, FT_MulFix)
 // Not interposed - only read, to answer the embedded-bitmap question below.
 #if DWRITECORE_FIREFOX_PARITY
 DEFINE_REAL(ft_load_sfnt_table_fn, FT_Load_Sfnt_Table)
 #endif
 
 #undef DEFINE_REAL
+
+// FreeType's rounded 16.16 multiply, for the shim's own arithmetic. Always
+// through the real function: this file interposes FT_MulFix to watch for the
+// one Gecko computes a synthetic-bold strength with, and a call from in here
+// would be mistaken for it.
+FT_Long MulFix(const FT_Long a, const FT_Long b)
+{
+    ft_mulfix_fn real = real_FT_MulFix();
+    if (real != nullptr) {
+        return real(a, b);
+    }
+    // What src/base/ftcalc.c does: the sign is taken out first, so the
+    // rounding goes away from zero on both sides.
+    const uint64_t magnitude =
+        static_cast<uint64_t>(a < 0 ? -a : a) * static_cast<uint64_t>(b < 0 ? -b : b);
+    const FT_Long product = static_cast<FT_Long>((magnitude + 0x8000U) >> 16);
+    return (a < 0) != (b < 0) ? -product : product;
+}
 
 // ---------------------------------------------------------------------------
 // Firefox parity.
@@ -418,7 +524,7 @@ void InitOptions()
         LogLine("%s", g_version);
     }
 
-    g_options.enabled = dwcft::Enabled();
+    g_options.enabled = InterposerWanted();
     g_options.subpixel_positioning = EnvIsOff("CLEARTYPE_SUBPIXEL_POSITIONING", true);
 
     // "auto" - the default - leaves the mode to DirectWrite, which decides
@@ -622,6 +728,7 @@ struct Factories
 {
     IDWriteFactory* factory = nullptr;
     IDWriteFactory2* factory2 = nullptr;  // optional; enables grid-fit control
+    IDWriteFactory3* factory3 = nullptr;  // optional; see AxesSwapped
 };
 
 Factories g_factories;
@@ -644,9 +751,15 @@ Factories GetFactories()
             if (SUCCEEDED(unknown->QueryInterface(iid2, &factory2))) {
                 created.factory2 = static_cast<IDWriteFactory2*>(factory2);
             }
+            void* factory3 = nullptr;
+            const GUID iid3 = DWRITE_UUIDOF(IDWriteFactory3);
+            if (SUCCEEDED(unknown->QueryInterface(iid3, &factory3))) {
+                created.factory3 = static_cast<IDWriteFactory3*>(factory3);
+            }
             g_factories = created;
-            LogLine("DWriteCore factory created (IDWriteFactory2 %s)",
-                    created.factory2 ? "available" : "unavailable");
+            LogLine("DWriteCore factory created (IDWriteFactory2 %s, IDWriteFactory3 %s)",
+                    created.factory2 ? "available" : "unavailable",
+                    created.factory3 ? "available" : "unavailable");
         } else {
             g_factory_failed = true;
             const char* why = DWriteCoreShimGetLastLoadError();
@@ -977,7 +1090,7 @@ void EraseFaceLocked(const size_t index)
 void RecordFace(FT_Library library, FT_Face face, const char* path, const FT_Byte* memory,
                 const FT_Long memory_size, const FT_Long face_index)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     GetOptions();  // opens the log, if it is wanted
@@ -1815,6 +1928,26 @@ DWRITE_MATRIX ToDWriteMatrix(const FT_Matrix& m, const float x_over_y)
     return out;
 }
 
+// True when the transform maps the glyph's x axis onto the device y axis and
+// its y axis onto the device x, which is what a quarter turn does.
+//
+// DirectWrite grid-fits along the device y axis, so under a quarter turn it
+// fits what was the glyph's x. In CLEARTYPE_NATURAL, DWriteCore's
+// IDWriteFactory::CreateGlyphRunAnalysis fits the glyph's own y instead. Every
+// glyph with a stem then differs, the strokes ending up horizontal keeping
+// their natural width instead of snapping to a pixel row and the ones ending
+// up vertical carrying the snapped width of the upright glyph. The
+// IDWriteFactory3 overload with DWRITE_GRID_FIT_MODE_ENABLED fits along the
+// device axis and matches Windows, so that one case takes it.
+//
+// Only a swap qualifies. A diagonal transform already agrees, and DirectWrite
+// does not grid-fit a rotation that is not a quarter turn at all, so forcing
+// the fit on for a skew or a 45 degree rotation is wrong the other way.
+bool AxesSwapped(const DWRITE_MATRIX& m)
+{
+    return m.m11 == 0.0f && m.m22 == 0.0f && (m.m12 != 0.0f || m.m21 != 0.0f);
+}
+
 // FIREFOX PARITY. Recover the exact synthetic-oblique skew from the 16.16 one
 // FreeType was given. Firefox reaches DirectWrite with a float on Windows and
 // with a fixed-point matrix here, and the two are not the same number:
@@ -2239,7 +2372,7 @@ PendingOutline* PendingOutlineLocked(const FT_Outline* outline)
 // glyph that is both emboldened and slanted asks for both.
 void RecordSimulation(const FT_Outline* outline, const DWRITE_FONT_SIMULATIONS simulation)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_shifts_mutex);
@@ -2257,10 +2390,10 @@ void RecordSimulation(const FT_Outline* outline, const DWRITE_FONT_SIMULATIONS s
 FT_Matrix MatrixConcat(const FT_Matrix& first, const FT_Matrix& second)
 {
     FT_Matrix out;
-    out.xx = FT_MulFix(first.xx, second.xx) + FT_MulFix(first.yx, second.xy);
-    out.xy = FT_MulFix(first.xy, second.xx) + FT_MulFix(first.yy, second.xy);
-    out.yx = FT_MulFix(first.xx, second.yx) + FT_MulFix(first.yx, second.yy);
-    out.yy = FT_MulFix(first.xy, second.yx) + FT_MulFix(first.yy, second.yy);
+    out.xx = MulFix(first.xx, second.xx) + MulFix(first.yx, second.xy);
+    out.xy = MulFix(first.xy, second.xx) + MulFix(first.yy, second.xy);
+    out.yx = MulFix(first.xx, second.yx) + MulFix(first.yx, second.yy);
+    out.yy = MulFix(first.xy, second.yx) + MulFix(first.yy, second.yy);
     return out;
 }
 
@@ -2281,7 +2414,7 @@ bool MatrixIsSingular(const FT_Matrix& m)
 // so a caller that transforms an outline twice gets the product.
 void RecordMatrix(const FT_Outline* outline, const FT_Matrix& matrix)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_shifts_mutex);
@@ -2294,7 +2427,7 @@ void RecordMatrix(const FT_Outline* outline, const FT_Matrix& matrix)
 // The reshape has no simulation to map to; the glyph falls through.
 void RecordUnrepresentable(const FT_Outline* outline)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_shifts_mutex);
@@ -2304,7 +2437,7 @@ void RecordUnrepresentable(const FT_Outline* outline)
 
 void RecordShift(const FT_Outline* outline, const FT_Pos dx, const FT_Pos dy)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_shifts_mutex);
@@ -2360,7 +2493,7 @@ PendingOutline PeekOutlineState(const FT_Outline* outline)
 // inside FT_Load_Glyph to apply an FT_Set_Transform delta.
 void SetPendingOutlineFace(const FT_Outline* outline, FT_Face face)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_shifts_mutex);
@@ -2632,7 +2765,7 @@ FT_Fixed PixelSize26_6(const FT_F26Dot6 char_size, const FT_UInt resolution)
 // that sets a size, including with 0, which clears a stale value.
 void RecordRequestedEmSize(FT_Face face, const FT_Fixed pixel_size_26_6)
 {
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
     pthread_mutex_lock(&g_faces_mutex);
@@ -2727,8 +2860,8 @@ bool GetScaledEmSize(FT_Face face, double* em_size, float* x_over_y)
     if (face->size == nullptr || face->units_per_EM == 0) {
         return false;
     }
-    const FT_Fixed x_26_6 = FT_MulFix(face->units_per_EM, face->size->metrics.x_scale);
-    const FT_Fixed y_26_6 = FT_MulFix(face->units_per_EM, face->size->metrics.y_scale);
+    const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+    const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
     if (x_26_6 <= 0 || y_26_6 <= 0) {
         return false;
     }
@@ -2799,10 +2932,12 @@ IDWriteFontFace1* QueryFontFace1(IDWriteFontFace* face)
     return static_cast<IDWriteFontFace1*>(out);
 }
 
-// gfxDWriteFont::MeasureGlyphWidth.
-double WinMeasureGlyphWidth(const WinInstance& inst, const UINT16 glyph)
+// gfxDWriteFont::MeasureGlyphWidth. The face is a parameter because one
+// instance answers through two of them, its own and the one carrying
+// DirectWrite's bold simulation.
+double WinMeasureGlyphWidth(const WinInstance& inst, IDWriteFontFace* face, const UINT16 glyph)
 {
-    IDWriteFontFace1* face1 = QueryFontFace1(inst.dwrite_face);
+    IDWriteFontFace1* face1 = QueryFontFace1(face);
     double result = 0.0;
     if (face1 != nullptr) {
         INT32 advance = 0;
@@ -2834,9 +2969,11 @@ double WinMeasureGlyphWidth(const WinInstance& inst, const UINT16 glyph)
 double WinGlyphAdvance(const WinInstance& inst, const UINT16 glyph, const bool has_variations)
 {
     // gfxDWriteFont::ProvidesGlyphWidths, with the bold-simulation term taken
-    // as false (not knowable here).
+    // as false. A load carries no sign of which font instance made it, so the
+    // emboldened one is recognized later and corrected by ApplyWindowsBoldAdvance.
     if (!inst.use_subpixel_positions || has_variations) {
-        return static_cast<double>(NSlround(WinMeasureGlyphWidth(inst, glyph) * 65536.0)) / 65536.0;
+        return static_cast<double>(NSlround(
+                   WinMeasureGlyphWidth(inst, inst.dwrite_face, glyph) * 65536.0)) / 65536.0;
     }
     IDWriteFontFace1* face1 = QueryFontFace1(inst.dwrite_face);
     double result = 0.0;
@@ -2849,6 +2986,66 @@ double WinGlyphAdvance(const WinInstance& inst, const UINT16 glyph, const bool h
         face1->Release();
     }
     return result;
+}
+
+// gfxFont::GetSyntheticBoldOffset: for size S below a threshold T of 48, the
+// glyphs fatten by 0.25 + 3S/4T, and by S/T above it.
+double WinSyntheticBoldOffset(const double size)
+{
+    constexpr double threshold = 48.0;
+    return size < threshold ? 0.25 + 0.75 * size / threshold : size / threshold;
+}
+
+// The advance for a bold face Firefox on Windows synthesizes itself, with no
+// DirectWrite simulation behind it.
+//
+// gfxDWriteFontEntry::CreateFontInstance keeps DirectWrite's simulation away
+// from webfonts and from COLR fonts, and gfxDWriteFont sets mApplySyntheticBold
+// for exactly those two, so the face measures as its plain self and
+// gfxFont::PostShapingFixup widens it afterwards. That widening is tracking:
+// gfxShapedText::ApplyTrackingToClusters adds a whole number of app units,
+// NS_round(GetSyntheticBoldOffset() * appUnitsPerDevUnit), to the last glyph of
+// each cluster, and only when the metrics say the face is not fixed-pitch.
+//
+// Two things about it cannot be reached from one glyph's advance. It is a whole
+// number of app units, which is 1/60 px for a device pixel that is a CSS pixel
+// and something else otherwise, and it lands once per cluster where this lands
+// once per glyph. A cluster of several glyphs therefore comes out wider than
+// Windows draws it, as it already does with the strength Linux adds.
+double WinSyntheticBoldAdvance(const WinInstance& inst, const double plain_advance)
+{
+    if (!(inst.metrics.maxAdvance > inst.metrics.aveCharWidth)) {
+        return plain_advance;
+    }
+    constexpr double app_units_per_px = 60.0;
+    const double tracking =
+        NSlround(WinSyntheticBoldOffset(inst.adjusted_size) * app_units_per_px) / app_units_per_px;
+    return plain_advance + tracking;
+}
+
+// The same advance for a face DirectWrite is simulating bold on. The simulation
+// bit makes gfxDWriteFont::ProvidesGlyphWidths() true whatever the other two
+// terms say, so the advance always comes from gfxDWriteFont::GetGlyphWidth.
+// Negative when the simulated face cannot be built. Called with g_faces_mutex
+// held.
+double WinBoldGlyphAdvanceLocked(FaceEntry* entry, const WinInstance& inst, const UINT16 glyph,
+                                 const bool has_variations)
+{
+    // gfxDWriteFontEntry::CreateFontInstance, with
+    // gfx.font_rendering.directwrite.bold_simulation at its default of 1.
+    if (entry->memory != nullptr || FaceHasCOLRLocked(entry)) {
+        return WinSyntheticBoldAdvance(inst, WinGlyphAdvance(inst, glyph, has_variations));
+    }
+    const Factories factories = GetFactories();
+    if (factories.factory == nullptr) {
+        return -1.0;
+    }
+    IDWriteFontFace* bold =
+        GetDWriteFaceLocked(entry, factories.factory, DWRITE_FONT_SIMULATIONS_BOLD, inst.axes);
+    if (bold == nullptr) {
+        return -1.0;
+    }
+    return static_cast<double>(NSlround(WinMeasureGlyphWidth(inst, bold, glyph) * 65536.0)) / 65536.0;
 }
 
 // gfxFont::GetCharAdvance: -1.0 when the font has no glyph for the character.
@@ -3135,7 +3332,7 @@ bool ComputeWinInstanceLocked(FaceEntry* entry, const double size, WinInstance* 
         UINT16 glyph = 0;
         if (SUCCEEDED(dwrite_face->GetGlyphIndices(&ucs, 1, &glyph)) &&
             glyph != 0) {
-            m.spaceWidth = WinMeasureGlyphWidth(*inst, glyph);
+            m.spaceWidth = WinMeasureGlyphWidth(*inst, dwrite_face, glyph);
         } else {
             m.spaceWidth = 0;
         }
@@ -3845,6 +4042,16 @@ void ForgetSfntCopiesLocked(FT_Face) {}
 
 #if DWRITECORE_FIREFOX_PARITY
 
+// The glyph ApplyWindowsAdvance last answered for on this thread, so that the
+// embolden strength computed for it right afterwards can be recognized. See
+// ApplyWindowsBoldAdvance.
+struct PendingAdvance
+{
+    FT_Face face;
+    FT_UInt glyph_index;
+};
+thread_local PendingAdvance g_pending_advance = {};
+
 // The horizontal advance Firefox on Windows hands to HarfBuzz for one glyph,
 // in 16.16 (hb_position_t), written into glyph->linearHoriAdvance because
 // that is the field gfxFT2FontBase::GetFTGlyphExtents reads on Linux when
@@ -3869,9 +4076,12 @@ void ForgetSfntCopiesLocked(FT_Face) {}
 //          with #define FloatToFixed(f) (65536 * (f)), evaluated in float and
 //          truncated to hb_position_t.
 //
-// The synthetic-bold simulation term cannot be known at this point (Linux
-// decides synthetic bold in the FcPattern, which FreeType never sees), so it is
-// taken as false; see the report on non-interceptable paths.
+// The synthetic-bold simulation term cannot be known at this point. Linux
+// decides synthetic bold in the FcPattern, which FreeType never sees, and
+// gfxFontconfigFontEntry::CreateFontInstance hands every instance of a family
+// the one SharedFTFace the entry holds, so nothing about the load says which
+// instance made it. It is taken as false here and corrected in
+// ApplyWindowsBoldAdvance, which runs late enough to know.
 void ApplyWindowsAdvance(FT_Face face)
 {
     if (face == nullptr || face->glyph == nullptr || !FT_IS_SCALABLE(face) ||
@@ -3901,11 +4111,90 @@ void ApplyWindowsAdvance(FT_Face face)
     pthread_mutex_unlock(&g_faces_mutex);
     // Both arithmetics leave a whole number of 1/65536 px.
     face->glyph->linearHoriAdvance = static_cast<FT_Fixed>(llround(advance_px * 65536.0));
+    g_pending_advance.face = face;
+    g_pending_advance.glyph_index = face->glyph->glyph_index;
+}
+
+// The advance for a synthetically bold instance, which the load above could
+// not recognize.
+//
+// gfx/thebes/gfxFT2FontBase.cpp gfxFT2FontBase::GetEmboldenStrength returns a
+// zero strength and calls nothing when the instance is not emboldened, so an
+// FT_MulFix of the face's own em size by its y_scale, arriving on this thread
+// with the glyph still in the slot, is the load being answered for an
+// emboldened one. gfxFT2FontBase::GetFTGlyphExtents asks for the strength
+// before it reads the advance:
+//
+//     FT_Vector bold = GetEmboldenStrength(face.get());
+//     advance = face.get()->glyph->linearHoriAdvance;
+//     if (advance) { advance += bold.x << 10; }
+//
+// so what belongs in the field is the Windows advance less the strength that
+// is about to be added to it. Firefox on Windows draws these faces through
+// DirectWrite's bold simulation, not the multi-strike synthetic bold
+// gfxFont::PostShapingFixup applies, so the Windows advance is the one
+// measured through the simulated face.
+//
+// The other callers of FT_MulFix in libxul that pass these two arguments,
+// WebRender's mozilla_glyphslot_embolden_less and Skia's FreeType port, are
+// computing the same strength for the same reason. The one that passes
+// something else, gfxFT2FontBase.cpp's ScaleRoundDesignUnits, scales an OS/2
+// design metric and runs before InitMetrics loads any glyph.
+void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long product)
+{
+    FT_Face face = g_pending_advance.face;
+    g_pending_advance.face = nullptr;
+    if (face == nullptr || face->glyph == nullptr || face->size == nullptr ||
+        face->glyph->glyph_index != g_pending_advance.glyph_index ||
+        a != static_cast<FT_Long>(face->units_per_EM) || b != face->size->metrics.y_scale) {
+        return;
+    }
+
+    // What GetEmboldenStrength returns, which is half of
+    // FT_GlyphSlot_Embolden's strength for an outline, matching how much
+    // WebRender emboldens outlines, and a whole number of pixels for an
+    // embedded bitmap.
+    FT_Pos strength = 0;
+    if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        strength = product / 48;
+    } else {
+        strength = product / 24;
+        if (face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+            strength &= -64;
+            if (strength == 0) {
+                strength = 64;
+            }
+        }
+    }
+
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (!GetEmSize(face, &em_size, &x_over_y) || !(em_size > 0.0)) {
+        return;
+    }
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    const WinInstance* instance =
+        entry != nullptr ? GetWinInstanceLocked(entry, em_size) : nullptr;
+    double advance_px = -1.0;
+    if (instance != nullptr && instance->valid && instance->dwrite_face != nullptr) {
+        advance_px = WinBoldGlyphAdvanceLocked(entry, *instance,
+                                               static_cast<UINT16>(face->glyph->glyph_index),
+                                               FT_HAS_MULTIPLE_MASTERS(face) != 0);
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (advance_px < 0.0) {
+        return;
+    }
+    face->glyph->linearHoriAdvance = static_cast<FT_Fixed>(llround(advance_px * 65536.0)) -
+                                     (static_cast<FT_Fixed>(strength) << 10);
 }
 
 #else  // !DWRITECORE_FIREFOX_PARITY
 
 inline void ApplyWindowsAdvance(FT_Face) {}
+inline void ApplyWindowsBoldAdvance(FT_Long, FT_Long, FT_Long) {}
 
 #endif
 
@@ -4575,12 +4864,22 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
 
     // GlyphRunAnalysis::create(&run, 1.0, transform, render_mode, measure_mode,
     // 0.0, 0.0): the seven-argument overload. The IDWriteFactory2 overload is
-    // only reached when CLEARTYPE_GRID_FIT pinned a grid-fit mode.
+    // only reached when CLEARTYPE_GRID_FIT pinned a grid-fit mode, and the
+    // IDWriteFactory3 one when the transform swaps the axes; see AxesSwapped.
     IDWriteGlyphRunAnalysis* analysis = nullptr;
     HRESULT hr;
     const DWRITE_MATRIX* analysis_transform = pass_transform ? &transform : nullptr;
+    // CLEARTYPE_NATURAL alone. It is the only mode whose grid fit differs
+    // between the two routes under a quarter turn; NATURAL_SYMMETRIC and the
+    // GDI modes already answer the same either way, so sending them through
+    // the other overload would change nothing.
+    const bool fit_along_device_y = analysis_transform != nullptr &&
+                                    rendering_mode == DWRITE_RENDERING_MODE_CLEARTYPE_NATURAL &&
+                                    AxesSwapped(transform) && factories.factory3 != nullptr;
     if (use_factory2 && factories.factory2 != nullptr) {
         hr = factories.factory2->CreateGlyphRunAnalysis(&run, analysis_transform, rendering_mode, measuring_mode, grid_fit_mode, antialias_mode, 0.0f, 0.0f, &analysis);
+    } else if (fit_along_device_y) {
+        hr = factories.factory3->CreateGlyphRunAnalysis(&run, analysis_transform, static_cast<DWRITE_RENDERING_MODE1>(rendering_mode), measuring_mode, DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE, 0.0f, 0.0f, &analysis);
     } else {
         hr = factory->CreateGlyphRunAnalysis(&run, 1.0f, analysis_transform, rendering_mode, measuring_mode, 0.0f, 0.0f, &analysis);
     }
@@ -4962,7 +5261,7 @@ void FT_Set_Transform(FT_Face face, FT_Matrix* matrix, FT_Vector* delta)
         return;
     }
     real(face, matrix, delta);
-    if (!dwcft::Enabled()) {
+    if (!InterposerWanted()) {
         return;
     }
 
@@ -5178,6 +5477,16 @@ FT_Error FT_Load_Char(FT_Face face, const FT_ULong char_code, const FT_Int32 loa
         ApplyWindowsAdvance(face);
     }
     return error;
+}
+
+// Only watched, never changed. The one call Gecko makes with a face's own em
+// size and y_scale is the synthetic-bold strength for the glyph just loaded,
+// which is what says the instance that asked for it is emboldened.
+FT_Long FT_MulFix(const FT_Long a, const FT_Long b)
+{
+    const FT_Long product = MulFix(a, b);
+    ApplyWindowsBoldAdvance(a, b, product);
+    return product;
 }
 
 // The second interception point.

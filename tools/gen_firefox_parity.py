@@ -402,10 +402,34 @@ def marker_revision(tree):
     return ("%s (%s)" % (tag, rev)) if tag else rev
 
 
+def sourcestamp_revision(tree):
+    """The revision a release source tarball names in sourcestamp.txt.
+
+    A tarball carries no VCS metadata, so the changeset the file records is
+    the only provenance it has. It is a Mercurial changeset and the marker a
+    --fetch leaves is a git commit, so the branch is kept in the text to say
+    which of the two a reader is looking at.
+    """
+    try:
+        with open(os.path.join(tree, "sourcestamp.txt"), encoding="utf-8") as f:
+            lines = f.read().split()
+    except OSError:
+        return None
+    for line in lines:
+        m = re.match(r"https://hg\.mozilla\.org/(?:releases/)?([^/]+)/rev/([0-9a-f]{12,})",
+                     line)
+        if m:
+            return "hg %s %s" % (m.group(1), m.group(2))
+    return None
+
+
 def tree_revision(tree):
     from_marker = marker_revision(tree)
     if from_marker:
         return from_marker
+    from_stamp = sourcestamp_revision(tree)
+    if from_stamp:
+        return from_stamp
     try:
         sha = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"],
                              capture_output=True, text=True, check=True).stdout.strip()
@@ -416,6 +440,18 @@ def tree_revision(tree):
         return ("%s (%s)" % (name, sha)) if name else sha
     except Exception:
         return "unknown revision"
+
+
+# What a font name list says when it names no family at all.
+#
+# gfxFontUtils::ParseFontList splits on commas and drops every name that is
+# empty once whitespace is compressed, so a lone comma parses to an empty
+# family list. An empty string does not work here. gfxFcPlatformFontList::
+# AddGenericFonts reads an empty value as "ask fontconfig for this generic"
+# and answers with whatever fontconfig offers, where Windows runs the base
+# class and adds nothing. Any non-empty value other than serif, sans-serif,
+# monospace or math sends Linux down that same base-class path.
+EMPTY_FONT_LIST = ","
 
 
 # The platform macros all.js branches on, as each build would define them.
@@ -463,6 +499,15 @@ def font_prefs_by_platform(all_js):
     `#if !defined(ANDROID) && !defined(XP_MACOSX) && defined(XP_UNIX)`. A pref
     like that appears in no Windows block at all, and is exactly the kind of
     difference this file exists to undo.
+
+    A pref Linux sets and Windows never sets is the same kind of difference.
+    ResolveGenericFontNames looks the name up and adds nothing when it is
+    missing, so on Windows that generic resolves to no family and the text
+    falls through to the default font. The Linux value has to say the same
+    thing, and it is written as a lone comma, EMPTY_FONT_LIST below.
+
+    Only the name lists are given a value this way. A Linux-only pref of any
+    other kind would need a real one and stops the build.
     """
     values = {"win": {}, "linux": {}}
     order = []
@@ -529,8 +574,19 @@ def font_prefs_by_platform(all_js):
         seen.add(name)
         win = values["win"].get(name)
         linux = values["linux"].get(name)
-        if win is not None and win != linux:
-            differing.append('"%s", %s' % (name, win))
+        if win is not None:
+            if win != linux:
+                # An empty list Windows writes itself means the same thing as
+                # one it never wrote, and reads the same way on Linux.
+                if win == '""' and name.startswith(("font.name.", "font.name-list.")):
+                    win = '"%s"' % EMPTY_FONT_LIST
+                differing.append('"%s", %s' % (name, win))
+        elif linux is not None:
+            if not name.startswith(("font.name.", "font.name-list.")):
+                die("all.js: %s is set on Linux and not on Windows, and it is "
+                    "not a font name list, so there is no empty value to give "
+                    "it" % name)
+            differing.append('"%s", "%s"' % (name, EMPTY_FONT_LIST))
     if not differing:
         die("all.js: Windows and Linux agree on every font pref, which cannot be right")
     return differing
