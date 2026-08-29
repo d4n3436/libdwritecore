@@ -50,12 +50,16 @@ def main():
                 cell = os.path.join(args.out_dir, "cell" + index)
                 os.makedirs(cell, exist_ok=True)
                 out = os.path.join(cell, args.label + "_clean.png")
+                # SystemExit included: the waits in viewport_protocol exit on
+                # a timeout, which stops a per-page driver cleanly but must
+                # not take the rest of the plan with it here. A scroll offset
+                # past the page's height, for one, times out that way.
                 try:
                     vp.capture_direct(browser, args.prefix + "/" + path,
                                       args.width, args.height, out,
                                       scroll=scroll, css=args.css)
                     print("ok " + index, flush=True)
-                except Exception as why:  # noqa: BLE001 - one bad page is one bad cell
+                except (Exception, SystemExit) as why:  # noqa: BLE001
                     print("fail %s %s" % (index, why), flush=True)
     finally:
         browser.close()

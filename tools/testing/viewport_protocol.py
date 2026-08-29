@@ -65,8 +65,22 @@ MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
 const d = document.createElement('div');
 d.id = '__dwc_origin_mark';
-d.style.cssText = 'position:fixed;left:0;top:0;width:8px;height:8px;'
-                + 'background:rgb(255,0,255);z-index:2147483647;';
+// all:initial first, because the page's own rules reach a bare div. A
+// `div { margin: 0 20px }` moves the marker, since left:0 positions the
+// margin box, and a border grows it; the crop then starts in the wrong
+// place or off the window entirely.
+// Two off-primary colors in vertical stripes, magenta on columns 0-3 and
+// green on 4-7. Neither half alone is enough: rgb(255,0,255) is `magenta`,
+// `fuchsia` and `#f0f` at once, and a page painting it in the corner captures
+// the origin (direction-upright-002.html has 2478 px of it), while any single
+// color is a range a tolerant test lets a page paint inside. Stripes rather
+// than a checker because the geometry is explicit: a conic gradient starts at
+// twelve o'clock, so its first quadrant is the top right and the detected
+// corner comes out four rows low.
+d.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:8px;height:8px;'
+                + 'z-index:2147483647;'
+                + 'background:linear-gradient(90deg,'
+                + 'rgb(253,3,251) 0 50%,rgb(3,251,3) 50% 100%);';
 document.documentElement.appendChild(d);
 document.documentElement.style.scrollBehavior = 'auto';
 window.scrollTo({top: arguments[0], left: 0, behavior: 'instant'});
@@ -206,6 +220,9 @@ class WebSocket:
 class Browser(abc.ABC):
     """What Capture needs from whichever browser is being driven."""
 
+    # Which protocol this speaks, for the few places that need to know.
+    driver = "cdp"
+
     @abc.abstractmethod
     def navigate(self, url):
         raise NotImplementedError
@@ -227,6 +244,51 @@ class Browser(abc.ABC):
 
     def close(self):
         pass
+
+
+class MarionetteBrowser(Browser):
+    """Firefox, over Marionette.
+
+    The scripts the tools here run are already written the way Marionette
+    passes them: arguments come in as `arguments[n]` and the value comes back
+    from a `return`, so only the transport differs.
+    """
+
+    driver = "marionette"
+
+    def __init__(self, host, port, timeout=30.0):
+        import marionette
+        self.m = marionette.Marionette(host, port, timeout=int(timeout))
+        self.m.start("content")
+
+    def navigate(self, url):
+        self.m.call("WebDriver:Navigate", {"url": url})
+
+    def script(self, body, args=()):
+        return self.m.script(body, list(args))
+
+    def script_async(self, body):
+        return self.m.script_async(body)
+
+    def set_window_rect(self, width, height):
+        self.m.call("WebDriver:SetWindowRect",
+                    {"width": width, "height": height, "x": 0, "y": 0})
+        return True
+
+    def close(self):
+        self.m.close()
+
+
+def open_browser(spec, timeout=30.0):
+    """A browser from `[driver:]host:port`, DevTools when no driver is named."""
+    driver, _, rest = spec.partition(":")
+    if driver == "marionette":
+        host, _, port = rest.partition(":")
+        return MarionetteBrowser(host, int(port or 2828), timeout)
+    if driver == "cdp":
+        spec = rest
+    host, _, port = spec.partition(":")
+    return CdpBrowser(host, int(port or 9222), timeout)
 
 
 class CdpBrowser(Browser):
@@ -437,10 +499,11 @@ def hide_scrollbars(browser):
 # The scroll part of MARK, without the marker. Scrollbars are already hidden
 # session-wide through Emulation.setScrollbarsHidden, so this writes no style,
 # since a per-page style write on the root element costs a full recalc on a
-# large document.
+# large document. Returns how far the page can scroll at all, so an offset
+# past its end is refused at once instead of waited on until the deadline.
 SETTLE = """
 window.scrollTo({top: arguments[0], left: 0, behavior: 'instant'});
-return 1;
+return Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
 """
 
 
@@ -462,7 +525,10 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
         browser.script(EXTRA_CSS, [css])
         await_condition(browser, PAGE_LOADED, deadline,
                         "the page never settled after the extra css")
-    browser.script(SETTLE, [scroll])
+    max_scroll = browser.script(SETTLE, [scroll])
+    if scroll > max_scroll + 1:
+        raise RuntimeError("scroll %d is past the page, which ends at %d"
+                           % (scroll, max_scroll))
     await_condition(browser, VIEWPORT_READY, deadline,
                     "the viewport never settled after scrolling", [scroll])
     # A navigation re-derives :hover from where the machine's own pointer

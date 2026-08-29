@@ -70,14 +70,42 @@ import numpy as np
 from PIL import Image
 
 
+# The marker's two colors, off the primaries on purpose. An exact match would
+# fail wherever a capture path shifts a channel, and a wide tolerance is a
+# range a page can paint inside, so the values are odd and the window is small.
+MARKER_A = (253, 3, 251)
+MARKER_B = (3, 251, 3)
+MARKER_TOLERANCE = 2
+
+
+def marker_colors(a):
+    """Masks of the marker's two colors in an RGB array."""
+    def near(rgb):
+        return ((np.abs(a[:, :, 0] - rgb[0]) <= MARKER_TOLERANCE) &
+                (np.abs(a[:, :, 1] - rgb[1]) <= MARKER_TOLERANCE) &
+                (np.abs(a[:, :, 2] - rgb[2]) <= MARKER_TOLERANCE))
+    return near(MARKER_A), near(MARKER_B)
+
+
 def origin(path):
-    """Top-left pixel of the magenta viewport marker."""
+    """Top-left pixel of the viewport marker.
+
+    The marker is a magenta and green checker rather than a flat fill, so a
+    magenta pixel alone does not identify it: a page painting `background:
+    fuchsia` would otherwise take the corner whenever its area sits further up
+    or left. A magenta pixel counts only where green sits four pixels along,
+    which is the checker's period.
+    """
     a = np.asarray(Image.open(path).convert("RGB")).astype(int)
-    found = (a[:, :, 0] > 240) & (a[:, :, 1] < 20) & (a[:, :, 2] > 240)
-    ys, xs = np.nonzero(found)
+    magenta, green = marker_colors(a)
+    # Green four columns right of a magenta pixel, and inside the image.
+    paired = magenta.copy()
+    paired[:, :-4] &= green[:, 4:]
+    paired[:, -4:] = False
+    ys, xs = np.nonzero(paired)
     if len(xs) == 0:
         sys.exit("no viewport marker in " + path)
-    return int(xs.min()), int(ys.min()), len(xs)
+    return int(xs.min()), int(ys.min()), int(magenta.sum())
 
 
 def marker_state(path):
@@ -94,7 +122,11 @@ def marker_state(path):
     either, so without this check it would read as a perfectly good clean shot.
     """
     a = np.asarray(Image.open(path).convert("RGB")).astype(int)
-    found = (a[:, :, 0] > 240) & (a[:, :, 1] < 20) & (a[:, :, 2] > 240)
+    # The checker, not one color; see origin() for why a flat test is wrong.
+    magenta, green = marker_colors(a)
+    found = magenta.copy()
+    found[:, :-4] &= green[:, 4:]
+    found[:, -4:] = False
     ys, xs = np.nonzero(found)
     if len(xs) == 0:
         corners = a[::max(1, a.shape[0] // 8), ::max(1, a.shape[1] // 8)]

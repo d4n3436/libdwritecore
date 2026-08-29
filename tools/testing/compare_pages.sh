@@ -105,11 +105,22 @@ FAILED=0
 CELLS=0
 STRIKES=0
 
-# Two CDP sides take the direct route. Each side sweeps the whole plan over
-# one connection, every cell is one Page.captureScreenshot, and cells are
-# compared here as soon as both sides have delivered them, overlapping with
-# the captures still going.
-if [ "${DRIVERS[0]}" = cdp ] && [ "${DRIVERS[1]}" = cdp ]; then
+# Both drivers have a direct route. Each side sweeps the whole plan over one
+# connection, in one process, and cells are compared here as soon as both sides
+# have delivered them, overlapping with the captures still going.
+#
+# A CDP side reads the compositor with Page.captureScreenshot. A Marionette
+# side still photographs the screen, because Firefox has no faithful in-browser
+# capture; sweep_pages_marionette.py opens with why. It grabs through Xlib into
+# memory instead of shelling out to `import`, and holds one process for the
+# plan instead of one per page. That grab is the one new dependency, so a
+# machine without python-xlib falls back to the per-page route below.
+DIRECT=1
+for i in 0 1; do
+    [ "${DRIVERS[$i]}" = cdp ] && continue
+    python3 -c "import Xlib" 2>/dev/null || DIRECT=0
+done
+if [ "$DIRECT" = 1 ]; then
     ALL_PATHS=(); ALL_SCROLLS=()
     : > "$SHOTS/cells"
     for entry in "${PAGES[@]}"; do
@@ -131,8 +142,13 @@ if [ "${DRIVERS[0]}" = cdp ] && [ "${DRIVERS[1]}" = cdp ]; then
     for i in 0 1; do
         live=()
         for port in ${PORTS[$i]//,/ }; do
-            if curl -s --max-time 3 "http://${HOSTS[$i]}:$port/json/version" \
-                    > /dev/null 2>&1; then
+            # DevTools answers an HTTP probe; Marionette is a bare socket.
+            if [ "${DRIVERS[$i]}" = cdp ]; then
+                probe() { curl -s --max-time 3 "http://${HOSTS[$i]}:$port/json/version" >/dev/null 2>&1; }
+            else
+                probe() { (exec 3<>"/dev/tcp/${HOSTS[$i]}/$port") 2>/dev/null; }
+            fi
+            if probe; then
                 live+=("$port")
             else
                 echo "side ${LABELS[$i]}: nothing answers on port $port; sweeping without it" >&2
@@ -145,7 +161,14 @@ if [ "${DRIVERS[0]}" = cdp ] && [ "${DRIVERS[1]}" = cdp ]; then
         for k in "${!live[@]}"; do
             awk -v n="${#live[@]}" -v k="$k" 'NR % n == (k + 1) % n' \
                 "$SHOTS/cells" > "$SHOTS/cells.${LABELS[$i]}.$k"
-            python3 "$HERE/sweep_pages_cdp.py" "${HOSTS[$i]}" "${live[$k]}" \
+            # The Marionette sweeper takes the side's screen backend first;
+            # everything after that is the same argument list.
+            if [ "${DRIVERS[$i]}" = cdp ]; then
+                SWEEP=("$HERE/sweep_pages_cdp.py")
+            else
+                SWEEP=("$HERE/sweep_pages_marionette.py" "${BACKENDS[$i]}")
+            fi
+            python3 "${SWEEP[@]}" "${HOSTS[$i]}" "${live[$k]}" \
                     "${PREFIXES[$i]}" "$WIDTH" "$HEIGHT" "${LABELS[$i]}" \
                     "$SHOTS" "$SHOTS/cells.${LABELS[$i]}.$k" "${CSS[@]+"${CSS[@]}"}" \
                     >"$SHOTS/${LABELS[$i]}.$k.log" 2>&1 &

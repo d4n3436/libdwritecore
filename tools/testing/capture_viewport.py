@@ -129,8 +129,22 @@ MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
 const d = document.createElement('div');
 d.id = '__dwc_origin_mark';
-d.style.cssText = 'position:fixed;left:0;top:0;width:8px;height:8px;'
-                + 'background:rgb(255,0,255);z-index:2147483647;';
+// all:initial first, because the page's own rules reach a bare div. A
+// `div { margin: 0 20px }` moves the marker, since left:0 positions the
+// margin box, and a border grows it; the crop then starts in the wrong
+// place or off the window entirely.
+// Two off-primary colors in vertical stripes, magenta on columns 0-3 and
+// green on 4-7. Neither half alone is enough: rgb(255,0,255) is `magenta`,
+// `fuchsia` and `#f0f` at once, and a page painting it in the corner captures
+// the origin (direction-upright-002.html has 2478 px of it), while any single
+// color is a range a tolerant test lets a page paint inside. Stripes rather
+// than a checker because the geometry is explicit: a conic gradient starts at
+// twelve o'clock, so its first quadrant is the top right and the detected
+// corner comes out four rows low.
+d.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:8px;height:8px;'
+                + 'z-index:2147483647;'
+                + 'background:linear-gradient(90deg,'
+                + 'rgb(253,3,251) 0 50%,rgb(3,251,3) 50% 100%);';
 document.documentElement.appendChild(d);
 document.documentElement.style.scrollBehavior = 'auto';
 window.scrollTo({top: arguments[0], left: 0, behavior: 'instant'});

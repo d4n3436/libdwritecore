@@ -112,8 +112,30 @@ try:
         if quiet >= 0.6:
             break
         time.sleep(0.05)
+    m.close()
 except Exception as exc:                    # a warm-up is never fatal
     print("warm-up skipped: %s" % exc, file=sys.stderr)
+
+# Firefox draws a status panel reading "Looking up <host>..." over the bottom
+# left of the content area while a request is in flight, and it lingers after
+# the load. It is chrome, so the marker handshake cannot see it and a capture is
+# accepted with the panel in it, which reads as a font difference wherever the
+# page has ink in those rows. Only the side whose page server is not loopback
+# shows it, and any subresource brings it back, so disabling favicons covers
+# only a page that fetches nothing else and a webfont undoes even that.
+#
+# StatusPanel.update() returns early on _frozen, so setting it silences the
+# panel for the session. No pref does this, and the alternative that does,
+# --kiosk, takes the window fullscreen and changes the viewport with it.
+try:
+    m = Marionette(sys.argv[1], int(sys.argv[2]), timeout=60)
+    m.start("chrome")
+    m.script("const w = Services.wm.getMostRecentWindow('navigator:browser');"
+             " if (w && w.StatusPanel) { w.StatusPanel._frozen = true; }"
+             " return 1;")
+    m.close()
+except Exception as exc:
+    print("status panel not frozen: %s" % exc, file=sys.stderr)
 PYWARM
 }
 
@@ -225,6 +247,15 @@ if [ "$COMMAND" = "guest" ]; then
         echo 'user_pref("browser.cache.disk.enable", false);'
         echo 'user_pref("browser.cache.memory.enable", false);'
         echo 'user_pref("browser.cache.check_doc_frequency", 1);'
+        # No favicons. A page that names none still costs a request for
+        # /favicon.ico after it has loaded, and Firefox reports that request in
+        # the status panel across the bottom left corner of the window. The
+        # marker handshake cannot see it, being chrome and not page, so a
+        # capture taken while it is up carries 21 rows of "Looking up
+        # <host>..." and reads as a font difference wherever the page has ink
+        # there. Only the side whose page server is not loopback shows it,
+        # which is this one.
+        echo 'user_pref("browser.chrome.site_icons", false);'
         echo 'user_pref("datareporting.policy.dataSubmissionEnabled", false);'
     } > "$GUEST_PREFS"
     CHUNKS="$(base64 -w0 < "$GUEST_PREFS" | fold -w1200)"
@@ -308,6 +339,8 @@ mkdir -p "$PROFILE"
     echo "user_pref(\"browser.cache.disk.enable\", false);"
     echo "user_pref(\"browser.cache.memory.enable\", false);"
     echo "user_pref(\"browser.cache.check_doc_frequency\", 1);"
+    # Both sides alike; see the guest block above for what it is for.
+    echo "user_pref(\"browser.chrome.site_icons\", false);"
     echo "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");"
     echo "user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);"
     echo "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);"

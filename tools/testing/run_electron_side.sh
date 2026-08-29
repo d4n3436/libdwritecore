@@ -4,7 +4,20 @@
 #
 #   run_electron_side.sh start <app-dir> <url> <width> <height> [--port N]
 #                              [--display :N] [--preload LIB] [--libdir DIR]
+#                              [--no-sandbox]
 #   run_electron_side.sh stop
+#   run_electron_side.sh guest <domain> [--port N]
+#   run_electron_side.sh guest-stop <domain>
+#
+# guest starts the Electron inside a libvirt guest, through the QEMU guest
+# agent. The agent runs as the system account, so the browser lands in the
+# services session, which has no visible desktop. That hides the window from
+# whoever is at the guest's console, and nothing there can hover, focus or
+# cover it. The capture must be the direct CDP route; there is no screen to
+# photograph. The app is pushed from electron-app/ first, so the guest runs
+# the same one, and a scheduled task restarts it at boot. DevTools binds to
+# loopback, so a port proxy and a firewall rule expose it, on --port
+# (default 9223).
 #
 # Started detached with a pidfile, because the process has to outlive the
 # shell that launched it and pattern-matching for it does not work, since a
@@ -33,8 +46,71 @@ case "${1:-}" in
         exit 0
         ;;
     start) shift ;;
-    *) echo "usage: $0 start <app-dir> <url> <width> <height> [options]" >&2; exit 2 ;;
+    guest|guest-stop) COMMAND="$1"; GUEST_DOMAIN="${2:?guest needs a libvirt domain}"
+        shift 2
+        GUEST_PORT=9223
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --port) GUEST_PORT="$2"; shift 2 ;;
+                *) echo "unknown option: $1" >&2; exit 2 ;;
+            esac
+        done
+        ;;
+    *) echo "usage: $0 start|stop|guest|guest-stop ..." >&2; exit 2 ;;
 esac
+
+# ---------------------------------------------------------------------------
+# The guest side. Everything goes through the QEMU guest agent (vmexec.py).
+# The guest layout is fixed: the Electron binary at C:\eparity\electron and
+# the app at C:\eparity\app.
+# ---------------------------------------------------------------------------
+
+run_guest() {                             # run_guest <powershell text>
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | base64 -w0 > "$STATE.ps1.b64"
+    python3 "$HERE/vmexec.py" "$GUEST_DOMAIN" powershell -NoProfile \
+            -EncodedCommand "$(cat "$STATE.ps1.b64")"
+    local status=$?
+    rm -f "$STATE.ps1.b64"
+    return $status
+}
+
+if [ "${COMMAND:-}" = "guest-stop" ]; then
+    run_guest "
+Get-Process electron -ErrorAction SilentlyContinue | Stop-Process -Force
+schtasks /delete /tn dwcel /f 2>&1 | Out-Null
+netsh interface portproxy delete v4tov4 listenport=$GUEST_PORT listenaddress=0.0.0.0 | Out-Null
+netsh advfirewall firewall delete rule name=dwc-devtools | Out-Null
+Write-Output 'guest stopped'
+"
+    exit $?
+fi
+
+if [ "${COMMAND:-}" = "guest" ]; then
+    MAIN_B64="$(base64 -w0 "$HERE/electron-app/main.js")"
+    PKG_B64="$(base64 -w0 "$HERE/electron-app/package.json")"
+    run_guest "
+Get-Process electron -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
+New-Item -ItemType Directory -Force -Path C:\eparity\app | Out-Null
+[IO.File]::WriteAllBytes('C:\eparity\app\main.js', [Convert]::FromBase64String('$MAIN_B64'))
+[IO.File]::WriteAllBytes('C:\eparity\app\package.json', [Convert]::FromBase64String('$PKG_B64'))
+Set-Content -Path C:\eparity\run.cmd -Value 'set DWC_URL=about:blank&& set DWC_W=1920&& set DWC_H=1080&& C:\eparity\electron\electron.exe --remote-debugging-port=9222 --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion C:\eparity\app'
+schtasks /create /tn dwcel /tr 'cmd.exe /c C:\eparity\run.cmd' /sc onstart /ru SYSTEM /rl highest /f | Out-Null
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$GUEST_PORT connectaddress=127.0.0.1 connectport=9222 | Out-Null
+netsh advfirewall firewall add rule name=dwc-devtools dir=in action=allow protocol=TCP localport=$GUEST_PORT 2>&1 | Out-Null
+schtasks /run /tn dwcel | Out-Null
+foreach (\$i in 1..60) {
+    Start-Sleep -Milliseconds 500
+    try {
+        \$r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:9222/json/version -TimeoutSec 2
+        if (\$r.StatusCode -eq 200) { Write-Output 'guest electron up on 9222'; exit 0 }
+    } catch {}
+}
+Write-Output 'guest electron never opened its DevTools port'
+exit 1
+"
+    exit $?
+fi
 
 APP="$1"; URL="$2"; WIDTH="$3"; HEIGHT="$4"; shift 4
 PORT=9222
@@ -42,6 +118,9 @@ DISPLAY_NAME="${DISPLAY:-:99}"
 PRELOAD=""
 LIBDIR=""
 BINARY="${DWC_ELECTRON_BIN:-}"
+# An Electron unpacked from a release archive has no setuid chrome-sandbox,
+# so its sandbox cannot start and the browser exits before DevTools opens.
+SANDBOX=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +129,7 @@ while [ $# -gt 0 ]; do
         --preload) PRELOAD="$2"; shift 2 ;;
         --libdir)  LIBDIR="$2"; shift 2 ;;
         --binary)  BINARY="$2"; shift 2 ;;
+        --no-sandbox) SANDBOX=0; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -94,8 +174,12 @@ env_args=(--unset=WAYLAND_DISPLAY
 # on one screen, one window fully covering the other, and a covered window's
 # requestAnimationFrame is otherwise throttled to a stop, which stalls every
 # capture from it.
+sandbox_args=()
+[ "$SANDBOX" = 0 ] && sandbox_args+=(--no-sandbox)
+
 setsid nohup env "${env_args[@]}" "$BINARY" \
     --ozone-platform=x11 --disable-backgrounding-occluded-windows \
+    "${sandbox_args[@]}" \
     --remote-debugging-port="$PORT" "$APP" \
     > "$STATE/electron.log" 2>&1 < /dev/null &
 echo $! > "$PIDFILE"

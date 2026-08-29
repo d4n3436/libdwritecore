@@ -17,6 +17,7 @@ To reach a Marionette in a virtual machine, forward the port to the guest -
 Marionette binds to loopback only - and pass the guest's address.
 """
 
+import base64
 import json
 import socket
 
@@ -107,3 +108,21 @@ class Marionette:
         if isinstance(value, dict) and "value" in value:
             return value["value"]
         return value
+
+    def script_async(self, source, args=None, sandbox=None):
+        """Run a script that calls arguments[arguments.length - 1] when done."""
+        params = {"script": source, "args": args or []}
+        if sandbox:
+            params["sandbox"] = sandbox
+        value = self.call("WebDriver:ExecuteAsyncScript", params)
+        if isinstance(value, dict) and "value" in value:
+            return value["value"]
+        return value
+
+    def screenshot(self):
+        """The viewport as PNG bytes."""
+        value = self.call("WebDriver:TakeScreenshot",
+                          {"full": False, "hash": False, "scroll": False})
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        return base64.b64decode(value)

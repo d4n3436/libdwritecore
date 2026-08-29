@@ -82,30 +82,71 @@ SNAPSHOT = """
 """
 
 
-def endpoint(text):
-    host, _, port = text.partition(":")
-    return host, int(port or 9222)
-
-
-def snapshot(browser, url):
+def snapshot(browser, url, scroll=0):
     browser.navigate(url)
-    browser.call("DOM.enable")
-    browser.call("CSS.enable")
-    browser.call("DOM.getDocument", {"depth": -1})
+    vp.await_condition(browser, vp.PAGE_LOADED, 60, "the page never finished loading")
+    if scroll:
+        browser.script(vp.SETTLE, [scroll])
+        vp.await_condition(browser, vp.VIEWPORT_READY, 60,
+                           "the viewport never settled after scrolling", [scroll])
+    if browser.driver == "cdp":
+        browser.call("DOM.enable")
+        browser.call("CSS.enable")
+        browser.call("DOM.getDocument", {"depth": -1})
     return {r[0]: r for r in json.loads(browser.script(SNAPSHOT))}
+
+
+# What CSS.getPlatformFontsForNode answers on the DevTools side, from
+# InspectorUtils.getUsedFontFaces. Firefox names the face and reports no glyph
+# count, so the count comes back zero and the comparison rests on the names.
+USED_FACES = """
+const el = document.querySelectorAll('*')[JSON.parse(arguments[0])];
+if (!el) { return '[]'; }
+const range = document.createRange();
+range.selectNodeContents(el);
+const out = [];
+const faces = InspectorUtils.getUsedFontFaces(range, 0, true);
+for (let i = 0; i < faces.length; i++) {
+  out.push([faces[i].name, faces[i].CSSFamilyName || '']);
+}
+return JSON.stringify(out);
+"""
+
+
+class FontQueryFailed(Exception):
+    """The browser could not be asked which faces an element drew with.
+
+    Distinct from an element that drew with none: an empty answer and a failed
+    query would otherwise both read as "the two sides agree", which turns a
+    dead DevTools session into a page of raster verdicts.
+    """
 
 
 def platform_fonts(browser, index):
     """The families an element really drew with, sorted so order cannot lie."""
-    browser.script("window.__a = document.querySelectorAll('*')[%d];" % index)
-    obj = browser.call("Runtime.evaluate", {"expression": "window.__a"})["result"]
-    if "objectId" not in obj:
-        return []
-    node = browser.call("DOM.requestNode", {"objectId": obj["objectId"]})["nodeId"]
+    if browser.driver == "marionette":
+        try:
+            rows = json.loads(browser.m.script(USED_FACES, [json.dumps(index)],
+                                               sandbox="system"))
+        except RuntimeError as err:
+            raise FontQueryFailed(str(err)) from err
+        return sorted((family or name, name, 0) for name, family in rows)
     try:
-        fonts = browser.call("CSS.getPlatformFontsForNode", {"nodeId": node}).get("fonts", [])
-    except RuntimeError:
-        return []
+        browser.script("window.__a = document.querySelectorAll('*')[%d];" % index)
+        obj = browser.call("Runtime.evaluate",
+                           {"expression": "window.__a"})["result"]
+        if "objectId" not in obj:
+            return []
+        node = browser.call("DOM.requestNode",
+                            {"objectId": obj["objectId"]})["nodeId"]
+        fonts = browser.call("CSS.getPlatformFontsForNode",
+                             {"nodeId": node}).get("fonts", [])
+    except RuntimeError as err:
+        # A node that went away between the snapshot and the query is the one
+        # failure meaning "no fonts"; every other one means "cannot ask".
+        if "Could not find node" in str(err):
+            return []
+        raise FontQueryFailed(str(err)) from err
     merged = {}
     for f in fonts:
         face = (f["familyName"], f.get("postScriptName", ""))
@@ -252,16 +293,21 @@ def main():
     ap.add_argument("page")
     ap.add_argument("url")
     ap.add_argument("--url-b", default=None)
-    ap.add_argument("--a", default="127.0.0.1:9222")
+    ap.add_argument("--a", default="127.0.0.1:9222",
+                    help="[driver:]host:port of the first side's driver")
     ap.add_argument("--b", required=True,
-                    help="host:port of the second side's driver")
+                    help="[driver:]host:port of the second side's driver")
+    ap.add_argument("--tag-b", default=None,
+                    help="the second side's tag; the first plus W by default")
+    ap.add_argument("--scroll", type=int, default=0,
+                    help="scroll offset of the compared cell")
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--limit", type=int, default=14)
     args = ap.parse_args()
 
     base = side_base(args.shots, args.tag, args.page)
-    other = side_base(args.shots, args.tag + "W", args.page)
+    other = side_base(args.shots, args.tag_b or args.tag + "W", args.page)
     ax, ay = viewport_origin(base)
     bx, by = viewport_origin(other)
     a = cv.crop(base + "_clean.png", ax, ay, args.width, args.height).astype(int)
@@ -273,11 +319,11 @@ def main():
     if not total:
         return 0
 
-    ba = vp.CdpBrowser(*endpoint(args.a))
-    bb = vp.CdpBrowser(*endpoint(args.b))
+    ba = vp.open_browser(args.a)
+    bb = vp.open_browser(args.b)
     try:
-        rows_a = snapshot(ba, args.url)
-        rows_b = snapshot(bb, args.url_b or args.url)
+        rows_a = snapshot(ba, args.url, args.scroll)
+        rows_b = snapshot(bb, args.url_b or args.url, args.scroll)
 
         # The tree, from the recorded-ancestor field, so a box whose own rect
         # agrees can still be caught holding something that moved.
@@ -337,7 +383,13 @@ def main():
             if ra is None or rb is None:
                 kinds["only-one-side"] = kinds.get("only-one-side", 0) + counts[index]
                 continue
-            fa, fb = platform_fonts(ba, index), platform_fonts(bb, index)
+            try:
+                fa, fb = platform_fonts(ba, index), platform_fonts(bb, index)
+            except FontQueryFailed as err:
+                sys.exit("the browsers could not be asked which faces drew "
+                         "element %d: %s\nEvery verdict below it would read as "
+                         "raster, so nothing is reported. Recapture against the "
+                         "browsers that are running now." % (index, err))
             kind, why = classify(ra, rb, fa, fb, moved_inside(index, band[index]))
             detail.append([counts[index], kind, why, ra, index, fa, fb])
 
