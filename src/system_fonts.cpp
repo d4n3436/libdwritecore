@@ -91,10 +91,17 @@ void LoadFontconfig()
 {
     // RTLD_LOCAL: nothing here should become visible to the host process, which
     // may have its own fontconfig loaded at a different version.
-    g_fc.handle = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
+    //
+    // RTLD_DEEPBIND makes this copy resolve its own calls against itself
+    // before the global scope. libcleartype.so is preloaded and exports FcFontMatch,
+    // FcFontSort and FcCharSetHasChar, so without it fontconfig's internal
+    // calls to those bind to the interposers, which forward through RTLD_NEXT
+    // back into this same library while it is still initializing.
+    constexpr int kFlags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
+    g_fc.handle = dlopen("libfontconfig.so.1", kFlags);
     if (g_fc.handle == nullptr)
     {
-        g_fc.handle = dlopen("libfontconfig.so", RTLD_NOW | RTLD_LOCAL);
+        g_fc.handle = dlopen("libfontconfig.so", kFlags);
     }
     if (g_fc.handle == nullptr)
     {

@@ -12,6 +12,11 @@
 //  were extracted from. The Ext-B fonts invert that: MingLiU-ExtB is in the
 //  base image, plain MingLiU is not.
 //
+//  Cascadia Code and Cascadia Mono are on that page but never reach the system
+//  font collection. They ship inside the Windows Terminal package as
+//  app-local resources, so C:\Windows\Fonts holds neither and no application
+//  but Terminal can name them, however recent the build.
+//
 //  Sub-family names that a caller asks for by name are listed in their own
 //  right - MS PGothic and MS UI Gothic alongside MS Gothic, NSimSun and
 //  SimSun-ExtB alongside SimSun - because a font.name-list entry names one of
@@ -39,8 +44,6 @@ inline constexpr const char* kBaseInstall[] = {
     "Cambria",
     "Cambria Math",
     "Candara",
-    "Cascadia Code",
-    "Cascadia Mono",
     "Comic Sans MS",
     "Consolas",
     "Constantia",
@@ -72,6 +75,7 @@ inline constexpr const char* kBaseInstall[] = {
     "Microsoft Yi Baiti",
     "MingLiU-ExtB",
     "MingLiU_HKSCS-ExtB",
+    "MingLiU_MSCS-ExtB",
     "Mongolian Baiti",
     "MS Gothic",
     "MS PGothic",
@@ -105,7 +109,6 @@ inline constexpr const char* kBaseInstall[] = {
     "Sitka Heading",
     "Sitka Small",
     "Sitka Subheading",
-    "Sitka Text",
     "Sitka Text",
     "Sylfaen",
     "Symbol",

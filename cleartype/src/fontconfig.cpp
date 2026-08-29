@@ -341,6 +341,30 @@ bool ShipsWithWindows(const char* name)
 // The names gfxFcPlatformFontList hands to fontconfig for a generic: the CSS
 // ones GetGenericName returns, plus the fake family GetDefaultFontForPlatform
 // uses. Nothing else asks fontconfig a question Windows would not ask.
+// Whether the pattern carries Gecko's substitution sentinel. Gecko tells an
+// explicit fontconfig substitution from a suggested one by matching
+// "<family>, -moz-sentinel" against "-moz-sentinel" alone
+// (gfxFcPlatformFontList.cpp, kSentinelName). An unquoted generic never
+// reaches that pattern, since FindFamilies resolves it through
+// FindGenericFamilies and returns several branches earlier, so a generic
+// keyword here is a quoted family name.
+bool HasGeckoSentinel(const FcPattern* pattern)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    if (get_string == nullptr || pattern == nullptr) {
+        return false;
+    }
+    for (int i = 0;; ++i) {
+        FcChar8* name = nullptr;
+        if (get_string(pattern, "family", i, &name) != kFcResultMatch || name == nullptr) {
+            return false;
+        }
+        if (std::strcmp(reinterpret_cast<const char*>(name), "-moz-sentinel") == 0) {
+            return true;
+        }
+    }
+}
+
 bool IsGenericRequest(const char* family)
 {
     static constexpr const char* kGenerics[] = {
@@ -631,6 +655,25 @@ bool ReplaceFamily(FcPattern* pattern, const char* with)
     return true;
 }
 
+// Whether HideFromChromium already renamed this request. The rename alone is
+// not enough to make the match fail: SkFontConfigInterfaceDirect::MatchFont
+// also accepts a result whose family equals the family originally requested,
+// and the configuration's default answer for a name nothing matches can be
+// exactly the hidden family that was asked for. A hidden request is answered with no
+// fonts at all instead, which is what Windows says about a family it does
+// not have.
+bool HiddenRequest(FcPattern* pattern)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    if (get_string == nullptr || pattern == nullptr) {
+        return false;
+    }
+    FcChar8* first = nullptr;
+    return get_string(pattern, "family", 0, &first) == kFcResultMatch &&
+           first != nullptr &&
+           std::strcmp(reinterpret_cast<const char*>(first), kNoSuchFamily) == 0;
+}
+
 bool HideFromChromium(FcPattern* pattern)
 {
     static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
@@ -646,10 +689,28 @@ bool HideFromChromium(FcPattern* pattern)
         (void)ReplaceFamily(pattern, kWindowsCursive);
         return false;
     }
-    if (IsGenericRequest(name) || ShipsWithWindows(name)) {
+    // A generic keyword arriving as a family name is a quoted one. Blink
+    // resolves a real generic through GenericFontFamilySettings before the
+    // request reaches fontconfig, so "serif" is already Times New Roman here;
+    // a literal "fantasy" is a family name no Windows font collection has,
+    // and fontconfig's own aliases would otherwise answer it with Impact.
+    if (ShipsWithWindows(name)) {
         return false;
     }
     return ReplaceFamily(pattern, kNoSuchFamily);
+}
+
+// A sentinel pattern whose requested family is a generic keyword, meaning the
+// author quoted it.
+bool QuotedGenericSentinel(const FcPattern* pattern)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    if (get_string == nullptr || pattern == nullptr || !HasGeckoSentinel(pattern)) {
+        return false;
+    }
+    FcChar8* first = nullptr;
+    return get_string(pattern, "family", 0, &first) == kFcResultMatch &&
+           first != nullptr && IsGenericRequest(reinterpret_cast<const char*>(first));
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -662,6 +723,16 @@ FcBool FcConfigSubstitute(FcConfig* config, FcPattern* pattern, const int kind)
     if (chromium_patch::ParityWanted() && kind == kFcMatchPattern &&
         HideFromChromium(pattern)) {
         return real(config, pattern, kind);
+    }
+    // Gecko reads the substitution list this call returns and collects the
+    // families in it up to the terminator. Left unexpanded, the quoted word is
+    // the only entry, no family answers to it, and Gecko moves on to the next
+    // name in the author's list, which is what Windows does with a family it
+    // does not ship. Expanded, fontconfig's own aliases answer "fantasy" with
+    // Impact and "cursive" with Comic Sans MS, and Gecko takes that as a
+    // match.
+    if (Answering() && kind == kFcMatchPattern && QuotedGenericSentinel(pattern)) {
+        return 1;
     }
     if (!Answering() || kind != kFcMatchPattern) {
         return real(config, pattern, kind);
@@ -686,19 +757,76 @@ FcBool FcConfigSubstitute(FcConfig* config, FcPattern* pattern, const int kind)
     return ok;
 }
 
+// Whether the running call was made by fontconfig itself. Its public entry
+// points call one another through the PLT, so an interposed function is
+// reached from inside the library too, and a result it is still reading must
+// go back untouched.
+thread_local unsigned g_inside_fontconfig = 0;
+
+// A sort reduced in place to the faces Windows ships. The per-character
+// fallback query carries a charset and no family, so fontconfig offers
+// whatever installed face covers the character, and a face Windows does not
+// have must not be offered. The set object itself goes back to the caller
+// untouched apart from the shorter list, since its consumers hold pointers
+// into it; the dropped patterns lose the reference the sort gave them. A
+// character only the dropped faces covered draws the same missing-glyph box
+// it draws on Windows.
+void WindowsOnlyPrune(FcFontSet* sorted)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    static auto destroy = Next<FcPatternDestroyFn>("FcPatternDestroy");
+    if (get_string == nullptr || destroy == nullptr || sorted == nullptr) {
+        return;
+    }
+    auto* view = reinterpret_cast<FontSetLayout*>(sorted);
+    if (view->fonts == nullptr) {
+        return;
+    }
+    int kept = 0;
+    for (int i = 0; i < view->nfont; ++i) {
+        FcPattern* face = view->fonts[i];
+        bool windows = false;
+        for (int n = 0; !windows; ++n) {
+            FcChar8* family = nullptr;
+            if (get_string(face, "family", n, &family) != kFcResultMatch ||
+                family == nullptr) {
+                break;
+            }
+            windows = ShipsWithWindows(reinterpret_cast<const char*>(family));
+        }
+        if (windows) {
+            view->fonts[kept++] = face;
+        } else {
+            destroy(face);
+        }
+    }
+    view->nfont = kept;
+}
+
 extern "C" __attribute__((visibility("default")))
 FcFontSet* FcFontSort(FcConfig* config, FcPattern* pattern, const FcBool trim,
                       FcCharSet** csp, FcResult* result)
 {
     static auto real = Next<FcFontSortFn>("FcFontSort");
     static auto destroy = Next<FcPatternDestroyFn>("FcPatternDestroy");
+    static auto create_set = Next<FcFontSetCreateFn>("FcFontSetCreate");
     if (real == nullptr) {
         return nullptr;
+    }
+    if (chromium_patch::ParityWanted() && create_set != nullptr &&
+        HiddenRequest(pattern)) {
+        if (result != nullptr) {
+            *result = kFcResultNoMatch;
+        }
+        return create_set();
     }
     FcPattern* copy = Answering() ? WindowsPattern(pattern) : nullptr;
     FcFontSet* set = real(config, copy != nullptr ? copy : pattern, trim, csp, result);
     if (copy != nullptr && destroy != nullptr) {
         destroy(copy);
+    }
+    if (chromium_patch::ParityWanted() && g_inside_fontconfig == 0) {
+        WindowsOnlyPrune(set);
     }
     // The Chromium half watches the result to learn which family carries which
     // charset. It substitutes nothing, so it runs after the sort either way.
@@ -716,8 +844,18 @@ FcPattern* FcFontMatch(FcConfig* config, FcPattern* pattern, FcResult* result)
     if (real == nullptr) {
         return nullptr;
     }
+    if (chromium_patch::ParityWanted() && HiddenRequest(pattern)) {
+        if (result != nullptr) {
+            *result = kFcResultNoMatch;
+        }
+        return nullptr;
+    }
     FcPattern* copy = Answering() ? WindowsPattern(pattern) : nullptr;
+    // FcFontMatch reaches the public FcFontSort through the PLT, so the sort
+    // this library filters must not be the one FcFontMatch is still reading.
+    ++g_inside_fontconfig;
     FcPattern* matched = real(config, copy != nullptr ? copy : pattern, result);
+    --g_inside_fontconfig;
     if (copy != nullptr && destroy != nullptr) {
         destroy(copy);
     }
