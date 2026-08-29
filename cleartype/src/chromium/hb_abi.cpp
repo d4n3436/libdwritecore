@@ -214,7 +214,7 @@ namespace {
 // Whether the main executable's own dynamic symbol table names `symbol` as an
 // import. dlsym cannot answer: this library exports the HarfBuzz entry points
 // it interposes, so the global scope always has them.
-bool ExecutableImports(const char* symbol)
+bool ImageImports(const char* symbol)
 {
     struct Ask
     {
@@ -238,6 +238,7 @@ bool ExecutableImports(const char* symbol)
                 const char* strtab = nullptr;
                 const ElfW(Sym)* symtab = nullptr;
                 const uint32_t* hash = nullptr;
+                const uint32_t* gnu_hash = nullptr;
                 for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
                     if (d->d_tag == DT_STRTAB) {
                         strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
@@ -245,16 +246,29 @@ bool ExecutableImports(const char* symbol)
                         symtab = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr);
                     } else if (d->d_tag == DT_HASH) {
                         hash = reinterpret_cast<const uint32_t*>(d->d_un.d_ptr);
+                    } else if (d->d_tag == DT_GNU_HASH) {
+                        gnu_hash = reinterpret_cast<const uint32_t*>(d->d_un.d_ptr);
                     }
                 }
-                // DT_HASH's second word is nchain, which is the symbol count.
-                // Without it there is no bound: the tables are not required to
-                // be adjacent, so walking to the string table reads past the
-                // end and faults.
-                if (strtab == nullptr || symtab == nullptr || hash == nullptr) {
+                if (strtab == nullptr || symtab == nullptr) {
                     continue;
                 }
-                const ElfW(Sym)* end = symtab + hash[1];
+                // A bound is required: the tables are not promised to be
+                // adjacent, so walking to the string table reads past the end
+                // and faults. DT_HASH's second word is the symbol count.
+                // DT_GNU_HASH, which is all a linker emits by default now,
+                // hashes only the defined symbols and its second word is the
+                // index the first of them sits at, so every import is below
+                // that, which is the whole range this asks about.
+                unsigned bound = 0;
+                if (hash != nullptr) {
+                    bound = hash[1];
+                } else if (gnu_hash != nullptr) {
+                    bound = gnu_hash[1];
+                } else {
+                    continue;
+                }
+                const ElfW(Sym)* end = symtab + bound;
                 for (const ElfW(Sym)* sym = symtab; sym < end; ++sym) {
                     if (sym->st_shndx == SHN_UNDEF && sym->st_name != 0 &&
                         std::strcmp(strtab + sym->st_name, a->symbol) == 0) {
@@ -317,7 +331,7 @@ void ResolveAtLoad()
     // interposing for one of those reaches none of Blink's shaping while
     // handing this library hb_font_t objects from a HarfBuzz whose layout it
     // never probed.
-    if (!as_static && ExecutableImports(kWitness) &&
+    if (!as_static && ImageImports(kWitness) &&
         (dlsym(RTLD_NEXT, kWitness) != nullptr ||
          (Beside() != nullptr && dlsym(Beside(), kWitness) != nullptr))) {
         g_where = Linkage::kInterposable;
@@ -341,6 +355,11 @@ void ResolveAtLoad()
     Say("HarfBuzz is compiled into the binary and stripped of its names, so "
         "shaping cannot be reached; a bold fallback run keeps the regular "
         "face's positioning");
+}
+
+bool ExecutableImports(const char* symbol)
+{
+    return ImageImports(symbol);
 }
 
 Linkage Where()

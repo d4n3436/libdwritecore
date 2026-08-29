@@ -76,6 +76,15 @@
        straight through. See src/chromium/generic_families.cpp. */
     mmap;
     mmap64;
+
+    /* Not FreeType: a build that compiled fontconfig in has no symbol to
+       interpose, so the fallback order is imposed through the configuration
+       that fontconfig reads. Every path but its own config file passes
+       straight through. See src/chromium/static_fontconfig.cpp. */
+    open;
+    open64;
+    openat;
+    openat64;
   local:
     *;
 };

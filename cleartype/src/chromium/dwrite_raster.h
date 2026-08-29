@@ -40,6 +40,20 @@ struct VariationCoord
 // means from the library's constructor, in the zygote.
 bool Preload();
 
+// Whether the system font collection has this family, and which of the code
+// points it covers. `points` and `covers` are parallel arrays of `count`
+// entries. False when the collection has no such family, leaving `covers`
+// untouched. The answer comes from the same collection the raster path draws
+// through, so a family the host has and this library cannot see counts as
+// absent, which is what the raster path would do with it anyway.
+bool FamilyCoverage(const char* family, const unsigned* points, unsigned count,
+                    bool* covers);
+
+// The directory holding the file this family's regular face comes from.
+// Written to `out` with a terminator, no trailing separator. False when the
+// collection has no such family or the face is not backed by a local file.
+bool FamilyDirectory(const char* family, char* out, size_t size);
+
 // Whether a factory could be built. Called lazily, after the fork, in the
 // process that will actually rasterize.
 bool Available();

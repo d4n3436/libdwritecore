@@ -26,6 +26,7 @@ add_library(cleartype SHARED
   src/chromium/bold_shaping.cpp
   src/chromium/hb_abi.cpp
   src/chromium/generic_families.cpp
+  src/chromium/static_fontconfig.cpp
   src/chromium/hook_thunk.S)
 
 # OFF leaves the parity paths out altogether, for a plain FreeType-to-

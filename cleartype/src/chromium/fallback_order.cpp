@@ -614,6 +614,19 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
 
 namespace fallback_order {
 
+// The script table, for a caller that has to state the order up front.
+// ScriptRow and ScriptFonts are the same shape; the header declares the one
+// the callers see so they need nothing else out of this file.
+const ScriptRow* Scripts(unsigned* count)
+{
+    static_assert(sizeof(ScriptRow) == sizeof(ScriptFonts),
+                  "the exported row must match the table's own");
+    if (count != nullptr) {
+        *count = static_cast<unsigned>(sizeof(kScripts) / sizeof(kScripts[0]));
+    }
+    return reinterpret_cast<const ScriptRow*>(kScripts);
+}
+
 // Called from cleartype/src/fontconfig.cpp's FcFontSort, on the set the real
 // one returned. Both halves of this library wanted that symbol and only one
 // can define it, so the Firefox side keeps the interposer and hands the

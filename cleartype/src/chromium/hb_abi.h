@@ -131,6 +131,12 @@ void* Real(const char* name);
 // the address has to come from the image instead.
 std::unordered_map<std::string, void*> SymbolsWithPrefix(const char* prefix);
 
+// Whether the main executable imports this symbol. Reads the executable's own
+// dynamic symbols, so it answers what that image was linked against and not
+// what the global scope happens to hold. Not about HarfBuzz, but the ELF walk
+// it needs is already here.
+bool ExecutableImports(const char* symbol);
+
 }  // namespace hb_abi
 
 #endif  // CHROMIUM_HB_ABI_H_INCLUDED

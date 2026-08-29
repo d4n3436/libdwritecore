@@ -393,6 +393,133 @@ bool Preload()
     return PreloadLibrary();
 }
 
+// The regular face of a family in the system collection, or null. The caller
+// releases it.
+IDWriteFont* RegularFace(IDWriteFontCollection* collection, const char* family)
+{
+    // The family names in the tables are ASCII, so widening a byte at a time
+    // is the whole conversion.
+    std::u16string wide;
+    for (const char* p = family; *p != '\0'; ++p) {
+        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+    }
+    UINT32 index = 0;
+    BOOL exists = FALSE;
+    IDWriteFontFamily* group = nullptr;
+    IDWriteFont* font = nullptr;
+    if (SUCCEEDED(collection->FindFamilyName(wide.c_str(), &index, &exists)) && exists &&
+        SUCCEEDED(collection->GetFontFamily(index, &group)) && group != nullptr) {
+        if (FAILED(group->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL,
+                                               DWRITE_FONT_STRETCH_NORMAL,
+                                               DWRITE_FONT_STYLE_NORMAL, &font))) {
+            font = nullptr;
+        }
+    }
+    if (group != nullptr) {
+        group->Release();
+    }
+    return font;
+}
+
+bool FamilyCoverage(const char* family, const unsigned* points, const unsigned count,
+                    bool* covers)
+{
+    if (family == nullptr || points == nullptr || covers == nullptr) {
+        return false;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontCollection* collection = nullptr;
+    if (FAILED(g_dw.factory5->GetSystemFontCollection(&collection, FALSE)) ||
+        collection == nullptr) {
+        return false;
+    }
+    IDWriteFont* font = RegularFace(collection, family);
+    if (font != nullptr) {
+        for (unsigned i = 0; i < count; ++i) {
+            BOOL has = FALSE;
+            covers[i] = SUCCEEDED(font->HasCharacter(points[i], &has)) && has;
+        }
+        font->Release();
+    }
+    collection->Release();
+    return font != nullptr;
+}
+
+bool FamilyDirectory(const char* family, char* out, const size_t size)
+{
+    if (family == nullptr || out == nullptr || size == 0) {
+        return false;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontCollection* collection = nullptr;
+    if (FAILED(g_dw.factory5->GetSystemFontCollection(&collection, FALSE)) ||
+        collection == nullptr) {
+        return false;
+    }
+
+    bool done = false;
+    IDWriteFont* font = RegularFace(collection, family);
+    IDWriteFontFace* face = nullptr;
+    if (font != nullptr && SUCCEEDED(font->CreateFontFace(&face)) && face != nullptr) {
+        UINT32 files = 1;
+        IDWriteFontFile* file = nullptr;
+        if (SUCCEEDED(face->GetFiles(&files, &file)) && files == 1 && file != nullptr) {
+            const void* key = nullptr;
+            UINT32 key_size = 0;
+            IDWriteFontFileLoader* loader = nullptr;
+            IDWriteLocalFontFileLoader* local = nullptr;
+            if (SUCCEEDED(file->GetReferenceKey(&key, &key_size)) &&
+                SUCCEEDED(file->GetLoader(&loader)) && loader != nullptr &&
+                SUCCEEDED(loader->QueryInterface(__uuidof(IDWriteLocalFontFileLoader),
+                                                 reinterpret_cast<void**>(&local))) &&
+                local != nullptr) {
+                UINT32 length = 0;
+                if (SUCCEEDED(local->GetFilePathLengthFromKey(key, key_size, &length)) &&
+                    length > 0) {
+                    std::u16string path(length + 1, u'\0');
+                    if (SUCCEEDED(local->GetFilePathFromKey(key, key_size, path.data(),
+                                                            length + 1))) {
+                        std::string narrow;
+                        for (const char16_t ch : path) {
+                            if (ch == u'\0') {
+                                break;
+                            }
+                            narrow.push_back(static_cast<char>(ch));
+                        }
+                        const size_t cut = narrow.rfind('/');
+                        if (cut != std::string::npos && cut > 0 && cut < size) {
+                            std::memcpy(out, narrow.data(), cut);
+                            out[cut] = '\0';
+                            done = true;
+                        }
+                    }
+                }
+            }
+            if (local != nullptr) {
+                local->Release();
+            }
+            if (loader != nullptr) {
+                loader->Release();
+            }
+            file->Release();
+        }
+    }
+    if (face != nullptr) {
+        face->Release();
+    }
+    if (font != nullptr) {
+        font->Release();
+    }
+    collection->Release();
+    return done;
+}
+
 bool Available()
 {
     const std::lock_guard lock(g_mutex);
