@@ -49,6 +49,7 @@ struct Image
 {
     std::string path;
     uintptr_t bias;
+    bool main;
 };
 
 // This library's own load address. It exports the very names being looked up,
@@ -72,8 +73,9 @@ int Note(dl_phdr_info* info, size_t, void* out)
     }
     // The main executable comes through with an empty name.
     const char* name = info->dlpi_name;
-    images->push_back({name != nullptr && name[0] != '\0' ? name : "/proc/self/exe",
-                       static_cast<uintptr_t>(info->dlpi_addr)});
+    const bool main_image = name == nullptr || name[0] == '\0';
+    images->push_back({main_image ? "/proc/self/exe" : name,
+                       static_cast<uintptr_t>(info->dlpi_addr), main_image});
     return 0;
 }
 
@@ -181,21 +183,91 @@ void ReadImage(const Image& image, const char* prefix, const size_t prefix_len, 
 // Every defined function in the process's own images whose name starts with
 // prefix, as name -> runtime address. The first definition of a name wins,
 // which is the one the loader would have bound to.
-Table Collect(const char* prefix)
+Table Collect(const char* prefix, const bool main_only)
 {
     Table out;
     std::vector<Image> images;
     dl_iterate_phdr(&Note, &images);
     const size_t prefix_len = std::strlen(prefix);
     for (const Image& image : images) {
+        if (main_only && !image.main) {
+            continue;
+        }
         ReadImage(image, prefix, prefix_len, &out);
     }
     return out;
 }
 
+}  // namespace
+
+std::unordered_map<std::string, void*> SymbolsWithPrefix(const char* prefix)
+{
+    return Collect(prefix, false);
+}
+
+namespace {
+
 //----------------------------------------------------------------------------
 // Which case this build is.
 //----------------------------------------------------------------------------
+
+// Whether the main executable's own dynamic symbol table names `symbol` as an
+// import. dlsym cannot answer: this library exports the HarfBuzz entry points
+// it interposes, so the global scope always has them.
+bool ExecutableImports(const char* symbol)
+{
+    struct Ask
+    {
+        const char* symbol;
+        bool found;
+    } ask{symbol, false};
+
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, size_t, void* data) {
+            // The main image is the one with an empty name.
+            if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
+                return 0;
+            }
+            auto* a = static_cast<Ask*>(data);
+            for (int i = 0; i < info->dlpi_phnum; ++i) {
+                if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) {
+                    continue;
+                }
+                const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                    info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+                const char* strtab = nullptr;
+                const ElfW(Sym)* symtab = nullptr;
+                const uint32_t* hash = nullptr;
+                for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+                    if (d->d_tag == DT_STRTAB) {
+                        strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
+                    } else if (d->d_tag == DT_SYMTAB) {
+                        symtab = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr);
+                    } else if (d->d_tag == DT_HASH) {
+                        hash = reinterpret_cast<const uint32_t*>(d->d_un.d_ptr);
+                    }
+                }
+                // DT_HASH's second word is nchain, which is the symbol count.
+                // Without it there is no bound: the tables are not required to
+                // be adjacent, so walking to the string table reads past the
+                // end and faults.
+                if (strtab == nullptr || symtab == nullptr || hash == nullptr) {
+                    continue;
+                }
+                const ElfW(Sym)* end = symtab + hash[1];
+                for (const ElfW(Sym)* sym = symtab; sym < end; ++sym) {
+                    if (sym->st_shndx == SHN_UNDEF && sym->st_name != 0 &&
+                        std::strcmp(strtab + sym->st_name, a->symbol) == 0) {
+                        a->found = true;
+                        return 1;
+                    }
+                }
+            }
+            return 1;
+        },
+        &ask);
+    return ask.found;
+}
 
 // A build either has HarfBuzz or does not, so one name settles the question
 // and nothing else is looked up until it is found.
@@ -235,20 +307,29 @@ void ResolveAtLoad()
     }
     g_resolved = true;
 
-    // Treating a shared HarfBuzz as a compiled-in one runs the replacement on
-    // a build whose shaping can be compared against the interposed route.
-    // Everything but Blink's own call site is the same either way.
+    // Forces the compiled-in route on a build that links HarfBuzz shared,
+    // which exercises the replacement against the interposed one. Only Blink's
+    // call site differs between them.
     const bool as_static = std::getenv("DWC_BOLD_SHAPING_STATIC") != nullptr;
 
-    if (!as_static && (dlsym(RTLD_NEXT, kWitness) != nullptr ||
-                       (Beside() != nullptr && dlsym(Beside(), kWitness) != nullptr))) {
+    // The executable's own imports decide this, not the global scope. Other
+    // libraries in the process carry HarfBuzz for their own drawing, and
+    // interposing for one of those reaches none of Blink's shaping while
+    // handing this library hb_font_t objects from a HarfBuzz whose layout it
+    // never probed.
+    if (!as_static && ExecutableImports(kWitness) &&
+        (dlsym(RTLD_NEXT, kWitness) != nullptr ||
+         (Beside() != nullptr && dlsym(Beside(), kWitness) != nullptr))) {
         g_where = Linkage::kInterposable;
         Say("HarfBuzz is a shared library, so the interposed entry points are "
             "the ones Blink calls");
         return;
     }
 
-    Symbols() = Collect("hb_");
+    // The main image alone. A HarfBuzz loaded beside the executable names the
+    // same symbols, and detouring one of those patches a copy Blink never
+    // calls.
+    Symbols() = Collect("hb_", true);
     if (Symbols().count(kWitness) != 0) {
         g_where = Linkage::kInImage;
         Say("HarfBuzz is compiled into the binary and its symbol table names "

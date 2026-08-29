@@ -26,6 +26,7 @@
 #include <dlfcn.h>
 
 #include "family_match.h"
+#include "hb_abi.h"
 #include "parity_gate.h"
 
 namespace {
@@ -41,10 +42,18 @@ struct FcFontSet
 using PatternGetStringFn = int (*)(const void*, const char*, int, unsigned char**);
 using PatternGetIntegerFn = int (*)(const void*, const char*, int, int*);
 
+// RTLD_NEXT first, which is what answers when the build links fontconfig as a
+// shared library. A build that compiled it in binds nothing to a preloaded
+// export, so the address comes from the image instead.
 template <typename T>
 T Sym(const char* name)
 {
-    return reinterpret_cast<T>(dlsym(RTLD_NEXT, name));
+    if (void* p = dlsym(RTLD_NEXT, name); p != nullptr) {
+        return reinterpret_cast<T>(p);
+    }
+    static const auto in_image = hb_abi::SymbolsWithPrefix("Fc");
+    const auto found = in_image.find(name);
+    return found != in_image.end() ? reinterpret_cast<T>(found->second) : nullptr;
 }
 
 // A weight on each scale, as the two tables in SkFontConfigInterface_direct.cpp

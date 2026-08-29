@@ -30,6 +30,13 @@
 // carry a substituted face.
 const std::vector<uint8_t>* ChromiumFontBytes(void* typeface);
 
+// The variation coordinates the typeface was cloned with, read once beside
+// the bytes, or null for a static face. The pointee lives as long as the
+// typeface entry.
+namespace dwrite_raster { struct VariationCoord; }
+const std::vector<dwrite_raster::VariationCoord>* ChromiumVariationCoords(
+    const void* typeface);
+
 namespace bold_shaping {
 
 // Work out how this build links HarfBuzz and install the swap the way that

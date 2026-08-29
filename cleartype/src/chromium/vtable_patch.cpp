@@ -477,6 +477,12 @@ void ForEachBranch(const Image& image, F&& visit)
 // vtable slot 9 throughout once the two header words are counted out.
 constexpr unsigned kFilterRecSlot = 9;
 
+// How far ahead of the runner-up the winning vtable must be for the shape
+// test to identify the typeface instead of merely breaking a tie. A build
+// that compiles Fontations in holds several tables of the right shape and
+// only one of them rasterizes.
+constexpr int kRasterCallsAhead = 2;
+
 // Walk from any known slot of a vtable back to its first virtual, by looking
 // for the two zero words every -fno-rtti vtable begins with.
 void** VtableBaseFrom(const Image& image, void** known_slot)
@@ -497,6 +503,8 @@ void** VtableBaseFrom(const Image& image, void** known_slot)
     return nullptr;
 }
 
+void FindVariationSlot(void** base, void** data_slot);
+
 // Install the rec filter on the Fontations typeface's own vtable. The proxy
 // typeface Linux actually hands to a scaler context forwards onFilterRec to
 // this one (SkTypeface_proxy::onFilterRec is
@@ -507,6 +515,7 @@ void** VtableBaseFrom(const Image& image, void** known_slot)
 // params, and the table read that hides VDMX.
 void PatchTypefaceSlots(void** base, void** data_slot)
 {
+    FindVariationSlot(base, data_slot);
     if (void** slot = base + kFilterRecSlot; InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
         g_original_filter_rec = *slot;
         if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
@@ -1252,6 +1261,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     void** chosen_slot = nullptr;
     uintptr_t chosen_fn = 0;
     int best_raster = -1;
+    int second_raster = -1;
 
     for (const uintptr_t* p = relro; p + kScalerContextVirtuals + 1 <= relro_end; ++p) {
         // The two words before slot 0 are offset-to-top and typeinfo.
@@ -1303,10 +1313,13 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
         }
         ++found;
         if (raster > best_raster) {
+            second_raster = best_raster;
             best_raster = raster;
             chosen_fn = slots[kGenerateImageSlot];
             chosen_slot = const_cast<void**>(
                 reinterpret_cast<void* const*>(p + kGenerateImageSlot));
+        } else if (raster > second_raster) {
+            second_raster = raster;
         }
     }
 
@@ -1330,6 +1343,16 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
                 PatchFilterRecByColrTag(image, map, colr, 0);
             }
         }
+        return;
+    }
+    // More than one candidate means the shape test did not identify the
+    // typeface, and patching the wrong vtable corrupts a table the browser
+    // dispatches through. A tie is refused, the same way InstallRecFilter
+    // refuses when onGetTableTags is in more than one table.
+    if (found > 1 && best_raster - second_raster < kRasterCallsAhead) {
+        Report("%s: %u vtables matched and none is clearly the scaler "
+               "context's (best %d, runner-up %d rasterization-only calls); "
+               "leaving them alone", path, found, best_raster, second_raster);
         return;
     }
     if (found > 1) {
@@ -1648,6 +1671,12 @@ void ScanLoadedImages()
         // function whichever scaler it was built with. Looking more widely
         // would reach fontconfig's own copies of the same property names.
         //
+        // A build that compiles fontconfig in holds those copies in the main
+        // executable too. The scan still identifies the target, because it
+        // requires one function to read all six property names and the
+        // runner-up to read fewer; on such a build the runner-up reads one,
+        // the same margin a dynamically linked one gives.
+        //
         // No Fontations symbols are required here. This patch names its target
         // by the properties it reads and refuses when no single function reads
         // them all, so it applies to any Chromium build.
@@ -1700,6 +1729,90 @@ void ScanLoadedImages()
 // answers are then only re-derived when the size changes.
 std::mutex g_font_mutex;
 std::unordered_map<const void*, std::vector<uint8_t>> g_fonts;
+std::unordered_map<const void*, std::vector<dwrite_raster::VariationCoord>> g_var_coords;
+
+// onGetVariationDesignPosition, called through each typeface's own vtable so
+// the proxy typeface Linux hands out forwards to the face behind it. The
+// SkSpan parameter is a pointer and a count in registers, and an empty span
+// asks for the count alone.
+using VariationPositionFn = int (*)(const void*, dwrite_raster::VariationCoord*, size_t);
+
+// Where it sits relative to onGetTableTags. SkTypeface declares thirteen
+// virtuals between the two: onGetVariationDesignParameters, the two synthetic
+// style queries, onGetFontDescriptor, onCharsToGlyphs, onCountGlyphs,
+// onGetUPEM, onGetKerningPairAdjustments, onGetFamilyName,
+// onGetPostScriptName, onGetResourceName and onCreateFamilyNameIterator.
+constexpr unsigned kTableTagsToVariationPosition = 13;
+
+// The slot to dispatch on. Slots here are counted the way an object's vptr
+// indexes them, so the same number reaches it through any typeface.
+std::atomic<unsigned> g_variation_index{0};
+
+void FindVariationSlot(void** base, void** data_slot)
+{
+    if (g_variation_index.load(std::memory_order_relaxed) != 0 || data_slot == nullptr) {
+        return;
+    }
+    void* bridge = dlsym(RTLD_DEFAULT,
+                         "fontations_ffi$cxxbridge1$194$variation_position");
+    if (bridge == nullptr) {
+        return;
+    }
+    const auto tags = static_cast<size_t>(data_slot - 1 - base);
+    if (tags <= kTableTagsToVariationPosition) {
+        return;
+    }
+    const size_t slot = tags - kTableTagsToVariationPosition;
+
+    // Confirm the slot before dispatching on it. The wrapper reaches the one
+    // bridge export that answers the axis position, within its own prologue.
+    // onMakeClone reaches the same export, so a scan that took the first slot
+    // matching would answer with that instead.
+    const auto fn = reinterpret_cast<uintptr_t>(base[slot]);
+    if (!InText(g_image, fn)) {
+        return;
+    }
+    const auto* at = reinterpret_cast<const unsigned char*>(fn);
+    for (unsigned off = 0; off + 5 <= 0x60; ++off) {
+        // A call or a tail jump; a wrapper this thin ends in the latter.
+        if (at[off] != 0xE8 && at[off] != 0xE9) {
+            continue;
+        }
+        int32_t rel = 0;
+        std::memcpy(&rel, at + off + 1, sizeof(rel));
+        if (fn + off + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel)) ==
+            reinterpret_cast<uintptr_t>(bridge)) {
+            g_variation_index.store(static_cast<unsigned>(slot),
+                                    std::memory_order_relaxed);
+            Report("onGetVariationDesignPosition is slot %zu", slot);
+            return;
+        }
+    }
+    Report("slot %zu does not answer the axis position, so variable font "
+           "instances will draw at their default", slot);
+}
+
+// Read under g_font_mutex, beside the bytes, so the coords and the font they
+// vary always answer together.
+void ReadVariationCoords(void* typeface)
+{
+    const unsigned index = g_variation_index.load(std::memory_order_relaxed);
+    if (index == 0 || g_var_coords.contains(typeface)) {
+        return;
+    }
+    const auto fn = reinterpret_cast<VariationPositionFn>(
+        (*reinterpret_cast<void***>(typeface))[index]);
+    const int count = fn(typeface, nullptr, 0);
+    if (count <= 0 || count > 64) {
+        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+        return;
+    }
+    std::vector<dwrite_raster::VariationCoord> coords(static_cast<size_t>(count));
+    if (fn(typeface, coords.data(), coords.size()) != count) {
+        coords.clear();
+    }
+    g_var_coords.emplace(typeface, std::move(coords));
+}
 
 // The caches below are keyed on the typeface pointer, which only identifies a
 // font while that address still belongs to the same object. Skia frees
@@ -1731,6 +1844,7 @@ const std::vector<uint8_t>& FontBytesLocked(void* typeface)
         } else {
             Report("typeface %p: rebuilt %zu bytes from its tables", typeface, bytes.size());
         }
+        ReadVariationCoords(typeface);
         font = g_fonts.emplace(typeface, std::move(bytes)).first;
     }
     return font->second;
@@ -1772,6 +1886,17 @@ windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int 
 //
 // The pointer stays good: entries are never erased, and an unordered_map
 // keeps element addresses across a rehash.
+const std::vector<dwrite_raster::VariationCoord>* ChromiumVariationCoords(
+    const void* typeface)
+{
+    const std::lock_guard lock(g_font_mutex);
+    const auto found = g_var_coords.find(typeface);
+    if (found == g_var_coords.end() || found->second.empty()) {
+        return nullptr;
+    }
+    return &found->second;
+}
+
 const std::vector<uint8_t>* ChromiumFontBytes(void* typeface)
 {
     const std::lock_guard lock(g_font_mutex);

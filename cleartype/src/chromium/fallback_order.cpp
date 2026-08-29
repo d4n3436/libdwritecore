@@ -37,6 +37,7 @@
 // ReSharper disable CppUseDesignatedInitializers
 // ReSharper disable CppUseStructuredBinding
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -396,8 +397,58 @@ const char* const* SystemHan(unsigned* count)
 // which is not mirrored here. That language reaches fontconfig only as FC_LANG
 // on the pattern Chromium sorts with, and the charset walk that reads the
 // sorted set carries no language.
+// The Han script the run being laid out asked for, learned from the families
+// Blink sorts. GetFallbackFamily narrows USCRIPT_HAN with the run's own
+// language, and the family it settles on reaches fontconfig as an ordinary
+// sort, so a sort for a family only one Han locale names says which locale
+// that was.
+//
+// Per thread, and cleared on every sort. Blink sorts the family it wants
+// immediately before the lookups that need it, so a learn kept across sorts
+// carries one page's language into the next.
+thread_local const char* const* t_run_han = nullptr;
+thread_local unsigned t_run_han_count = 0;
+
+// A family that belongs to exactly one of the three Han lists, so seeing it
+// sorted for identifies the locale.
+struct HanTell
+{
+    const char* family;
+    const char* const* families;
+    unsigned count;
+};
+
+const HanTell kHanTells[] = {
+    {"Yu Gothic", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+    {"Meiryo", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+    {"MS PGothic", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+    {"Malgun Gothic", kHangul, DWC_COUNT(kHangul)},
+    {"Gulim", kHangul, DWC_COUNT(kHangul)},
+    {"Microsoft JhengHei", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+    {"PMingLiU", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+};
+
+void NoteHanFamily(const char* family)
+{
+    t_run_han = nullptr;
+    t_run_han_count = 0;
+    for (const HanTell& tell : kHanTells) {
+        if (strcasecmp(tell.family, family) == 0) {
+            t_run_han = tell.families;
+            t_run_han_count = tell.count;
+            return;
+        }
+    }
+}
+
 const char* const* HanFamilies(unsigned* count)
 {
+    // What this run asked for, then the system locale, then the list
+    // initializeScriptFontMap seeds when neither says anything.
+    if (const char* const* families = t_run_han) {
+        *count = t_run_han_count;
+        return families;
+    }
     if (const char* const* families = SystemHan(count)) {
         return families;
     }
@@ -525,14 +576,20 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         return answer;          // not a font from a fallback sort
     }
     const FamilyList script = ScriptFor(codepoint);
-    // The first candidate that exists and actually covers this character.
+    // ScriptToFontMap::FirstAvailableFont takes the first installed
+    // candidate without asking whether it covers anything, and memoizes it for
+    // the script. A character the chosen family lacks therefore falls to the
+    // last-resort walk below instead of to the next candidate.
     for (unsigned i = 0; i < script.count; ++i) {
         if (!ShipsWithWindows(script.families[i])) {
             continue;
         }
-        if (const void* candidate = CharSetOfFamily(script.families[i]);
-            candidate == nullptr || real(candidate, codepoint) == 0) {
-            continue;
+        const void* candidate = CharSetOfFamily(script.families[i]);
+        if (candidate == nullptr) {
+            continue;           // not installed, so not what Windows picked
+        }
+        if (real(candidate, codepoint) == 0) {
+            break;              // installed but does not cover it
         }
         return HasFamily(charset, script.families[i]) ? 1 : 0;
     }
@@ -575,6 +632,13 @@ void NoteFontSet(const void* pattern, void* sorted)
     if (get_charset == nullptr || get_string == nullptr) {
         return;
     }
+    // The family this sort asked for, which is what names the Han locale.
+    unsigned char* wanted = nullptr;
+    if (get_string(pattern, "family", 0, &wanted) == kFcResultMatch &&
+        wanted != nullptr) {
+        NoteHanFamily(reinterpret_cast<const char*>(wanted));
+    }
+
     for (int i = 0; i < set->nfont; ++i) {
         void* charset = nullptr;
         if (get_charset(set->fonts[i], "charset", 0, &charset) != kFcResultMatch) {

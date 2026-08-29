@@ -5,6 +5,8 @@
 
 #include "dwrite_raster.h"
 
+#include "bold_shaping.h"
+
 // Skia compares these to zero exactly. A tolerance check would take a
 // different branch than Windows does on the same input.
 #pragma GCC diagnostic ignored "-Wfloat-equal"
@@ -138,6 +140,46 @@ struct KeyHash
     }
 };
 
+// The face at the typeface's own design-space position. A variable font's
+// clone carries its coordinates on the SkTypeface, not in the tables, so a
+// face built from the bytes alone is the default instance. DirectWrite's
+// axis values are the same numbers under a byte-swapped tag.
+IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
+                                 const DWRITE_FONT_SIMULATIONS sims)
+{
+    const std::vector<VariationCoord>* coords = ChromiumVariationCoords(typeface);
+    if (coords == nullptr || face == nullptr) {
+        return face;
+    }
+    IDWriteFontFace5* face5 = nullptr;
+    if (FAILED(face->QueryInterface(__uuidof(IDWriteFontFace5),
+                                    reinterpret_cast<void**>(&face5))) ||
+        face5 == nullptr) {
+        return face;
+    }
+    IDWriteFontResource* resource = nullptr;
+    if (FAILED(face5->GetFontResource(&resource)) || resource == nullptr) {
+        face5->Release();
+        return face;
+    }
+    std::vector<DWRITE_FONT_AXIS_VALUE> values;
+    values.reserve(coords->size());
+    for (const VariationCoord& c : *coords) {
+        values.push_back({static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(c.axis)),
+                          c.value});
+    }
+    IDWriteFontFace5* varied = nullptr;
+    const HRESULT hr = resource->CreateFontFace(
+        sims, values.data(), static_cast<UINT32>(values.size()), &varied);
+    resource->Release();
+    face5->Release();
+    if (FAILED(hr) || varied == nullptr) {
+        return face;
+    }
+    face->Release();
+    return varied;
+}
+
 // One font face per typeface, built from the bytes typeface_bridge rebuilt,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
@@ -171,6 +213,7 @@ IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes
             face = nullptr;
         }
         file->Release();
+        face = ApplyVariations(face, typeface, sims);
     }
     faces[key] = face;
     if (face == nullptr) {

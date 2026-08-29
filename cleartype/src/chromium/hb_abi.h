@@ -61,6 +61,9 @@ struct hb_feature_t
 
 }  // extern "C"
 
+#include <string>
+#include <unordered_map>
+
 namespace hb_abi {
 
 using BlobCreateFn = hb_blob_t* (*)(const char*, unsigned int, hb_memory_mode_t,
@@ -117,6 +120,16 @@ Linkage Where();
 // for hb_shape is the function about to be replaced. Anything that has to
 // defer to HarfBuzz's real behavior goes through hb_shape_full instead.
 void* Real(const char* name);
+
+// Every symbol in the process whose name starts with `prefix`, read from each
+// loaded image's dynamic table and, where a static link kept them out of it,
+// from the symbol table the file holds on disk. Needs the filesystem, so it
+// runs in the zygote.
+//
+// This is how a hook reaches a library the build compiled in: the loader
+// binds nothing to a preloaded export there, so RTLD_NEXT answers null and
+// the address has to come from the image instead.
+std::unordered_map<std::string, void*> SymbolsWithPrefix(const char* prefix);
 
 }  // namespace hb_abi
 

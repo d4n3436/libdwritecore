@@ -10,8 +10,9 @@
 //  both chosen at build time, so a Linux build answers Japanese sans-serif
 //  with Arial where a Windows one answers Yu Gothic.
 //
-//  Values are rewritten in the resource bundle as it is mapped, and the one
-//  table row a Linux build can spare is repointed at a script Windows covers.
+//  Values are rewritten in the resource bundle as it is mapped, and the table
+//  of rows is relocated and extended so scripts this platform leaves out get
+//  the rows Windows has.
 //
 //  fontconfig cannot answer this. A family reaches it already resolved to
 //  "Arial", which is what an author naming Arial sends too.
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -31,7 +33,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "generic_families.h"
 #include "parity_gate.h"
 
 namespace {
@@ -43,53 +44,73 @@ namespace {
 // hides them from fontconfig, so FirstAvailableOrFirst never settles on one,
 // and the remainder fits the space the platform value occupies.
 //
-// pref names which row reads the value, for the table patch below.
+// prefs names the rows that read the value, for the table patch below. One
+// value can serve several rows, since Windows gives its per-script fixed rows
+// the same family.
+constexpr unsigned kMaxPrefsPerValue = 3;
+
 struct Substitution
 {
     const char* platform;
     const char* windows;
-    const char* pref;
+    const char* prefs[kMaxPrefsPerValue];
 };
 
 constexpr Substitution kSubstitutions[] = {
-    {"Latin Modern Math", ",Cambria Math", nullptr},
+    {"Latin Modern Math", ",Cambria Math", {}},
     // Windows swaps the fixed family for IDS_FIXED_FONT_FAMILY_ALT_WIN when the
     // shipped one is Courier and ClearType smoothing is on (font_defaults.cc).
-    {"Monospace", ",Consolas", nullptr},
-    {"Noto Sans Devanagari", ",Nirmala UI", nullptr},
-    {"Noto Serif Devanagari", ",Nirmala UI", nullptr},
+    {"Monospace", ",Consolas", {}},
+    {"Noto Sans Devanagari", ",Nirmala UI", {}},
+    // The fixed rows Windows compiles for Arabic, Cyrillic and Greek all carry
+    // Courier New, so one rewritten resource answers for all three. Blink
+    // keys the map on the element's locale, so Latin text inside such an
+    // element takes it as well.
+    {"Noto Serif Devanagari", ",Courier New",
+     {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
+      "webkit.webprefs.fonts.fixed.Grek"}},
 
     {",Noto Sans JP,Noto Sans CJK JP,Arial", ",Meiryo,Yu Gothic",
-     "webkit.webprefs.fonts.sansserif.Jpan"},
-    {",Noto Sans JP,Noto Sans CJK JP,Times New Roman", ",Meiryo,Yu Gothic",
-     "webkit.webprefs.fonts.standard.Jpan"},
+     {"webkit.webprefs.fonts.sansserif.Jpan"}},
+    // The standard row's resource carries the fixed family instead. Only one
+    // of the two fits, and the fixed family is the one whose absence shows.
+    {",Noto Sans JP,Noto Sans CJK JP,Times New Roman", ",BIZ UDGothic,MS Gothic",
+     {"webkit.webprefs.fonts.fixed.Jpan"}},
     {",Noto Serif JP,Noto Serif CJK JP,Times New Roman", ",Yu Mincho,MS PMincho",
-     "webkit.webprefs.fonts.serif.Jpan"},
+     {"webkit.webprefs.fonts.serif.Jpan"}},
 
     {",Noto Sans KR,Noto Sans CJK KR,Arial", ",Malgun Gothic",
-     "webkit.webprefs.fonts.sansserif.Hang"},
+     {"webkit.webprefs.fonts.sansserif.Hang"}},
     {",Noto Sans KR,Noto Sans CJK KR,Times New Roman", ",Malgun Gothic",
-     "webkit.webprefs.fonts.standard.Hang"},
+     {"webkit.webprefs.fonts.standard.Hang"}},
     {",Noto Serif KR,Noto Serif CJK KR,Times New Roman", ",Batang",
-     "webkit.webprefs.fonts.serif.Hang"},
+     {"webkit.webprefs.fonts.serif.Hang"}},
 
     // Arabic has no sans-serif family on Linux to rewrite, so the Japanese
     // fixed one carries Segoe UI for the row below.
-    {"Noto Sans Mono CJK JP", ",Segoe UI", "webkit.webprefs.fonts.sansserif.Arab"},
+    {"Noto Sans Mono CJK JP", ",Segoe UI", {"webkit.webprefs.fonts.sansserif.Arab"}},
 
     {",Noto Sans SC,Noto Sans CJK SC,Arial", ",Microsoft YaHei",
-     "webkit.webprefs.fonts.sansserif.Hans"},
+     {"webkit.webprefs.fonts.sansserif.Hans"}},
     {",Noto Sans SC,Noto Sans CJK SC,Times New Roman", ",Microsoft YaHei",
-     "webkit.webprefs.fonts.standard.Hans"},
+     {"webkit.webprefs.fonts.standard.Hans"}},
     {",Noto Serif SC,Noto Serif CJK SC,Times New Roman", ",Simsun",
-     "webkit.webprefs.fonts.serif.Hans"},
+     {"webkit.webprefs.fonts.serif.Hans"}},
+
+    // Windows differentiates the fixed family per script too;
+    // IDS_FIXED_FONT_FAMILY_SIMPLIFIED_HAN is NSimsun, and Blink keys the map
+    // on the element's locale, so Latin text inside a zh element takes it as
+    // well. The Devanagari fixed resource carries it, since no table row
+    // reads that one. A list, because a plain name is dropped between the
+    // table and the renderer while the list form resolves to the same face.
+    {"Noto Sans Mono", ",NSimsun", {"webkit.webprefs.fonts.fixed.Hans"}},
 
     {",Noto Sans TC,Noto Sans CJK TC,Arial", ",Microsoft JhengHei",
-     "webkit.webprefs.fonts.sansserif.Hant"},
+     {"webkit.webprefs.fonts.sansserif.Hant"}},
     {",Noto Sans TC,Noto Sans CJK TC,Times New Roman", ",Microsoft JhengHei",
-     "webkit.webprefs.fonts.standard.Hant"},
+     {"webkit.webprefs.fonts.standard.Hant"}},
     {",Noto Serif TC,Noto Serif CJK TC,Times New Roman", ",PMingLiU",
-     "webkit.webprefs.fonts.serif.Hant"},
+     {"webkit.webprefs.fonts.serif.Hant"}},
 };
 
 // Which resource carries each per-script list, learned while patching.
@@ -99,7 +120,8 @@ struct Learned
     uint16_t resource;
 };
 
-constexpr unsigned kLearnedMax = sizeof(kSubstitutions) / sizeof(kSubstitutions[0]);
+constexpr unsigned kLearnedMax =
+    sizeof(kSubstitutions) / sizeof(kSubstitutions[0]) * kMaxPrefsPerValue;
 Learned g_learned[kLearnedMax];
 unsigned g_learned_count = 0;
 
@@ -129,6 +151,9 @@ uint32_t ReadU32(const unsigned char* at)
 
 namespace generic_families {
 
+// Rewrites the generic font family values inside one mapped resource bundle,
+// replacing what this platform ships with what Windows ships. Returns how many
+// were replaced.
 unsigned PatchBundle(void* base, const size_t length)
 {
     auto* bytes = static_cast<unsigned char*>(base);
@@ -167,8 +192,17 @@ unsigned PatchBundle(void* base, const size_t length)
             // FontList::FirstAvailableOrFirst splits on commas and keeps the
             // non-empty pieces, so trailing commas name nothing.
             std::memset(bytes + start + wanted, ',', size - wanted);
-            if (s.pref != nullptr && g_learned_count < kLearnedMax) {
-                g_learned[g_learned_count++] = {s.pref, ReadU16(entry)};
+            if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
+                (void)std::fprintf(stderr,
+                                   "chromium-patch: generic families: resource "
+                                   "%u now %s (%s)\n",
+                                   ReadU16(entry), s.windows,
+                                   s.prefs[0] != nullptr ? s.prefs[0] : "-");
+            }
+            for (const char* pref : s.prefs) {
+                if (pref != nullptr && g_learned_count < kLearnedMax) {
+                    g_learned[g_learned_count++] = {pref, ReadU16(entry)};
+                }
             }
             ++patched;
             break;
@@ -182,60 +216,38 @@ unsigned PatchBundle(void* base, const size_t length)
 namespace {
 
 // Which entries kFontDefaults has is also decided at build time, and a Linux
-// build has only the seven script-less ones (font_defaults.cc). Rows are
-// repointed at scripts Windows covers when losing them costs nothing.
+// build has only the seven script-less ones (font_defaults.cc), so the rest
+// are appended and the loop that reads the table is pointed at the longer one.
 //
-// font_defaults.cc reads a row through FamilyMapByName, which lists cursive,
-// fixed, sansserif, serif and standard, so the fantasy and math rows are read
-// by nothing and are free.
-//
-// standard, serif and sansserif carry a Zyyy value the WebPreferences
-// constructor already holds, so those rows go too, but only once
-// kFontFamilyMap stops blanking the pref, which is safe on a host with no
-// pref registry. Cursive goes the same way: the constructor says Script where
-// Windows says Comic Sans MS, and fontconfig.cpp renames the one to the other
-// when it arrives as a family.
-struct Spare
-{
-    const char* pref;
-    bool blanked;      // whether kFontFamilyMap lists it
+// The rows a Windows build compiles, in kFontDefaults order, less the five
+// whose value no resource in a Linux bundle can be made to carry: fixed.Hang,
+// fixed.Hant and cursive for all three Han scripts.
+constexpr const char* kWindowsRows[] = {
+    "webkit.webprefs.fonts.standard.Jpan",
+    "webkit.webprefs.fonts.fixed.Jpan",
+    "webkit.webprefs.fonts.serif.Jpan",
+    "webkit.webprefs.fonts.sansserif.Jpan",
+    "webkit.webprefs.fonts.standard.Hang",
+    "webkit.webprefs.fonts.serif.Hang",
+    "webkit.webprefs.fonts.sansserif.Hang",
+    "webkit.webprefs.fonts.standard.Hans",
+    "webkit.webprefs.fonts.serif.Hans",
+    "webkit.webprefs.fonts.sansserif.Hans",
+    "webkit.webprefs.fonts.standard.Hant",
+    "webkit.webprefs.fonts.serif.Hant",
+    "webkit.webprefs.fonts.sansserif.Hant",
+    "webkit.webprefs.fonts.sansserif.Arab",
+    "webkit.webprefs.fonts.fixed.Hans",
+    "webkit.webprefs.fonts.fixed.Arab",
+    "webkit.webprefs.fonts.fixed.Cyrl",
+    "webkit.webprefs.fonts.fixed.Grek",
 };
 
-constexpr Spare kSpares[] = {
-    {"webkit.webprefs.fonts.fantasy.Zyyy", false},
-    {"webkit.webprefs.fonts.math.Zyyy", false},
-    {"webkit.webprefs.fonts.standard.Zyyy", true},
-    {"webkit.webprefs.fonts.serif.Zyyy", true},
-    {"webkit.webprefs.fonts.sansserif.Zyyy", true},
-    {"webkit.webprefs.fonts.cursive.Zyyy", true},
-};
-
-// Chrome registers every kFontFamilyMap name in a pref registry and reads them
-// back, so a name this stops the second loop blanking is a name Chrome never
-// registers, and the first read of it ends the process. Electron builds
-// WebPreferences straight from the table and has no registry. Browser prefs
-// only a full PrefService carries tell the two apart.
-constexpr const char* kBrowserPrefs[] = {
-    "bookmark_bar.show_on_all_tabs",
-    "browser.show_home_button",
-};
-
-// The row the array is found by, and what a blanked pref name is pointed at.
-// Its family is not one FamilyMapByName carries, so the second loop skips it.
-constexpr const char* kInertPref = "webkit.webprefs.fonts.fantasy.Zyyy";
+// The row the array is found by. Its value is one no other table holds.
+constexpr const char* kAnchorPref = "webkit.webprefs.fonts.fantasy.Zyyy";
 
 constexpr const char* kPrefPrefix = "webkit.webprefs.fonts.";
 constexpr size_t kRowSize = 16;   // const char* then int, padded
-
-// The rows to hand the spares to, highest value first.
-constexpr const char* kWanted[] = {
-    "webkit.webprefs.fonts.sansserif.Hans",
-    "webkit.webprefs.fonts.sansserif.Arab",
-    "webkit.webprefs.fonts.sansserif.Hang",
-    "webkit.webprefs.fonts.sansserif.Jpan",
-    "webkit.webprefs.fonts.standard.Jpan",
-    "webkit.webprefs.fonts.serif.Hans",
-};
 
 struct Executable
 {
@@ -245,8 +257,9 @@ struct Executable
 
 Executable g_exe{};
 
-// Only the segments that can hold strings and tables. Searching the code as
-// well costs more than the browser's startup can absorb.
+// The segments that can hold strings and tables, and separately the code. A
+// string search stays out of the code, which costs more than the browser's
+// startup can absorb; only the loop bound is looked for there.
 struct Segment
 {
     const unsigned char* begin;
@@ -256,6 +269,10 @@ struct Segment
 constexpr unsigned kMaxSegments = 8;
 Segment g_data[kMaxSegments];
 unsigned g_data_count = 0;
+
+// The code, for the one instruction that bounds the table's read loop.
+Segment g_text[kMaxSegments];
+unsigned g_text_count = 0;
 
 // Both tables hold relocated pointers, so both live in the relro span. Writes
 // are kept inside it: a page outside is one the process may still write, and
@@ -292,8 +309,12 @@ int NoteExecutable(dl_phdr_info* info, size_t, void* data)
             g_relro = {from, from + header.p_memsz};
             continue;
         }
-        if ((header.p_flags & PF_X) == 0 && g_data_count < kMaxSegments) {
-            g_data[g_data_count++] = {from, to};
+        if ((header.p_flags & PF_X) == 0) {
+            if (g_data_count < kMaxSegments) {
+                g_data[g_data_count++] = {from, to};
+            }
+        } else if (g_text_count < kMaxSegments) {
+            g_text[g_text_count++] = {from, to};
         }
     }
     return 1;
@@ -334,73 +355,148 @@ bool InExecutable(const void* p)
     return at >= g_exe.begin && at < g_exe.end;
 }
 
-bool WriteRow(unsigned char* row, const char* pref, const uint16_t resource)
+// The lea that loads a bound of the table, as the loop in
+// MakeDefaultFontCopier reads it:
+//
+//     lea  <first row>(%rip), %r13     the cursor
+//     ...
+//     add  $16, %r13
+//     lea  <past last row>(%rip), %rax
+//     cmp  %rax, %r13
+//
+// How far apart the two leas sit depends on how much of the loop body the
+// compiler put between them, so the span is wide enough for an inlined body.
+// It only narrows the search; the compare after the end lea is what separates
+// the loop from an unrelated pair of leas.
+constexpr unsigned char kLeaOpcode = 0x8d;
+constexpr unsigned char kRipModRm = 0x05;
+constexpr size_t kLeaLength = 7;
+constexpr ptrdiff_t kLoopSpan = 256;
+
+const unsigned char* LeaTarget(const unsigned char* at)
 {
-    auto* page = reinterpret_cast<unsigned char*>(
-        reinterpret_cast<uintptr_t>(row) & ~static_cast<uintptr_t>(0xFFF));
-    const size_t span = static_cast<size_t>(row + kRowSize - page);
-    if (mprotect(page, span, PROT_READ | PROT_WRITE) != 0) {
-        return false;
+    if (at[0] != 0x48 && at[0] != 0x4C && at[0] != 0x49 && at[0] != 0x4D) {
+        return nullptr;
     }
-    std::memcpy(row, &pref, sizeof(pref));
-    const int id = resource;
-    std::memcpy(row + sizeof(pref), &id, sizeof(id));
-    (void)mprotect(page, span, PROT_READ);
-    return true;
+    if (at[1] != kLeaOpcode || (at[2] & 0xC7) != kRipModRm) {
+        return nullptr;
+    }
+    int32_t disp = 0;
+    std::memcpy(&disp, at + 3, sizeof(disp));
+    return at + kLeaLength + disp;
 }
 
-bool WritePointer(unsigned char* at, const char* value)
+bool WriteLeaTarget(unsigned char* at, const unsigned char* target)
 {
+    const ptrdiff_t disp = target - (at + kLeaLength);
+    if (disp > INT32_MAX || disp < INT32_MIN) {
+        return false;
+    }
     auto* page = reinterpret_cast<unsigned char*>(
         reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(0xFFF));
-    const size_t span = static_cast<size_t>(at + sizeof(value) - page);
-    if (mprotect(page, span, PROT_READ | PROT_WRITE) != 0) {
+    const size_t span = static_cast<size_t>(at + kLeaLength - page);
+    if (mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         return false;
     }
-    std::memcpy(at, &value, sizeof(value));
-    (void)mprotect(page, span, PROT_READ);
+    const auto narrowed = static_cast<int32_t>(disp);
+    std::memcpy(at + 3, &narrowed, sizeof(narrowed));
+    (void)mprotect(page, span, PROT_READ | PROT_EXEC);
     return true;
 }
 
-// Whether a slot holds a pointer to a pref name.
-bool HoldsPrefName(const unsigned char* at)
+// Room for the compiled rows and every row this adds.
+constexpr size_t kTableBytes =
+    (sizeof(kWindowsRows) / sizeof(kWindowsRows[0]) + 16) * kRowSize;
+
+// A page for the table, close enough to the code that a lea can reach it. The
+// loop's bounds are RIP-relative with a signed 32-bit displacement, and this
+// library's own data sits far outside that of the executable's text.
+unsigned char* MapBeside(const unsigned char* beside)
 {
-    if (!InExecutable(at) || !InExecutable(at + sizeof(void*) - 1)) {
-        return false;
+    constexpr ptrdiff_t kReach = 0x7000'0000;   // inside 2 GB, with room to spare
+    constexpr uintptr_t kStep = 0x10'0000;
+    const auto at = reinterpret_cast<uintptr_t>(beside);
+    // The kernel treats the address as a hint and places the mapping elsewhere
+    // when it is taken, so each distance is tried on both sides and the
+    // address that came back is checked.
+    for (uintptr_t away = kStep; away < static_cast<uintptr_t>(kReach); away *= 2) {
+        for (const uintptr_t hint : {at + away, at - away}) {
+            void* got = mmap(reinterpret_cast<void*>(hint & ~static_cast<uintptr_t>(0xFFF)),
+                             kTableBytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (got == MAP_FAILED) {
+                continue;
+            }
+            if (const ptrdiff_t gap = static_cast<unsigned char*>(got) - beside;
+                gap < kReach && gap > -kReach) {
+                return static_cast<unsigned char*>(got);
+            }
+            (void)munmap(got, kTableBytes);
+        }
     }
-    const char* name = nullptr;
-    std::memcpy(&name, at, sizeof(name));
-    return InExecutable(name) &&
-           std::strncmp(name, kPrefPrefix, std::strlen(kPrefPrefix)) == 0;
+    return nullptr;
 }
 
-// Whether a slot sits in kFontFamilyMap. That array is one pref name per
-// script per family, so a slot of it lies in a long run of them; the other
-// pref-name arrays in the image are far shorter, and a kFontDefaults row is
-// not a run at all, since it carries a resource id on either side of its name.
-// kFontFamilyMap is grouped by family, one entry per script, so a slot of it
-// has a neighbour naming the same family and a different script. The other
-// pref-name arrays in the image mix families, and a kFontDefaults row has a
-// resource id on either side of its name rather than a name at all.
-bool SharesFamily(const unsigned char* at, const char* pref, const size_t family)
+// Where the loop's end bound was found, so a later pack can move it again
+// without searching the code twice.
+unsigned char* g_loop_end = nullptr;
+
+// Points the loop at a copy of the table. Refuses unless exactly one loop of
+// that shape reads it, leaving a build that inlined the loop twice untouched
+// instead of half patched.
+// Whether a `cmp reg, reg` follows, which is how the loop tests its cursor
+// against the end. REX prefix, 0x39, then a mod=11 modrm.
+bool FollowedByCompare(const unsigned char* at)
 {
-    if (!HoldsPrefName(at)) {
-        return false;
-    }
-    const char* held = nullptr;
-    std::memcpy(&held, at, sizeof(held));
-    return std::strncmp(held, pref, family) == 0 && std::strcmp(held, pref) != 0;
+    return (at[0] & 0xF8) == 0x48 && at[1] == 0x39 && (at[2] & 0xC0) == 0xC0;
 }
 
-bool IsMapSlot(const unsigned char* at, const char* pref)
+bool PointLoopAt(const unsigned char* first, const unsigned char* end,
+                 const unsigned char* table, const unsigned rows)
 {
-    const char* dot = std::strrchr(pref, '.');
-    if (dot == nullptr) {
+    unsigned char* begin_lea = nullptr;
+    unsigned char* end_lea = nullptr;
+    for (unsigned i = 0; i < g_text_count; ++i) {
+        unsigned char* seen = nullptr;
+        for (auto* at = const_cast<unsigned char*>(g_text[i].begin);
+             at + kLeaLength <= g_text[i].end; ++at) {
+            const unsigned char* target = LeaTarget(at);
+            if (target == first) {
+                seen = at;
+                continue;
+            }
+            if (target != end || seen == nullptr || at - seen > kLoopSpan) {
+                continue;
+            }
+            // The end lea is compared against the cursor immediately after
+            // it. Without this test a lea of the table's first row anywhere in
+            // the image pairs with an unrelated lea of its end and the write
+            // lands in code that has nothing to do with the loop.
+            if (!FollowedByCompare(at + kLeaLength)) {
+                continue;
+            }
+            if (end_lea != nullptr) {
+                return false;
+            }
+            begin_lea = seen;
+            end_lea = at;
+        }
+    }
+    if (end_lea == nullptr ||
+        !WriteLeaTarget(begin_lea, table) ||
+        !WriteLeaTarget(end_lea, table + rows * kRowSize)) {
         return false;
     }
-    const size_t family = static_cast<size_t>(dot - pref) + 1;
-    return SharesFamily(at - sizeof(void*), pref, family) ||
-           SharesFamily(at + sizeof(void*), pref, family);
+    g_loop_end = end_lea;
+    return true;
+}
+
+// Moves the end bound alone, for rows added after the loop was repointed.
+void MoveLoopEnd(const unsigned char* end)
+{
+    if (g_loop_end != nullptr) {
+        (void)WriteLeaTarget(g_loop_end, end);
+    }
 }
 
 // Whether a row holds a pointer to a pref name.
@@ -443,48 +539,30 @@ bool IsBrowserProcess()
     return n > 0;
 }
 
-// The second loop in font_defaults.cc's MakeDefaultFontCopier writes an empty
-// family for every pref kFontFamilyMap lists that no row set, which would wipe
-// the constructor value the row being given away was carrying. Pointing that
-// slot at a family FamilyMapByName does not carry leaves the value in place.
-unsigned NeutralizeMapEntry(const char* pref, const char* inert,
-                            const unsigned char* first, const unsigned char* last)
+void Note(const char* what, const char* which)
 {
-    unsigned written = 0;
-    // By content, not by address. kFontFamilyMap builds its names by pasting
-    // literals together, so they are their own objects and not the ones
-    // pref_names.h holds and kFontDefaults points at.
-    for (unsigned i = 0; i < g_data_count; ++i) {
-        for (const unsigned char* at = g_data[i].begin;
-             at + sizeof(void*) <= g_data[i].end; at += sizeof(void*)) {
-            if (at >= first && at <= last) {
-                continue;
-            }
-            const char* held = nullptr;
-            std::memcpy(&held, at, sizeof(held));
-            if (InRelro(at) && HoldsPrefName(at) && std::strcmp(held, pref) == 0 &&
-                IsMapSlot(at, pref) && WritePointer(const_cast<unsigned char*>(at), inert)) {
-                ++written;
-            }
-        }
+    static const bool on = std::getenv("DWC_GENERIC_LOG") != nullptr;
+    if (on) {
+        (void)std::fprintf(stderr, "chromium-patch: generic families: %s %s\n",
+                           what, which);
     }
-    return written;
 }
 
 // Hands the spare rows to the scripts Windows covers that this build does not.
-// Silent when the table cannot be recognized.
+// Runs after every bundle patch, because the resources arrive one pack at a
+// time and a row can only be written once its resource has been seen; a row
+// already written is skipped. Silent when the table cannot be recognized.
+//
+// The compiled array cannot be written past, since another array starts
+// immediately after it. A longer copy is built here instead and the loop that
+// reads the table is pointed at that.
 void PatchFontDefaults()
 {
-    static bool done = false;
-    if (done || g_exe.begin == nullptr) {
-        return;
-    }
-    done = true;
-    if (!IsBrowserProcess()) {
+    if (g_exe.begin == nullptr || !IsBrowserProcess()) {
         return;
     }
 
-    const unsigned char* anchor = FindInData(kInertPref, std::strlen(kInertPref) + 1);
+    const unsigned char* anchor = FindInData(kAnchorPref, std::strlen(kAnchorPref) + 1);
     if (anchor == nullptr) {
         return;
     }
@@ -502,16 +580,28 @@ void PatchFontDefaults()
     while (IsRow(last + kRowSize)) {
         last += kRowSize;
     }
-    bool registry = false;
-    for (const char* pref : kBrowserPrefs) {
-        registry = registry || FindInData(pref, std::strlen(pref) + 1) != nullptr;
+    const unsigned char* end = last + kRowSize;
+
+    // The copy, kept for the process's life since the loop reads it on every
+    // WebPreferences the browser builds. Filled from the compiled array once,
+    // then extended as later resource packs are learned.
+    static unsigned char* table = nullptr;
+    static unsigned rows = 0;
+    static bool pointed = false;
+    if (table == nullptr) {
+        const auto compiled = static_cast<size_t>(end - first);
+        if (compiled == 0 || compiled > kTableBytes) {
+            return;
+        }
+        table = MapBeside(g_exe.end);
+        if (table == nullptr) {
+            return;
+        }
+        std::memcpy(table, first, compiled);
+        rows = static_cast<unsigned>(compiled / kRowSize);
     }
 
-    const auto* inert = reinterpret_cast<const char*>(
-        FindInData(kInertPref, std::strlen(kInertPref) + 1));
-
-    unsigned next_spare = 0;
-    for (const char* wanted : kWanted) {
+    for (const char* wanted : kWindowsRows) {
         const unsigned char* name = FindInData(wanted, std::strlen(wanted) + 1);
         if (name == nullptr) {
             continue;
@@ -520,9 +610,9 @@ void PatchFontDefaults()
         // entries are bare pointers, so a search of the whole image would
         // always report the row as present.
         bool present = false;
-        for (const unsigned char* at = first; at <= last && !present; at += kRowSize) {
+        for (unsigned i = 0; i < rows && !present; ++i) {
             const char* held = nullptr;
-            std::memcpy(&held, at, sizeof(held));
+            std::memcpy(&held, table + i * kRowSize, sizeof(held));
             present = held == reinterpret_cast<const char*>(name);
         }
         if (present) {
@@ -535,40 +625,43 @@ void PatchFontDefaults()
                 break;
             }
         }
-        if (resource == 0) {
+        // A row whose value no resource carries would answer with the family
+        // this platform ships, which is worse than not covering the script.
+        if (resource == 0 || (rows + 1) * kRowSize > kTableBytes) {
             continue;
         }
-        // The next spare row still holding its own pref name, and still safe
-        // to give away.
-        unsigned char* give = nullptr;
-        while (next_spare < sizeof(kSpares) / sizeof(kSpares[0]) && give == nullptr) {
-            const Spare& candidate = kSpares[next_spare++];
-            unsigned char* found = nullptr;
-            for (const unsigned char* at = first; at <= last && found == nullptr;
-                 at += kRowSize) {
-                const char* held = nullptr;
-                std::memcpy(&held, at, sizeof(held));
-                if (held != nullptr && std::strcmp(held, candidate.pref) == 0) {
-                    found = const_cast<unsigned char*>(at);
-                }
-            }
-            if (found == nullptr) {
-                continue;
-            }
-            // While the name is still in the row to be found by. A row whose
-            // pref would go on being blanked stays where it is: losing its
-            // value outright is worse than not covering the script.
-            if (candidate.blanked &&
-                (registry || inert == nullptr ||
-                 NeutralizeMapEntry(candidate.pref, inert, first, last) == 0)) {
-                continue;
-            }
-            give = found;
+        const auto* pref = reinterpret_cast<const char*>(name);
+        unsigned char* at = table + rows * kRowSize;
+        std::memcpy(at, &pref, sizeof(pref));
+        const int id = resource;
+        std::memcpy(at + sizeof(pref), &id, sizeof(id));
+        std::memset(at + sizeof(pref) + sizeof(id), 0,
+                    kRowSize - sizeof(pref) - sizeof(id));
+        ++rows;
+        Note("row written for", wanted);
+    }
+
+    if (!pointed) {
+        pointed = PointLoopAt(first, end, table, rows);
+        if (!pointed) {
+            Note("the loop that reads the table could not be repointed, so the "
+                 "added rows go", "unread");
         }
-        if (give == nullptr) {
-            break;
+    } else {
+        MoveLoopEnd(table + rows * kRowSize);
+    }
+
+    if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
+        for (unsigned i = 0; i < rows; ++i) {
+            const char* held = nullptr;
+            std::memcpy(&held, table + i * kRowSize, sizeof(held));
+            int id = 0;
+            std::memcpy(&id, table + i * kRowSize + sizeof(held), sizeof(id));
+            (void)std::fprintf(stderr,
+                               "chromium-patch: generic families: pid %d row "
+                               "%s -> %d\n",
+                               getpid(), held != nullptr ? held : "?", id);
         }
-        (void)WriteRow(give, reinterpret_cast<const char*>(name), resource);
     }
 }
 
@@ -599,6 +692,10 @@ void* MapAndPatch(const MmapFn real, void* addr, const size_t length, const int 
     if (mapped == MAP_FAILED) {
         return real(addr, length, prot, flags, fd, offset);
     }
+    // One map at a time: PatchBundle appends to the learned list and the row
+    // patch reads it, and two packs can arrive on two threads.
+    static std::mutex patch_mutex;
+    const std::lock_guard<std::mutex> lock(patch_mutex);
     if (generic_families::PatchBundle(mapped, length) > 0) {
         PatchFontDefaults();
     }

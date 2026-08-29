@@ -27,6 +27,15 @@
 
 namespace dwrite_raster {
 
+// One design-space coordinate of a variable font, as
+// SkFontArguments::VariationPosition::Coordinate lays it out.
+struct VariationCoord
+{
+    uint32_t axis = 0;
+    float value = 0;
+};
+
+
 // Map libdwritecore.so. Must be called before the sandbox closes, which
 // means from the library's constructor, in the zygote.
 bool Preload();
