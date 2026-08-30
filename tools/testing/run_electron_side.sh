@@ -177,6 +177,14 @@ env_args=(--unset=WAYLAND_DISPLAY
 sandbox_args=()
 [ "$SANDBOX" = 0 ] && sandbox_args+=(--no-sandbox)
 
+# A browser still holding the port answers for the one about to start, which
+# then fails to bind and is never reached. The pidfile and the mapped library
+# both describe the new process, so nothing downstream catches it.
+if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+    echo "port $PORT is already in use; stop whatever holds it first" >&2
+    exit 1
+fi
+
 setsid nohup env "${env_args[@]}" "$BINARY" \
     --ozone-platform=x11 --disable-backgrounding-occluded-windows \
     "${sandbox_args[@]}" \
@@ -187,7 +195,18 @@ echo $! > "$PIDFILE"
 # Ready when DevTools answers, not after a fixed sleep.
 for _ in $(seq 1 120); do
     if curl -s --max-time 2 "http://127.0.0.1:$PORT/json/version" > /dev/null 2>&1; then
-        echo "electron up on port $PORT (pid $(cat "$PIDFILE"))"
+        # setsid put the browser in its own process group led by the recorded
+        # pid, so the listener has to be in that group to be the one started
+        # here.
+        started="$(cat "$PIDFILE")"
+        listener="$(ss -ltnp 2>/dev/null | grep ":$PORT " |
+                    grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+        if [ -n "$listener" ] &&
+           [ "$(ps -o pgid= -p "$listener" 2>/dev/null | tr -d ' ')" != "$started" ]; then
+            echo "port $PORT answers from pid $listener, not the browser just started" >&2
+            exit 1
+        fi
+        echo "electron up on port $PORT (pid $started)"
         exit 0
     fi
     sleep 0.5

@@ -39,6 +39,7 @@ no cheaper form, so only an X11 side gets the fast path.
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -170,13 +171,99 @@ class LibvirtGrabber:
         return frame if w is None else frame[:, x:x + w]
 
 
+class GuestGrabber:
+    """A window inside a Windows guest, read over TCP from wincap.exe.
+
+    screendump photographs the emulated framebuffer, so it sees only what the
+    console is scanning out. wincap runs inside the session that owns the
+    window and asks the window to render itself, so a capture does not need
+    that session to be the one on screen.
+
+    GRABZ is used for the payload, which is PackBits over whole pixels. A page
+    of text compresses enough that the wire is not what a sweep costs.
+    """
+
+    def __init__(self, hostport):
+        host, _, port = hostport.rpartition(":")
+        if not host or not port.isdigit():
+            sys.exit("guest backend is guest:<host>:<port>")
+        self.addr = (host, int(port))
+        self.width, self.height = self._size()
+
+    def _ask(self, request):
+        sock = socket.create_connection(self.addr, timeout=60)
+        try:
+            sock.sendall(request)
+            chunks = []
+            while True:
+                chunk = sock.recv(1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            sock.close()
+
+    def _size(self):
+        answer = self._ask(b"SIZE\n").split()
+        if len(answer) != 2:
+            sys.exit("wincap did not answer SIZE")
+        return int(answer[0]), int(answer[1])
+
+    def grab(self, x=0, y=0, w=None, h=None):
+        w = self.width if w is None else w
+        h = self.height if h is None else h
+        blob = self._ask(b"GRABZ %d %d %d %d\n" % (x, y, w, h))
+        # "PK\n<w> <h> <bytes>\n", then the packed pixels.
+        head, _, packed = blob.partition(b"\n")
+        if head != b"PK":
+            sys.exit("wincap answered %r, not a packed frame" % head[:16])
+        dims, _, packed = packed.partition(b"\n")
+        gw, gh, count = (int(v) for v in dims.split())
+        if gw <= 0 or gh <= 0:
+            sys.exit("wincap could not capture the window")
+        return _unpack(packed[:count], gw, gh)
+
+
+def _unpack(packed, w, h):
+    """Decode PackBits over whole pixels, the encoding GRABZ writes.
+
+    A leading byte over 127 is a run of 257 - b pixels of the one color that
+    follows. Otherwise it is b + 1 literal pixels.
+    """
+    flat = np.empty((h * w, 3), dtype=np.uint8)
+    src = 0
+    out = 0
+    total = h * w
+    while out < total and src < len(packed):
+        control = packed[src]
+        src += 1
+        if control > 127:
+            run = min(257 - control, total - out)
+            flat[out:out + run] = np.frombuffer(packed, np.uint8, 3, src)
+            src += 3
+            out += run
+        else:
+            lit = min(control + 1, total - out)
+            flat[out:out + lit] = np.frombuffer(
+                packed, np.uint8, lit * 3, src).reshape(lit, 3)
+            src += (control + 1) * 3
+            out += lit
+    if out != total:
+        sys.exit("wincap sent %d of %d pixels" % (out, total))
+    return flat.reshape(h, w, 3)
+
+
 def open_grabber(backend):
     kind, _, rest = backend.partition(":")
     if kind == "x11":
         return X11Grabber(rest)
     if kind == "libvirt":
         return LibvirtGrabber(rest)
-    sys.exit("backend must be x11:<display> or libvirt:<domain>")
+    if kind == "guest":
+        return GuestGrabber(rest)
+    sys.exit("backend must be x11:<display>, libvirt:<domain> "
+             "or guest:<host>:<port>")
 
 
 # What an unobstructed marker is worth to marker_mask, which is the magenta

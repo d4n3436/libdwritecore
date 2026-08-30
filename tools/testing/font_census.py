@@ -57,6 +57,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import sys
 import unicodedata
 
@@ -391,8 +392,10 @@ def name_faces(side, cps, lang, generic):
             for cp, a in zip(cps, answers)}
 
 
-# How many of a config's differing codepoints get their faces named.
-kNamedPerConfig = 60
+# How many of a config's differing codepoints get their faces named. Naming
+# costs a round trip per codepoint, so the default keeps a full run cheap.
+# Raise it through the environment to see which faces the cells hold.
+kNamedPerConfig = int(os.environ.get("DWC_CENSUS_NAMED", "60"))
 
 
 def mode_fallback(sides, full):
