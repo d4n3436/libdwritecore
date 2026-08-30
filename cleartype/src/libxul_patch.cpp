@@ -151,6 +151,14 @@ struct Image
 };
 
 // libxul, whatever it is called on disk and wherever it was installed from.
+// The loader's own recorded name for an image, which is the path it was opened
+// by. Weaker than asking the object, and used only where asking is not
+// available: LookForLibxul runs inside dl_iterate_phdr, where dlsym can
+// deadlock against a concurrent dlopen, and libxul carries no DT_SONAME to
+// read out of its dynamic section instead. Replacing it would mean walking
+// each image's own symbol table for XRE_GetBootstrap, which needs the symbol
+// count out of DT_GNU_HASH. Not worth it against a build that renames libxul,
+// which nothing ships; ScanLoadedImages reports the miss if one ever does.
 bool IsLibxul(const char* name)
 {
     if (name == nullptr || *name == '\0') {
@@ -441,6 +449,8 @@ constexpr unsigned kMetricsUnderlineOffset = 5;
 constexpr unsigned kMetricsInternalLeading = 6;
 constexpr unsigned kMetricsExternalLeading = 7;
 constexpr unsigned kMetricsEmHeight = 8;
+constexpr unsigned kMetricsEmAscent = 9;
+constexpr unsigned kMetricsEmDescent = 10;
 constexpr unsigned kMetricsMaxHeight = 11;
 constexpr unsigned kMetricsMaxAscent = 12;
 constexpr unsigned kMetricsMaxDescent = 13;
@@ -1098,35 +1108,6 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
     return found;
 }
 
-// ReflowInput.cpp:2719, the one place the two leadings are read together.
-constexpr double kNormalLineHeightFactor = 1.2;
-
-// GetNormalLineHeight works in nscoord app units, not in the doubles written
-// here. nsFontMetrics converts each field with
-// ROUND_TO_TWIPS(x) = floor(x * mP2A + 0.5), and both the zero test and the
-// sum are done on the rounded values, so a leading small enough to round to
-// zero sends Gecko down the 1.2 shortcut whatever the doubles say.
-//
-// mP2A is 60 app units per device pixel at a device pixel ratio of 1 and
-// smaller above it, so this is the narrowest window Gecko uses. A leading this
-// reads as non-zero can still round to zero on a HiDPI screen; widening it
-// would snap values Gecko keeps.
-constexpr double kAppUnitsPerDevPixel = 60.0;
-
-long ToAppUnits(const double px)
-{
-    return static_cast<long>(std::floor(px * kAppUnitsPerDevPixel + 0.5));
-}
-
-long NormalLineHeightAppUnits(const double em, const double il, const double el)
-{
-    const long em_units = ToAppUnits(em);
-    if (ToAppUnits(il) == 0 && ToAppUnits(el) == 0) {
-        return static_cast<long>(std::floor(static_cast<double>(em_units) * kNormalLineHeightFactor + 0.5));
-    }
-    return em_units + ToAppUnits(il) + ToAppUnits(el);
-}
-
 extern "C" void DwcInitMetrics(void* self)
 {
     g_init_metrics(self);
@@ -1145,8 +1126,14 @@ extern "C" void DwcInitMetrics(void* self)
     double em = 0.0, asc = 0.0, desc = 0.0;
     double il = 0.0, el = 0.0;
     const bool leading = CleartypeWindowsLeading(&il, &el, &em, &asc, &desc) != 0;
-    double uo = 0.0, us = 0.0;
-    const bool underline = CleartypeWindowsUnderline(&uo, &us, &em, &asc, &desc) != 0;
+    double uo = 0.0, us = 0.0, fold = 0.0;
+    const bool underline = CleartypeWindowsUnderline(&uo, &us, &em, &asc, &desc, &fold) != 0;
+    double ave = 0.0, adv = 0.0, cw_em = 0.0, cw_asc = 0.0, cw_desc = 0.0;
+    const bool char_width = CleartypeWindowsCharWidth(&ave, &adv, &cw_em, &cw_asc, &cw_desc) != 0;
+    // All three are read together and the claim is then dropped. The answers
+    // belong to this call alone, and a later InitMetrics that returns before
+    // reading OS/2 would otherwise be handed this face's numbers.
+    CleartypeEndInitMetrics();
     if (!leading && !underline) {
         return;
     }
@@ -1157,60 +1144,57 @@ extern "C" void DwcInitMetrics(void* self)
     }
 
     // The pair that sizes a text control and places nothing.
-    double ave = 0.0, adv = 0.0, cw_em = 0.0, cw_asc = 0.0, cw_desc = 0.0;
-    if (CleartypeWindowsCharWidth(&ave, &adv, &cw_em, &cw_asc, &cw_desc) != 0 &&
-        SameDouble(cw_em, em) && SameDouble(cw_asc, asc) && SameDouble(cw_desc, desc)) {
+    if (char_width && SameDouble(cw_em, em) && SameDouble(cw_asc, asc) &&
+        SameDouble(cw_desc, desc)) {
         found[kMetricsAveCharWidth] = ave;
         found[kMetricsMaxAdvance] = adv;
     }
 
     if (leading) {
-        // The correction is to the line height the pair produces.
-        // ComputeMetrics measures the leadings against the unrounded size
-        // Windows lays out with, while InitMetrics has already written
-        // floor(size + 0.5) into emHeight beside them, so a pair copied in
-        // verbatim sums to a line height neither platform computes. The
-        // difference goes into the internal leading, which the rounding keeps
-        // within half a pixel of what Windows measured, and the external one is
-        // left exact. Both fields have a second reader that takes them alone.
-        // nsFontMetrics::TrimmedAscent subtracts half the internal leading from
-        // the ascent, and gfxHarfBuzzShaper reports the external one as the
-        // font's line gap.
-        const double have_em = found[kMetricsEmHeight];
-        const long want = NormalLineHeightAppUnits(em, il, el);
-        double set_il = il + (em - have_em);
-        double set_el = el;
-        if (NormalLineHeightAppUnits(have_em, set_il, set_el) != want) {
-            // The pair came out reading as no leading at all, which sends
-            // GetNormalLineHeight down its 1.2 shortcut instead of the sum.
-            // Put the whole correction in the internal leading, in a size
-            // Gecko still reads as non-zero, and leave the external one at
-            // nothing.
-            const long em_units = ToAppUnits(have_em);
-            const long shortcut =
-                static_cast<long>(std::floor(static_cast<double>(em_units) * kNormalLineHeightFactor + 0.5));
-            if (want == shortcut) {
-                set_il = 0.0;
-            } else {
-                // Gecko takes the sum branch only when one of the rounded
-                // fields is non-zero, so a correction of no app units cannot be
-                // expressed. One app unit is the closest available, and it is
-                // 1/60 of a pixel too tall. A negative correction is exact.
-                const long units = want - em_units;
-                set_il = static_cast<double>(units == 0 ? 1 : units) / kAppUnitsPerDevPixel;
-            }
-            set_el = 0.0;
-        }
-        // One app unit out is the clamp above. Anything further is unmodelled,
-        // and InitMetrics' own values stand.
-        if (std::labs(NormalLineHeightAppUnits(have_em, set_il, set_el) - want) <= 1) {
-            found[kMetricsInternalLeading] = set_il;
-            found[kMetricsExternalLeading] = set_el;
-        }
+        // gfxFT2FontBase::InitMetrics writes floor(size + 0.5) into emHeight
+        // where gfxDWriteFont::ComputeMetrics writes the unrounded
+        // mAdjustedSize, so all three fields that make a line height are put
+        // back as Windows holds them. The leadings then need no correction of
+        // their own, and GetNormalLineHeight reaches the Windows answer from
+        // the inputs Windows gives it.
+        //
+        // emHeight is not only a line-height term, which is why correcting the
+        // leading against a rounded one was not equivalent.
+        // gfxFcPlatformFontList reads it for the font-size-adjust ratios,
+        // nsTextFrame for emphasis and decoration placement, and
+        // gfxFont::CreateVerticalMetrics divides the horizontal internal
+        // leading by it to synthesize the vertical one. That last one made
+        // every fractional font size differ in a vertical writing mode, form
+        // controls included, since their 13.3281px is never whole.
+        found[kMetricsEmHeight] = em;
+        found[kMetricsInternalLeading] = il;
+        found[kMetricsExternalLeading] = el;
     }
     if (underline) {
         found[kMetricsUnderlineOffset] = uo;
         found[kMetricsUnderlineSize] = us;
+        // ApplyWindowsMetrics moved half a pixel from the ascent to the descent
+        // so that nsFontMetrics, folding the underline InitMetrics computed on
+        // Linux, still reached the Windows MaxAscent and MaxDescent. The two
+        // lines above just replaced that underline with the Windows one, which
+        // folds to those values on its own, so the half pixel goes back. It is
+        // visible on its own in canvas TextMetrics, whose fontBoundingBox
+        // ascent and descent are these two fields unrounded.
+        if (fold != 0.0) {
+            found[kMetricsMaxAscent] = asc + fold;
+            found[kMetricsMaxDescent] = desc - fold;
+        }
+    }
+    if (leading) {
+        // gfxDWriteFonts.cpp: emAscent = emHeight * maxAscent / maxHeight, and
+        // emDescent is the remainder. InitMetrics derived both from the
+        // rounded emHeight, so they no longer sum to the one written above.
+        // Canvas places textBaseline top, middle and bottom on this pair.
+        const double height = found[kMetricsMaxAscent] + found[kMetricsMaxDescent];
+        if (height > 0.0) {
+            found[kMetricsEmAscent] = em * found[kMetricsMaxAscent] / height;
+            found[kMetricsEmDescent] = em - found[kMetricsEmAscent];
+        }
     }
 }
 void* (*g_malloc)(size_t) = nullptr;
@@ -1950,11 +1934,19 @@ int LookForLibxul(dl_phdr_info* info, size_t, void* out)
     return 1;
 }
 
-void ScanLoadedImages()
+void ScanLoadedImages(const bool expected)
 {
     FoundLibxul found;
     dl_iterate_phdr(LookForLibxul, &found);
     if (!found.found) {
+        if (expected) {
+            // The handle answered for XRE_GetBootstrap, so libxul is in this
+            // process under a name the link-map scan does not recognize. Said
+            // out loud, because the whole Firefox side is about to do nothing
+            // and the reason would otherwise be invisible.
+            Report("libxul is loaded but not named libxul.so in the link map; "
+                   "the Firefox patches will not be applied");
+        }
         return;
     }
     // Out of the callback, so the loader's lock is no longer held.
@@ -1977,8 +1969,36 @@ __attribute__((constructor)) void AtLoad()
 {
     // Only for the case where libxul is already mapped. The firefox binary has
     // no DT_NEEDED on it and dlopens it after this runs, which the interposed
-    // dlopen below catches.
-    ScanLoadedImages();
+    // dlopen below catches. Nothing is expected here, so a miss says nothing.
+    ScanLoadedImages(/*expected=*/false);
+}
+
+}  // namespace
+
+// Whether a dlopen just brought in libxul, asked of the object rather than of
+// the string the caller passed. libxul exports two dynamic symbols and
+// XRE_GetBootstrap is one of them, so a handle that answers for it is libxul
+// whatever the file was called - and a handle that does not is not, since
+// dlsym on a handle searches that object and its dependencies rather than the
+// global scope. dlopen(NULL) is the one handle that does see the global scope,
+// and there the answer is still right: libxul really is loaded.
+//
+// Safe to call from the interposer below, which runs after the real dlopen has
+// returned and released the loader's locks. LookForLibxul, which runs inside
+// dl_iterate_phdr with one of them held, cannot do this; see IsLibxul.
+namespace
+{
+
+bool HandleIsLibxul(void* handle)
+{
+    if (handle == nullptr) {
+        return false;
+    }
+    const bool is_libxul = dlsym(handle, "XRE_GetBootstrap") != nullptr;
+    // A miss leaves an error behind that the caller would read back as its own
+    // dlopen's.
+    (void)dlerror();
+    return is_libxul;
 }
 
 }  // namespace
@@ -1989,14 +2009,21 @@ __attribute__((constructor)) void AtLoad()
 extern "C" __attribute__((visibility("default")))
 void* dlopen(const char* file, const int mode)
 {
-    static const auto real = reinterpret_cast<void* (*)(const char*, int)>(
-        dlsym(RTLD_NEXT, "dlopen"));
+    // Never remembered as null. dlsym can be asked before the loader is in a
+    // state to answer, and a cached null here would make every dlopen in the
+    // process return null for the rest of its life.
+    static std::atomic<void* (*)(const char*, int)> resolved{nullptr};
+    auto real = resolved.load(std::memory_order_acquire);
     if (real == nullptr) {
-        return nullptr;
+        real = reinterpret_cast<void* (*)(const char*, int)>(dlsym(RTLD_NEXT, "dlopen"));
+        if (real == nullptr) {
+            return nullptr;
+        }
+        resolved.store(real, std::memory_order_release);
     }
     void* handle = real(file, mode);
-    if (handle != nullptr && !g_done.load() && IsLibxul(file)) {
-        ScanLoadedImages();
+    if (handle != nullptr && !g_done.load() && HandleIsLibxul(handle)) {
+        ScanLoadedImages(/*expected=*/true);
         // It resolves symbols on the way, and a failed dlsym leaves an error
         // the caller would read back as its own dlopen's.
         (void)dlerror();

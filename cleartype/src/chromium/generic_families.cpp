@@ -70,20 +70,37 @@ constexpr Substitution kSubstitutions[] = {
      {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
       "webkit.webprefs.fonts.fixed.Grek"}},
 
+    // Windows gives standard and sansserif the same value for every CJK
+    // script, so one rewritten resource seats both rows and leaves the other
+    // resource free for a row that had none.
     {",Noto Sans JP,Noto Sans CJK JP,Arial", ",Meiryo,Yu Gothic",
-     {"webkit.webprefs.fonts.sansserif.Jpan"}},
+     {"webkit.webprefs.fonts.sansserif.Jpan",
+      "webkit.webprefs.fonts.standard.Jpan"}},
     // The standard row's resource carries the fixed family instead. Only one
     // of the two fits, and the fixed family is the one whose absence shows.
     {",Noto Sans JP,Noto Sans CJK JP,Times New Roman", ",BIZ UDGothic,MS Gothic",
      {"webkit.webprefs.fonts.fixed.Jpan"}},
-    {",Noto Serif JP,Noto Serif CJK JP,Times New Roman", ",Yu Mincho,MS PMincho",
+    // The serif families Windows names for the CJK scripts ship with neither
+    // platform, so the whole list misses there and the script's standard
+    // family answers. This platform would fall through to fontconfig's serif,
+    // so the standard family is written as the last entry to land on the same
+    // face. The Noto entries are dropped for the same reason. What mirrors
+    // Windows is the value that resolves to the face Windows resolves to, not
+    // the string it stores.
+    {",Noto Serif JP,Noto Serif CJK JP,Times New Roman",
+     ",Yu Mincho,MS PMincho,Yu Gothic",
      {"webkit.webprefs.fonts.serif.Jpan"}},
 
+    // The fixed row joins them. Windows names Gulimche, which ships with
+    // neither platform, so that row lands on the standard family too.
     {",Noto Sans KR,Noto Sans CJK KR,Arial", ",Malgun Gothic",
-     {"webkit.webprefs.fonts.sansserif.Hang"}},
-    {",Noto Sans KR,Noto Sans CJK KR,Times New Roman", ",Malgun Gothic",
-     {"webkit.webprefs.fonts.standard.Hang"}},
-    {",Noto Serif KR,Noto Serif CJK KR,Times New Roman", ",Batang",
+     {"webkit.webprefs.fonts.sansserif.Hang",
+      "webkit.webprefs.fonts.standard.Hang",
+      "webkit.webprefs.fonts.fixed.Hang"}},
+    {",Noto Sans KR,Noto Sans CJK KR,Times New Roman", ",Gungsuh",
+     {"webkit.webprefs.fonts.cursive.Hang"}},
+    {",Noto Serif KR,Noto Serif CJK KR,Times New Roman",
+     ",Batang,Malgun Gothic",
      {"webkit.webprefs.fonts.serif.Hang"}},
 
     // Arabic has no sans-serif family on Linux to rewrite, so the Japanese
@@ -91,9 +108,10 @@ constexpr Substitution kSubstitutions[] = {
     {"Noto Sans Mono CJK JP", ",Segoe UI", {"webkit.webprefs.fonts.sansserif.Arab"}},
 
     {",Noto Sans SC,Noto Sans CJK SC,Arial", ",Microsoft YaHei",
-     {"webkit.webprefs.fonts.sansserif.Hans"}},
-    {",Noto Sans SC,Noto Sans CJK SC,Times New Roman", ",Microsoft YaHei",
-     {"webkit.webprefs.fonts.standard.Hans"}},
+     {"webkit.webprefs.fonts.sansserif.Hans",
+      "webkit.webprefs.fonts.standard.Hans"}},
+    {",Noto Sans SC,Noto Sans CJK SC,Times New Roman", ",KaiTi",
+     {"webkit.webprefs.fonts.cursive.Hans"}},
     {",Noto Serif SC,Noto Serif CJK SC,Times New Roman", ",Simsun",
      {"webkit.webprefs.fonts.serif.Hans"}},
 
@@ -105,11 +123,15 @@ constexpr Substitution kSubstitutions[] = {
     // table and the renderer while the list form resolves to the same face.
     {"Noto Sans Mono", ",NSimsun", {"webkit.webprefs.fonts.fixed.Hans"}},
 
+    // Same for MingLiU, which Windows names for the Traditional Han fixed row.
     {",Noto Sans TC,Noto Sans CJK TC,Arial", ",Microsoft JhengHei",
-     {"webkit.webprefs.fonts.sansserif.Hant"}},
-    {",Noto Sans TC,Noto Sans CJK TC,Times New Roman", ",Microsoft JhengHei",
-     {"webkit.webprefs.fonts.standard.Hant"}},
-    {",Noto Serif TC,Noto Serif CJK TC,Times New Roman", ",PMingLiU",
+     {"webkit.webprefs.fonts.sansserif.Hant",
+      "webkit.webprefs.fonts.standard.Hant",
+      "webkit.webprefs.fonts.fixed.Hant"}},
+    {",Noto Sans TC,Noto Sans CJK TC,Times New Roman", ",DFKai-SB",
+     {"webkit.webprefs.fonts.cursive.Hant"}},
+    {",Noto Serif TC,Noto Serif CJK TC,Times New Roman",
+     ",PMingLiU,Microsoft JhengHei",
      {"webkit.webprefs.fonts.serif.Hant"}},
 };
 
@@ -219,9 +241,9 @@ namespace {
 // build has only the seven script-less ones (font_defaults.cc), so the rest
 // are appended and the loop that reads the table is pointed at the longer one.
 //
-// The rows a Windows build compiles, in kFontDefaults order, less the five
-// whose value no resource in a Linux bundle can be made to carry: fixed.Hang,
-// fixed.Hant and cursive for all three Han scripts.
+// The rows a Windows build compiles, in kFontDefaults order. Every one is
+// covered. The families Windows names that ship with neither platform resolve
+// to the script's standard family, which a resource already carries.
 constexpr const char* kWindowsRows[] = {
     "webkit.webprefs.fonts.standard.Jpan",
     "webkit.webprefs.fonts.fixed.Jpan",
@@ -236,6 +258,11 @@ constexpr const char* kWindowsRows[] = {
     "webkit.webprefs.fonts.standard.Hant",
     "webkit.webprefs.fonts.serif.Hant",
     "webkit.webprefs.fonts.sansserif.Hant",
+    "webkit.webprefs.fonts.cursive.Hang",
+    "webkit.webprefs.fonts.cursive.Hans",
+    "webkit.webprefs.fonts.cursive.Hant",
+    "webkit.webprefs.fonts.fixed.Hang",
+    "webkit.webprefs.fonts.fixed.Hant",
     "webkit.webprefs.fonts.sansserif.Arab",
     "webkit.webprefs.fonts.fixed.Hans",
     "webkit.webprefs.fonts.fixed.Arab",

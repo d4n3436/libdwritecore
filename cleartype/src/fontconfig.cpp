@@ -46,6 +46,7 @@
 //----------------------------------------------------------------------------
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
@@ -78,7 +79,7 @@ namespace {
 
 // fontconfig's ABI, declared here instead of included so this library keeps
 // its build dependencies. Names and values from fontconfig/fontconfig.h:
-// FC_RGBA_RGB 1, FC_HINT_NONE 0, FC_LCD_DEFAULT 1, FcResultMatch 0.
+// FC_RGBA_RGB 1, FC_HINT_SLIGHT 1, FC_LCD_DEFAULT 1, FcResultMatch 0.
 using FcPattern = struct _FcPattern;
 using FcBool = int;
 using FcResult = int;
@@ -109,7 +110,7 @@ struct FcValue
 };
 
 constexpr int kFcRgbaRgb = 1;
-constexpr int kFcHintNone = 0;
+constexpr int kFcHintSlight = 1;
 constexpr int kFcLcdDefault = 1;
 
 using FcPatternGetIntegerFn = FcResult (*)(const FcPattern*, const char*, int, int*);
@@ -133,6 +134,25 @@ using FcPatternGetFn = FcResult (*)(const FcPattern*, const char*, int, FcValue*
 // RTLD_NOLOAD first, which returns a handle only if it is already mapped and
 // is therefore the same fontconfig the caller is using; a plain dlopen after
 // that, for a host that has not loaded it yet.
+// One handle for the whole file, and a failed open is retried rather than
+// remembered: the library can arrive after the first ask, and a cached null
+// would leave every later call with nothing to forward to.
+void* FontconfigLibrary()
+{
+    static std::atomic<void*> library{nullptr};
+    void* handle = library.load(std::memory_order_acquire);
+    if (handle == nullptr) {
+        handle = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        if (handle == nullptr) {
+            handle = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
+        }
+        if (handle != nullptr) {
+            library.store(handle, std::memory_order_release);
+        }
+    }
+    return handle;
+}
+
 template <typename Fn>
 Fn Next(const char* name)
 {
@@ -140,14 +160,7 @@ Fn Next(const char* name)
         return reinterpret_cast<Fn>(fn);
     }
 
-    static void* handle = [] {
-        void* h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        if (h == nullptr) {
-            h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
-        }
-        return h;
-    }();
-
+    void* handle = FontconfigLibrary();
     return handle != nullptr ? reinterpret_cast<Fn>(dlsym(handle, name)) : nullptr;
 }
 
@@ -225,10 +238,17 @@ bool IntegerAnswer(const char* object, const int n, int* out)
         return true;
     }
 #if CLEARTYPE_FIREFOX_PARITY
-    // Only for Firefox: gfxFT2FontBase reads the unrounded advance when the
-    // pattern says no hinting, which is what Windows measures with.
+    // Only for Firefox. hintslight and hintnone both leave
+    // gfxFT2FontBase::ShouldRoundXOffset false, so both read the unrounded
+    // advance Windows measures with. They part over the glyph's ink bounds.
+    // GetFTGlyphExtents floors the top and ceils the bottom to whole pixels
+    // when the load flags carry FT_LOAD_NO_HINTING, and hintnone is the only
+    // way to ask for that flag. DirectWrite scales the design bounds and
+    // rounds nothing, so hintslight is the answer that matches. It costs no
+    // hinting either, because UnhintedLoadFlags in src/freetype.cpp puts
+    // FT_LOAD_NO_HINTING back before FreeType sees the flags.
     if (Answers(object, n, "hintstyle")) {
-        *out = kFcHintNone;
+        *out = kFcHintSlight;
         return true;
     }
 #endif
@@ -242,7 +262,17 @@ bool BoolAnswer(const char* object, const int n, int* out)
         return true;
     }
 #if CLEARTYPE_FIREFOX_PARITY
+    // PrepareFontOptions only reads hintstyle when this says yes; a no there
+    // pins the style to hintnone whatever the integer answer is.
     if (Answers(object, n, "hinting")) {
+        *out = 1;
+        return true;
+    }
+    // With hinting on, FcPatternAllowsBitmaps lets a face's embedded strikes
+    // through, which used to be refused for an outline font on the strength of
+    // the hinting answer alone. Windows decides strikes per font in
+    // gfxDWriteFont::GetScaledFont, so they are refused here as before.
+    if (Answers(object, n, "embeddedbitmap")) {
         *out = 0;
         return true;
     }

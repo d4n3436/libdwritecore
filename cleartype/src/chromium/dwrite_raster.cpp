@@ -14,7 +14,6 @@
 #include "compat.h"
 #include "dwrite_3.h"
 #include "dwrite_core.h"
-#include "geometry_sink.h"
 
 #include <cmath>
 #include <cstdio>
@@ -24,6 +23,57 @@
 #include <unordered_map>
 
 #include <dlfcn.h>
+
+// ID2D1SimplifiedGeometrySink, reconstructed. IDWriteFontFace::GetGlyphRunOutline
+// takes one of these, and include/dwrite.h only forward declares it, since the
+// SDK puts it in d2d1.h, which is outside the DirectWrite header set this
+// repository mirrors. Declared here in its documented method order, and only
+// ever implemented, never consumed from DirectWrite.
+
+typedef enum D2D1_FILL_MODE
+{
+    D2D1_FILL_MODE_ALTERNATE = 0,
+    D2D1_FILL_MODE_WINDING = 1,
+} D2D1_FILL_MODE;
+
+typedef enum D2D1_PATH_SEGMENT
+{
+    D2D1_PATH_SEGMENT_NONE = 0,
+    D2D1_PATH_SEGMENT_FORCE_UNSTROKED = 1,
+    D2D1_PATH_SEGMENT_FORCE_ROUND_LINE_JOIN = 2,
+} D2D1_PATH_SEGMENT;
+
+typedef enum D2D1_FIGURE_BEGIN
+{
+    D2D1_FIGURE_BEGIN_FILLED = 0,
+    D2D1_FIGURE_BEGIN_HOLLOW = 1,
+} D2D1_FIGURE_BEGIN;
+
+typedef enum D2D1_FIGURE_END
+{
+    D2D1_FIGURE_END_OPEN = 0,
+    D2D1_FIGURE_END_CLOSED = 1,
+} D2D1_FIGURE_END;
+
+typedef struct D2D1_BEZIER_SEGMENT
+{
+    D2D1_POINT_2F point1;
+    D2D1_POINT_2F point2;
+    D2D1_POINT_2F point3;
+} D2D1_BEZIER_SEGMENT;
+
+interface ID2D1SimplifiedGeometrySink : IUnknown
+{
+    STDMETHOD_(void, SetFillMode)(D2D1_FILL_MODE fillMode) PURE;
+    STDMETHOD_(void, SetSegmentFlags)(D2D1_PATH_SEGMENT vertexFlags) PURE;
+    STDMETHOD_(void, BeginFigure)(D2D1_POINT_2F startPoint, D2D1_FIGURE_BEGIN figureBegin) PURE;
+    STDMETHOD_(void, AddLines)(_In_reads_(pointsCount) const D2D1_POINT_2F* points,
+                               UINT32 pointsCount) PURE;
+    STDMETHOD_(void, AddBeziers)(_In_reads_(beziersCount) const D2D1_BEZIER_SEGMENT* beziers,
+                                 UINT32 beziersCount) PURE;
+    STDMETHOD_(void, EndFigure)(D2D1_FIGURE_END figureEnd) PURE;
+    STDMETHOD(Close)() PURE;
+};
 
 namespace dwrite_raster {
 namespace {

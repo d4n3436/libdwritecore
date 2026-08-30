@@ -441,8 +441,14 @@ void NoteHanFamily(const char* family)
     }
 }
 
-const char* const* HanFamilies(unsigned* count)
+// unsettled reports that nothing named a Han script, which is the case
+// GetFallbackFamily leaves as USCRIPT_HAN. It decides which last-resort list
+// the caller walks.
+const char* const* HanFamilies(unsigned* count, bool* unsettled = nullptr)
 {
+    if (unsettled != nullptr) {
+        *unsettled = false;
+    }
     // What this run asked for, then the system locale, then the list
     // initializeScriptFontMap seeds when neither says anything.
     if (const char* const* families = t_run_han) {
@@ -452,6 +458,9 @@ const char* const* HanFamilies(unsigned* count)
     if (const char* const* families = SystemHan(count)) {
         return families;
     }
+    if (unsettled != nullptr) {
+        *unsettled = true;
+    }
     *count = DWC_COUNT(kSimplifiedHan);
     return kSimplifiedHan;
 }
@@ -460,7 +469,8 @@ struct FamilyList
 {
     const char* const* families;
     unsigned count;
-    bool han;
+    // The script stayed unified Han, so the CJK last-resort list applies.
+    bool han_unsettled;
 };
 
 FamilyList ScriptFor(const unsigned codepoint)
@@ -473,8 +483,9 @@ FamilyList ScriptFor(const unsigned codepoint)
             return {s.families, s.count, false};
         }
         unsigned count = 0;
-        const char* const* families = HanFamilies(&count);
-        return {families, count, true};
+        bool unsettled = false;
+        const char* const* families = HanFamilies(&count, &unsettled);
+        return {families, count, unsettled};
     }
     return {nullptr, 0, false};
 }
@@ -524,6 +535,27 @@ void Remember(const void* charset, const char* family)
     g_known[g_known_count].charset = charset;
     (void)std::snprintf(g_known[g_known_count].family, sizeof(g_known[0].family), "%s", family);
     ++g_known_count;
+}
+
+// Names a Han list for the log.
+const char* HanName(const char* const* h)
+{
+    if (h == kKatakanaOrHiragana) { return "kana"; }
+    if (h == kHangul) { return "hangul"; }
+    if (h == kSimplifiedHan) { return "simplified"; }
+    if (h == kTraditionalHan) { return "traditional"; }
+    return h == nullptr ? "none" : "other";
+}
+
+// One line per Han decision, under DWC_FALLBACK_LOG.
+void LogPick(unsigned codepoint, const char* stage, const char* family)
+{
+    if (std::getenv("DWC_FALLBACK_LOG") == nullptr || codepoint < 0x3400 ||
+        codepoint > 0x9FFF) {
+        return;
+    }
+    (void)std::fprintf(stderr, "chromium-patch: fallback: U+%04X han=%s %s -> %s\n",
+                       codepoint, HanName(t_run_han), stage, family);
 }
 
 const char* FamilyOf(const void* charset)
@@ -591,14 +623,19 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         if (real(candidate, codepoint) == 0) {
             break;              // installed but does not cover it
         }
+        LogPick(codepoint, "script", script.families[i]);
         return HasFamily(charset, script.families[i]) ? 1 : 0;
     }
-    // No script font covers it, which is where Windows walks its last-resort
-    // list. Characters with no script row at all arrive here too, and that is
-    // the same path they take there.
-    const char* const* last = script.han ? kCjkLastResort : kCommonLastResort;
-    const unsigned last_count = script.han ? DWC_COUNT(kCjkLastResort)
-                                           : DWC_COUNT(kCommonLastResort);
+    // No script font covers it, so Windows walks its last-resort list, which is
+    // also how characters with no script row are answered.
+    // GetFallbackFamilyNameFromHardcodedChoices picks the list from the script
+    // GetFallbackFamily reported: a locale that named a Han script leaves Kana,
+    // Hangul or one of the Han pair, which take the common list, and only an
+    // unsettled USCRIPT_HAN takes the CJK one.
+    const char* const* last = script.han_unsettled ? kCjkLastResort
+                                                   : kCommonLastResort;
+    const unsigned last_count = script.han_unsettled ? DWC_COUNT(kCjkLastResort)
+                                                     : DWC_COUNT(kCommonLastResort);
     for (unsigned i = 0; i < last_count; ++i) {
         if (!ShipsWithWindows(last[i])) {
             continue;
@@ -607,8 +644,10 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
             candidate == nullptr || real(candidate, codepoint) == 0) {
             continue;
         }
+        LogPick(codepoint, "last", last[i]);
         return HasFamily(charset, last[i]) ? 1 : 0;
     }
+    LogPick(codepoint, "none", "(fontconfig)");
     return answer;              // none of them, so leave fontconfig's answer
 }
 
@@ -650,6 +689,26 @@ void NoteFontSet(const void* pattern, void* sorted)
     if (get_string(pattern, "family", 0, &wanted) == kFcResultMatch &&
         wanted != nullptr) {
         NoteHanFamily(reinterpret_cast<const char*>(wanted));
+    }
+
+    // The run's language, which CreateFcFontSetForLocale puts on the pattern
+    // as FC_LANG before sorting (ui/gfx/font_fallback_linux.cc). It names the
+    // Han script outright, so it wins over the family above.
+    unsigned char* lang = nullptr;
+    if (get_string(pattern, "lang", 0, &lang) == kFcResultMatch && lang != nullptr) {
+        unsigned count = 0;
+        if (const char* const* families =
+                HanForLocale(reinterpret_cast<const char*>(lang), &count)) {
+            t_run_han = families;
+            t_run_han_count = count;
+        }
+    }
+    if (std::getenv("DWC_FALLBACK_LOG") != nullptr) {
+        (void)std::fprintf(stderr,
+                           "chromium-patch: fallback: sort lang=%s han=%s, %d fonts\n",
+                           lang != nullptr ? reinterpret_cast<const char*>(lang)
+                                           : "(none)",
+                           HanName(t_run_han), set->nfont);
     }
 
     for (int i = 0; i < set->nfont; ++i) {

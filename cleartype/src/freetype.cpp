@@ -106,96 +106,143 @@ namespace {
 // and there it crashes a JVM. Asking the object directly is the fallback.
 // ---------------------------------------------------------------------------
 
+// One walk of the link map, looking for an importer of FreeType that is not
+// this library. Split out so it can be asked more than once; see
+// HostUsesThisFreeType below for why once is not enough.
+bool LinkMapImportsFreeType()
+{
+    // Any image in the link map that imports FreeType, other than this
+    // one. dlsym cannot answer, since this library exports FT_Load_Glyph
+    // and the global scope therefore always has one.
+    //
+    // The main image alone is not enough. Firefox's executable is a
+    // launcher whose DT_NEEDED lists only libc and libstdc++, while
+    // libxul.so carries the FreeType dependency, so asking the main image
+    // stands the rasterizer down in every Gecko process.
+    Dl_info self{};
+    const void* self_base = nullptr;
+    if (dladdr(reinterpret_cast<const void*>(&LinkMapImportsFreeType), &self) != 0) {
+        self_base = self.dli_fbase;
+    }
+
+    struct Ask
+    {
+        const void* self_base;
+        bool found;
+    } ask{self_base, false};
+
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, size_t, void* data) {
+            auto* a = static_cast<Ask*>(data);
+            if (a->self_base != nullptr &&
+                reinterpret_cast<const void*>(info->dlpi_addr) == a->self_base) {
+                return 0;           // this library's own dependency
+            }
+            for (int i = 0; i < info->dlpi_phnum; ++i) {
+                if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) {
+                    continue;
+                }
+                const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                    info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+                const char* strtab = nullptr;
+                for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+                    if (d->d_tag == DT_STRTAB) {
+                        strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
+                    }
+                }
+                if (strtab == nullptr) {
+                    continue;
+                }
+                for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+                    if (d->d_tag == DT_NEEDED &&
+                        std::strncmp(strtab + d->d_un.d_val, "libfreetype", 11) == 0) {
+                        a->found = true;
+                        return 1;
+                    }
+                }
+            }
+            return 0;
+        },
+        &ask);
+    return ask.found;
+}
+
 // Whether the FreeType this library interposes is the one the host draws
 // with. A build that compiles FreeType in imports none of its symbols, so the
 // host's calls never reach these entry points and the only callers left are
 // other libraries in the process drawing their own widgets. Serving those
 // rasterizes text the host never asked about, against face state that belongs
 // to nobody, so the interposer stands down instead.
+//
+// True once anything in the process has been seen to import FreeType. Only a
+// true is ever stored: the answer can go from false to true when the host
+// dlopens a library, and never the other way.
+std::atomic<bool> g_host_uses_freetype{false};
+std::atomic<unsigned> g_host_scan_calls{0};
+
 bool HostUsesThisFreeType()
 {
-    static const bool uses = [] {
-        // Any image in the link map that imports FreeType, other than this
-        // one. dlsym cannot answer, since this library exports FT_Load_Glyph
-        // and the global scope therefore always has one.
-        //
-        // The main image alone is not enough. Firefox's executable is a
-        // launcher whose DT_NEEDED lists only libc and libstdc++, while
-        // libxul.so carries the FreeType dependency, so asking the main image
-        // stands the rasterizer down in every Gecko process.
-        Dl_info self{};
-        const void* self_base = nullptr;
-        if (dladdr(reinterpret_cast<const void*>(&HostUsesThisFreeType), &self) != 0) {
-            self_base = self.dli_fbase;
-        }
-
-        struct Ask
-        {
-            const void* self_base;
-            bool found;
-        } ask{self_base, false};
-
-        dl_iterate_phdr(
-            [](dl_phdr_info* info, size_t, void* data) {
-                auto* a = static_cast<Ask*>(data);
-                if (a->self_base != nullptr &&
-                    reinterpret_cast<const void*>(info->dlpi_addr) == a->self_base) {
-                    return 0;           // this library's own dependency
-                }
-                for (int i = 0; i < info->dlpi_phnum; ++i) {
-                    if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) {
-                        continue;
-                    }
-                    const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                        info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-                    const char* strtab = nullptr;
-                    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
-                        if (d->d_tag == DT_STRTAB) {
-                            strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
-                        }
-                    }
-                    if (strtab == nullptr) {
-                        continue;
-                    }
-                    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
-                        if (d->d_tag == DT_NEEDED &&
-                            std::strncmp(strtab + d->d_un.d_val, "libfreetype", 11) == 0) {
-                            a->found = true;
-                            return 1;
-                        }
-                    }
-                }
-                return 0;
-            },
-            &ask);
-        if (ask.found) {
-            return true;
-        }
-        // The scan runs while this library loads, before the host has opened
-        // anything of its own, so a launcher that dlopens its shared library
-        // later has no importer in the link map yet. ParityActive answers from
-        // the installation layout instead, which is known at that point.
-        return dwcft::ParityActive();
-    }();
-    return uses;
+    if (g_host_uses_freetype.load(std::memory_order_acquire)) {
+        return true;
+    }
+    // The first scan runs while this library loads, before the host has opened
+    // anything of its own, so a launcher that dlopens its shared library later
+    // has no importer in the link map yet. ParityActive answers from the
+    // installation layout instead, which is known at that point, and is itself
+    // monotone.
+    if (dwcft::ParityActive()) {
+        g_host_uses_freetype.store(true, std::memory_order_release);
+        return true;
+    }
+    // Nothing said yes yet, so ask the link map again - it is a different link
+    // map every time the host opens something. Walking it costs the loader
+    // lock, so the answer is only re-sought on calls 1, 2, 4, 8 and so on: a
+    // process that really has no FreeType importer settles into doing almost
+    // nothing, while one that gains an importer at any point still finds it.
+    const unsigned n = g_host_scan_calls.fetch_add(1, std::memory_order_relaxed);
+    if ((n & (n + 1)) != 0) {
+        return false;
+    }
+    if (!LinkMapImportsFreeType()) {
+        return false;
+    }
+    g_host_uses_freetype.store(true, std::memory_order_release);
+    return true;
 }
 
 // Whether the interposer should do anything at all in this process.
+//
+// The master switch is an environment variable and cannot change under a
+// running process; the other half can, so it is asked every time.
+//
+// Settles the options on the way past. Every gated entry point asks this
+// first, and the first read of the options is what opens CLEARTYPE_LOG, so
+// doing it here keeps the log open even for a call that declines.
+struct Options;
+const Options& GetOptions();
+
 bool InterposerWanted()
 {
-    static const bool wanted = dwcft::Enabled() && HostUsesThisFreeType();
-    return wanted;
+    (void)GetOptions();
+    static const bool enabled = dwcft::Enabled();
+    return enabled && HostUsesThisFreeType();
 }
 
+// Same rule as DEFINE_REAL: a failed open is retried rather than remembered,
+// since the library can arrive after the first ask.
 void* FreeTypeSymbol(const char* name)
 {
-    static void* handle = [] {
-        void* h = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        if (h == nullptr) {
-            h = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_LOCAL);
+    static std::atomic<void*> library{nullptr};
+    void* handle = library.load(std::memory_order_acquire);
+    if (handle == nullptr) {
+        handle = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        if (handle == nullptr) {
+            handle = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_LOCAL);
         }
-        return h;
-    }();
+        if (handle != nullptr) {
+            library.store(handle, std::memory_order_release);
+        }
+    }
     return handle != nullptr ? dlsym(handle, name) : nullptr;
 }
 
@@ -268,22 +315,32 @@ using ft_mulfix_fn = FT_Long (*)(FT_Long, FT_Long);
 // of the process's lookup scope.
 // ---------------------------------------------------------------------------
 
-// One resolution per name. The initializer form carries a thread-safe-init
-// guard, which is needed because two threads can reach the same entry point on
-// its first call, and a caller handed a null real function has nothing left to
-// fall through to.
+// One resolution per name, kept only once it succeeds.
+//
+// A null is never stored. dlsym(RTLD_NEXT) can be asked before the host's
+// FreeType is in the link map, and a caller handed a null real function has
+// nothing to fall through to, so caching that answer would leave every later
+// call failing for the rest of the process with nothing said about it. Storing
+// only a non-null result makes the resolution monotone: a call after the
+// library arrives picks the symbol up. Two threads racing store the same
+// address, so the plain atomic needs no init guard.
 #define DEFINE_REAL(type, name)                             \
     type real_##name()                                      \
     {                                                       \
-        static type const fn = [] {                         \
-            type p = reinterpret_cast<type>(                \
-                dlsym(RTLD_NEXT, #name));                   \
-            if (p == nullptr) {                             \
-                p = reinterpret_cast<type>(                 \
-                    FreeTypeSymbol(#name));                 \
-            }                                               \
-            return p;                                       \
-        }();                                                \
+        static std::atomic<type> resolved{nullptr};         \
+        type fn = resolved.load(std::memory_order_acquire); \
+        if (fn != nullptr) {                                \
+            return fn;                                      \
+        }                                                   \
+        fn = reinterpret_cast<type>(                        \
+            dlsym(RTLD_NEXT, #name));                       \
+        if (fn == nullptr) {                                \
+            fn = reinterpret_cast<type>(                    \
+                FreeTypeSymbol(#name));                     \
+        }                                                   \
+        if (fn != nullptr) {                                \
+            resolved.store(fn, std::memory_order_release);  \
+        }                                                   \
         return fn;                                          \
     }
 
@@ -476,7 +533,11 @@ void LogSkipOnce(FT_Face face, const char* reason)
 
 struct Options
 {
-    bool enabled = true;
+    // Whether the interposer runs at all is not here. It can go from false to
+    // true when the host opens a library, and these are settled once by
+    // pthread_once, so it is asked per call through InterposerWanted instead -
+    // the same reason WindowsMetrics below is a call and not a field.
+    //
     // Unset means "ask DirectWrite", which is what Windows does.
     bool rendering_mode_forced = false;
     DWRITE_RENDERING_MODE rendering_mode = DWRITE_RENDERING_MODE_CLEARTYPE_NATURAL;
@@ -524,7 +585,6 @@ void InitOptions()
         LogLine("%s", g_version);
     }
 
-    g_options.enabled = InterposerWanted();
     g_options.subpixel_positioning = EnvIsOff("CLEARTYPE_SUBPIXEL_POSITIONING", true);
 
     // "auto" - the default - leaves the mode to DirectWrite, which decides
@@ -663,12 +723,10 @@ thread_local char g_thread_name[16 + 1];
 thread_local bool g_thread_named = false;
 }  // namespace
 
-#if CLEARTYPE_FIREFOX_PARITY
 static const char* ThisThreadName()
 {
     return g_thread_named ? g_thread_name : nullptr;
 }
-#endif
 
 // The same log libxul_patch.cpp writes to, so a patch report and a
 // rasterization report land in one file in the order they happened.
@@ -784,7 +842,7 @@ __attribute__((constructor)) void CreateFactoryAtLoad()
     // process that loads this library, which is most of the cost a plain build
     // avoids; ParityActive answers from the installation layout here, since
     // libxul is not mapped yet in a content process this early.
-    if (dwcft::ParityActive() && GetOptions().enabled) {
+    if (dwcft::ParityActive() && InterposerWanted()) {
         GetFactories();
     }
 }
@@ -4178,12 +4236,36 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
     const WinInstance* instance =
         entry != nullptr ? GetWinInstanceLocked(entry, em_size) : nullptr;
     double advance_px = -1.0;
+    bool win_fattens_outline = true;
     if (instance != nullptr && instance->valid && instance->dwrite_face != nullptr) {
+        // The two cases WinBoldGlyphAdvanceLocked answers for by tracking.
+        // gfxDWriteFontEntry::CreateFontInstance keeps DirectWrite's simulation
+        // away from a webfont and from a COLR font, so their outlines are drawn
+        // at their plain weight and only the advance moves.
+        win_fattens_outline = !(entry->memory != nullptr || FaceHasCOLRLocked(entry));
         advance_px = WinBoldGlyphAdvanceLocked(entry, *instance,
                                                static_cast<UINT16>(face->glyph->glyph_index),
                                                FT_HAS_MULTIPLE_MASTERS(face) != 0);
     }
     pthread_mutex_unlock(&g_faces_mutex);
+
+    // gfxFT2FontBase::GetFTGlyphExtents grows the glyph box by this same
+    // strength for every emboldened instance:
+    //
+    //     y  = -horiBearingY;  y2 = y + height;  y -= bold.y;
+    //     x2 = horiBearingX + width;             x2 += bold.x;
+    //
+    // Where Windows leaves the outline alone there is nothing to grow, so the
+    // three fields it reads are taken down by the strength first and the two
+    // additions net to nothing. y2 is read before y moves, which is why the
+    // height comes down with the bearing instead of up.
+    if (!win_fattens_outline && strength > 0 &&
+        face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        FT_Glyph_Metrics& gm = face->glyph->metrics;
+        gm.horiBearingY -= strength;
+        gm.height -= strength;
+        gm.width -= strength;
+    }
     if (advance_px < 0.0) {
         return;
     }
@@ -4299,17 +4381,86 @@ RasterCaller CurrentRasterCaller()
 
     thread_local int cached = -1;
     if (cached < 0) {
-        cached = 0;
         const char* name = ThisThreadName();
-        if (name != nullptr) {
-            for (const char* prefix : firefox_parity::kWebRenderThreadPrefixes) {
-                if (std::strncmp(name, prefix, 7) == 0) {
-                    cached = 1;
-                }
+        // Nothing has named this thread yet. Gecko names its threads on the
+        // way in, through PR_SetCurrentThreadName and rayon's Builder::name,
+        // so a name can still arrive; answering Skia now and keeping that
+        // answer would give the wrong rasterizer's parameters to a thread that
+        // is about to say it is WebRender's. Answer, but do not remember.
+        if (name == nullptr) {
+            return RasterCaller::Skia;
+        }
+        cached = 0;
+        for (const char* prefix : firefox_parity::kWebRenderThreadPrefixes) {
+            if (std::strncmp(name, prefix, 7) == 0) {
+                cached = 1;
             }
         }
     }
     return cached == 1 ? RasterCaller::WebRender : RasterCaller::Skia;
+}
+
+// The same question for one face, which the thread cannot always answer.
+//
+// Gecko rasterizes a blob image through DrawTargetSkia on WebRender's own
+// rayon workers, so a thread named WRWorker is not proof that WebRender is the
+// caller, and those glyphs were being given platform/windows/font.rs's
+// DirectWrite parameters where Windows gives them SkScalerContext_win_dw's.
+//
+// The FreeType library settles it. WebRender calls FT_Init_FreeType for itself
+// in FontContext::new (platform/unix/font.rs), so the two rasterizers never
+// share one, and FT_Outline_Get_Bitmap has no caller but Skia
+// (SkScalerContextFTUtils::generateGlyphImage). A library seen there is Skia's
+// for the life of the process, and face->glyph->library says which one a face
+// belongs to. FT_Render_Glyph cannot be used the same way, since Skia calls it
+// too for SkMask::kLCD16_Format.
+//
+// Slots rather than a map, since a process has one library per rasterizer and
+// this is read on every glyph. An unclaimed library leaves the answer to the
+// thread name, which is where it was before.
+constexpr int kSkiaLibrarySlots = 4;
+std::atomic<void*> g_skia_libraries[kSkiaLibrarySlots];
+
+void RecordSkiaLibrary(const FT_Library library)
+{
+    if (library == nullptr || !dwcft::ParityActive()) {
+        return;
+    }
+    void* const handle = static_cast<void*>(library);
+    for (std::atomic<void*>& slot : g_skia_libraries) {
+        void* held = slot.load(std::memory_order_acquire);
+        // A lost race leaves the winner's handle in `held`, so the same value
+        // arriving on two threads still claims one slot between them.
+        if (held == nullptr) {
+            slot.compare_exchange_strong(held, handle, std::memory_order_acq_rel);
+            held = slot.load(std::memory_order_acquire);
+        }
+        if (held == handle) {
+            return;
+        }
+    }
+}
+
+bool IsSkiaLibrary(const FT_Library library)
+{
+    if (library == nullptr) {
+        return false;
+    }
+    void* const handle = static_cast<void*>(library);
+    for (const std::atomic<void*>& slot : g_skia_libraries) {
+        if (slot.load(std::memory_order_acquire) == handle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+RasterCaller CallerForFace(FT_Face face)
+{
+    if (face != nullptr && face->glyph != nullptr && IsSkiaLibrary(face->glyph->library)) {
+        return RasterCaller::Skia;
+    }
+    return CurrentRasterCaller();
 }
 
 // SkScalerContext_win_dw.cpp get_gasp_range / is_gridfit_only / is_hinted /
@@ -4751,7 +4902,10 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     const bool exact_oblique =
         dwcft::ParityActive() && ExactObliqueSkew(combined, &exact_skew);
 #if CLEARTYPE_FIREFOX_PARITY
-    const bool skia_caller = CurrentRasterCaller() == RasterCaller::Skia;
+    // The face, not the thread: blob images are rasterized through Skia on
+    // WebRender's own workers, and those glyphs need SkScalerContext_win_dw's
+    // parameters, not platform/windows/font.rs's.
+    const bool skia_caller = CallerForFace(face) == RasterCaller::Skia;
 #else
     constexpr bool skia_caller = false;
 #endif
@@ -5425,8 +5579,26 @@ void FT_Outline_Transform(const FT_Outline* outline, const FT_Matrix* matrix)
     }
 }
 
-// Watched only to learn which glyph an outline holds - the load itself is
-// forwarded untouched. FT_Load_Char is interposed alongside because its
+// Gecko is told hintslight so gfxFT2FontBase::GetFTGlyphExtents leaves the
+// glyph's ink bounds unsnapped, and it passes that on as FT_LOAD_TARGET_LIGHT.
+// The load itself still has to be unhinted. The light autohinter grid-fits
+// horiBearingY and height to whole pixels, which is the rounding the
+// fontconfig answer just removed, and it moves the outline with them.
+// FT_LOAD_NO_HINTING wins over any target mode, so adding it here leaves the
+// render mode the caller asked for alone. See IntegerAnswer in
+// src/fontconfig.cpp.
+FT_Int32 UnhintedLoadFlags(const FT_Int32 load_flags)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (dwcft::ParityActive()) {
+        return load_flags | FT_LOAD_NO_HINTING;
+    }
+#endif
+    return load_flags;
+}
+
+// Watched to learn which glyph an outline holds, and to keep the load unhinted
+// under the hintslight answer. FT_Load_Char is interposed alongside because its
 // internal call to FT_Load_Glyph does not go through this symbol.
 FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 load_flags)
 {
@@ -5444,7 +5616,7 @@ FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 l
     // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     InRealFreeType inside(face != nullptr && face->glyph != nullptr ? &face->glyph->outline
                                                                      : nullptr);
-    const FT_Error error = real(face, glyph_index, load_flags);
+    const FT_Error error = real(face, glyph_index, UnhintedLoadFlags(load_flags));
     if (error == 0) {
         if (face != nullptr && face->glyph != nullptr) {
             SetPendingOutlineFace(&face->glyph->outline, face);
@@ -5469,7 +5641,7 @@ FT_Error FT_Load_Char(FT_Face face, const FT_ULong char_code, const FT_Int32 loa
     // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     InRealFreeType inside(face != nullptr && face->glyph != nullptr ? &face->glyph->outline
                                                                      : nullptr);
-    const FT_Error error = real(face, char_code, load_flags);
+    const FT_Error error = real(face, char_code, UnhintedLoadFlags(load_flags));
     if (error == 0 && g_load_applied == applied_before && face != nullptr &&
         face->glyph != nullptr) {
         SetPendingOutlineFace(&face->glyph->outline, face);
@@ -5604,9 +5776,16 @@ FT_Error FT_Set_Char_Size(FT_Face face, const FT_F26Dot6 char_width, const FT_F2
 // so the branch that lowers the underline for these families is not even
 // compiled into a Linux build. See cleartype/src/shim_exports.h for what the
 // out-parameters mean.
+extern "C" void CleartypeEndInitMetrics(void)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    g_last_sfnt_face = nullptr;
+#endif
+}
+
 extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* underline_size,
                                          double* em_height, double* max_ascent,
-                                         double* max_descent)
+                                         double* max_descent, double* descent_fold)
 {
 #if CLEARTYPE_FIREFOX_PARITY
     // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
@@ -5644,13 +5823,14 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
         *em_height = m.emHeight;
         *max_ascent = m.maxAscent - fold;
         *max_descent = m.maxDescent + fold;
+        *descent_fold = fold;
         answered = 1;
     }
     pthread_mutex_unlock(&g_faces_mutex);
     return answered;
 #else
     (void)underline_offset; (void)underline_size; (void)em_height;
-    (void)max_ascent; (void)max_descent;
+    (void)max_ascent; (void)max_descent; (void)descent_fold;
     return 0;
 #endif
 }
@@ -5857,15 +6037,16 @@ void FT_Outline_Get_CBox(const FT_Outline* outline, FT_BBox* acbox)
     if (g_in_real_freetype != 0) {
         return;
     }
-    const Options& options = GetOptions();
-    if (!options.enabled || outline == nullptr || acbox == nullptr || outline->n_contours == 0 ||
-        CurrentRasterCaller() != RasterCaller::Skia ||
+    if (!InterposerWanted() || outline == nullptr || acbox == nullptr || outline->n_contours == 0 ||
         std::getenv("CLEARTYPE_FORCE_FALLBACK") != nullptr) {
         return;
     }
     FT_Face face = nullptr;
     FT_UInt glyph_index = 0;
     if (!FindOutlineOwner(outline, &face, &glyph_index)) {
+        return;
+    }
+    if (CallerForFace(face) != RasterCaller::Skia) {
         return;
     }
     // Measured for both targets and unioned, since which one the caller will
@@ -5916,7 +6097,13 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
     // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     InRealFreeType inside;
 
-    const Options& options = GetOptions();
+#if CLEARTYPE_FIREFOX_PARITY
+    // Only Skia calls this, so the library it names is Skia's. Recorded before
+    // anything can decline the glyph, because the point of it is the next
+    // glyph's control box, not this one.
+    RecordSkiaLibrary(library);
+#endif
+
     // An LCD target is the subpixel case for any caller. A gray target is
     // how Skia's cairo-FT port (SkScalerContextFTUtils::generateGlyphImage)
     // fills an A8 glyph, whose Windows counterpart is SkScalerContext_DW's
@@ -5929,7 +6116,7 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
 #else
     const bool gray_target = false;
 #endif
-    if (!options.enabled || outline == nullptr || abitmap == nullptr ||
+    if (!InterposerWanted() || outline == nullptr || abitmap == nullptr ||
         (!lcd_target && !gray_target) || abitmap->buffer == nullptr ||
         abitmap->rows == 0 || abitmap->width == 0 ||
         std::getenv("CLEARTYPE_FORCE_FALLBACK") != nullptr) {
@@ -5965,14 +6152,17 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
                           std::max(origin_row, 0);
         if (LogEnabled() &&
             (vis_w <= 0 || vis_h <= 0 || vis_w != image.width || vis_h != image.height)) {
+            // The thread is named because who is calling is the first thing
+            // a clip raises, and the answer is not always the obvious one.
             LogLine("clipped glyph %u face %p: dwrite %dx%d at (%d,%d) into %dx%d "
-                    "bitmap - %ld%% of it lands%s",
+                    "bitmap - %ld%% of it lands%s, on %s",
                     static_cast<unsigned>(glyph_index), static_cast<void*>(face), image.width, image.height,
                     origin_col, origin_row, target_width, target_rows,
                     vis_w <= 0 || vis_h <= 0
                         ? 0L
                         : 100L * vis_w * vis_h / (static_cast<long>(image.width) * image.height),
-                    vis_w <= 0 || vis_h <= 0 ? " - GLYPH LOST" : "");
+                    vis_w <= 0 || vis_h <= 0 ? " - GLYPH LOST" : "",
+                    ThisThreadName() != nullptr ? ThisThreadName() : "an unnamed thread");
         }
     }
 
@@ -6020,7 +6210,6 @@ FT_Error FT_Render_Glyph(FT_GlyphSlot slot, const FT_Render_Mode render_mode)
     // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     InRealFreeType inside(slot != nullptr ? &slot->outline : nullptr);
 
-    const Options& options = GetOptions();
     MaybeLogTableCensus();
 #if CLEARTYPE_FIREFOX_PARITY
     WarnOnMissingParityFonts();
@@ -6038,7 +6227,7 @@ FT_Error FT_Render_Glyph(FT_GlyphSlot slot, const FT_Render_Mode render_mode)
 #else
     const bool handled = (render_mode == FT_RENDER_MODE_LCD);
 #endif
-    if (!options.enabled || !handled || slot == nullptr ||
+    if (!InterposerWanted() || !handled || slot == nullptr ||
         slot->face == nullptr || slot->format != FT_GLYPH_FORMAT_OUTLINE) {
         const FT_Error passed = real(slot, render_mode);
         // FreeType translates the outline to the grid on its way to a bitmap,

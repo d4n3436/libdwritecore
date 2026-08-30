@@ -504,6 +504,10 @@ void** VtableBaseFrom(const Image& image, void** known_slot)
 }
 
 void FindVariationSlot(void** base, void** data_slot);
+void FindVariationSlotFromColr(void** base, size_t colr_slot);
+bool ConfirmVariationSlot(void** base, size_t slot, const void* bridge);
+bool HoldsColrTag(uintptr_t fn);
+unsigned ChromiumMajor();
 
 // Install the rec filter on the Fontations typeface's own vtable. The proxy
 // typeface Linux actually hands to a scaler context forwards onFilterRec to
@@ -516,6 +520,21 @@ void FindVariationSlot(void** base, void** data_slot);
 void PatchTypefaceSlots(void** base, void** data_slot)
 {
     FindVariationSlot(base, data_slot);
+    // The axis position is the virtual after the COLR query in every Skia
+    // revision, so finding that one names it without counting. The symbol
+    // route never looks for it, and the count back from the table calls
+    // depends on the version.
+    for (unsigned i = 0; i < typeface_bridge::kMaxSlotSearched; ++i) {
+        if (reinterpret_cast<unsigned char*>(base + i + 1) > g_image.relro.end) {
+            break;
+        }
+        const auto fn = reinterpret_cast<uintptr_t>(base[i]);
+        if (!InText(g_image, fn) || !HoldsColrTag(fn)) {
+            continue;
+        }
+        FindVariationSlotFromColr(base, i);
+        break;
+    }
     if (void** slot = base + kFilterRecSlot; InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
         g_original_filter_rec = *slot;
         if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
@@ -616,6 +635,78 @@ constexpr size_t kColrSlot = 15;
 std::vector<uintptr_t> g_colr_sites;
 std::vector<uintptr_t> g_vt_starts;
 std::vector<uintptr_t> g_colr_fns;
+
+// Whether this virtual reads the COLR tag, from the tables the module scan
+// built. SkTypeface_Fontations::onGlyphMaskNeedsCurrentColor is the one that
+// does, and the axis position is declared immediately after it.
+// The Chromium version the patched image was built from, read from the user
+// agent string it carries. The SkTypeface layout moves with it, and a count
+// that was right when it was written stops describing the object otherwise.
+unsigned ChromiumMajor()
+{
+    static const unsigned major = [] {
+        struct Ask
+        {
+            uintptr_t base;
+            unsigned found;
+        } ask{g_image.base, 0};
+        dl_iterate_phdr(
+            [](dl_phdr_info* info, size_t, void* data) {
+                auto* a = static_cast<Ask*>(data);
+                if (info->dlpi_addr != a->base) {
+                    return 0;
+                }
+                for (int i = 0; i < info->dlpi_phnum; ++i) {
+                    const ElfW(Phdr)& p = info->dlpi_phdr[i];
+                    if (p.p_type != PT_LOAD || (p.p_flags & (PF_X | PF_W)) != 0) {
+                        continue;
+                    }
+                    const auto* begin =
+                        reinterpret_cast<const unsigned char*>(info->dlpi_addr + p.p_vaddr);
+                    const unsigned char* end = begin + p.p_filesz;
+                    for (const unsigned char* q = begin; q + 12 <= end; ++q) {
+                        if (std::memcmp(q, "Chrome/", 7) != 0) {
+                            continue;
+                        }
+                        unsigned v = 0;
+                        const unsigned char* d = q + 7;
+                        for (; d < end && *d >= '0' && *d <= '9'; ++d) {
+                            v = v * 10 + static_cast<unsigned>(*d - '0');
+                        }
+                        if (d < end && *d == '.' && v >= 100 && v < 1000) {
+                            a->found = v;
+                            return 1;
+                        }
+                    }
+                }
+                return 1;
+            },
+            &ask);
+        if (ask.found != 0) {
+            Report("the image reports Chrome/%u", ask.found);
+        }
+        return ask.found;
+    }();
+    return major;
+}
+
+bool HoldsColrTag(const uintptr_t fn)
+{
+    if (std::ranges::binary_search(g_colr_fns, fn)) {
+        return true;
+    }
+    if (g_vt_starts.empty() || g_image.text_count == 0) {
+        return false;
+    }
+    // A tag anywhere before the next function a vtable names counts, since it
+    // can sit past a branch and outside the site's own function.
+    const auto next = std::ranges::upper_bound(g_vt_starts, fn);
+    const uintptr_t stop = next != g_vt_starts.end()
+                               ? *next
+                               : reinterpret_cast<uintptr_t>(g_image.text[0].end);
+    const auto at = std::ranges::lower_bound(g_colr_sites, fn);
+    return at != g_colr_sites.end() && *at < stop;
+}
 
 // Patch onFilterRec on the typeface vtable a COLR-holding virtual belongs to.
 // This is what an older build gets: its scaler context cannot be named, but
@@ -830,10 +921,17 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         (!may_patch || patched.load(std::memory_order_acquire))) {
         return;
     }
-    if (may_patch) {
-        patched.store(true, std::memory_order_release);
+    // Marked only once the search below succeeds. The first glyph can arrive
+    // with a typeface this cannot read, and settling the answer on that would
+    // stand the search down for the life of the process on one bad sample.
+    // Retried on calls 1, 2, 4, 8 and so on instead, so a process that never
+    // resolves settles into doing almost nothing while one that later paints
+    // through a readable typeface still finds it.
+    static std::atomic<unsigned> attempts{0};
+    if (const unsigned n = attempts.fetch_add(1, std::memory_order_relaxed);
+        (n & (n + 1)) != 0) {
+        return;
     }
-    g_typeface_resolved.store(true, std::memory_order_release);
     if (g_image.text_count == 0 || context == nullptr) {
         return;
     }
@@ -906,9 +1004,18 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         typeface_bridge::SetAnchors(tag_fns, data_fns);
         typeface_bridge::SetSlotHint(vptr, static_cast<unsigned>(tags_at),
                                      static_cast<unsigned>(tags_at + 1));
+        g_typeface_resolved.store(true, std::memory_order_release);
+        if (may_patch) {
+            patched.store(true, std::memory_order_release);
+        }
         Report("typeface vtable %p resolved from a live scaler context: "
                "COLR slot %u, onGetTableTags slot %zu, onGetTableData %zu",
                static_cast<void*>(base), i, tags_at, tags_at + 1);
+        // The COLR query names it, since the axis position is the virtual
+        // immediately after. The distance back from the table calls is not
+        // usable, having moved when Chromium 146 added the two synthetic
+        // style queries.
+        FindVariationSlotFromColr(base, i);
         // The table slots are left alone. Skia dispatches through them while
         // a scaler context is alive, and the bridge reads the tables through
         // the slots it was told about.
@@ -1011,6 +1118,7 @@ bool PatchTypefaceByScalerRef(const Image& image, const CodeMap& map, const uint
         }
         auto* slots = reinterpret_cast<uintptr_t*>(base);
         void** data_slot = nullptr;
+        size_t colr_at = SIZE_MAX;
         for (unsigned i = 0; i < typeface_bridge::kMaxSlotSearched; ++i) {
             if (reinterpret_cast<unsigned char*>(slots + i + 1) > image.relro.end) {
                 break;
@@ -1018,6 +1126,7 @@ bool PatchTypefaceByScalerRef(const Image& image, const CodeMap& map, const uint
             if (!InText(image, slots[i]) || !holds_colr(slots[i])) {
                 continue;
             }
+            colr_at = i;
             const size_t tags_at = i + kColrToTableTags;
             if (reinterpret_cast<unsigned char*>(slots + tags_at + 2) <= image.relro.end &&
                 InText(image, slots[tags_at + 1])) {
@@ -1030,6 +1139,9 @@ bool PatchTypefaceByScalerRef(const Image& image, const CodeMap& map, const uint
         Report("typeface vtable %p found by the scaler context it builds",
                static_cast<void*>(base));
         PatchTypefaceSlots(base, data_slot);
+        if (colr_at != SIZE_MAX) {
+            FindVariationSlotFromColr(base, colr_at);
+        }
         ++patched;
     }
     return patched != 0;
@@ -1818,61 +1930,178 @@ constexpr unsigned kTableTagsToVariationPosition = 13;
 // indexes them, so the same number reaches it through any typeface.
 std::atomic<unsigned> g_variation_index{0};
 
+// Set when the slot was taken from the class layout alone. A build that keeps
+// no symbols has nothing to disassemble against, so the answer is confirmed
+// against the font's own fvar the first time it is read instead.
+std::atomic<bool> g_variation_unconfirmed{false};
+
 void FindVariationSlot(void** base, void** data_slot)
 {
     if (g_variation_index.load(std::memory_order_relaxed) != 0 || data_slot == nullptr) {
         return;
     }
+    // cxxbridge numbers the export and the number moves between Skia
+    // revisions, so both the numbered and unnumbered spellings are asked for
+    // before the class layout is used instead.
     void* bridge = dlsym(RTLD_DEFAULT,
                          "fontations_ffi$cxxbridge1$194$variation_position");
     if (bridge == nullptr) {
-        return;
+        bridge = dlsym(RTLD_DEFAULT, "fontations_ffi$cxxbridge1$variation_position");
     }
     const auto tags = static_cast<size_t>(data_slot - 1 - base);
     if (tags <= kTableTagsToVariationPosition) {
         return;
     }
-    const size_t slot = tags - kTableTagsToVariationPosition;
-
-    // Confirm the slot before dispatching on it. The wrapper reaches the one
-    // bridge export that answers the axis position, within its own prologue.
-    // onMakeClone reaches the same export, so a scan that took the first slot
-    // matching would answer with that instead.
-    const auto fn = reinterpret_cast<uintptr_t>(base[slot]);
-    if (!InText(g_image, fn)) {
-        return;
+    // One candidate, not a search. From Chromium 146 on, SkTypeface declares
+    // onIsSyntheticBold and onIsSyntheticOblique between the axis position and
+    // the table calls, so the distance is 11 before that version and 13 after.
+    // A window wide enough to cover both would take an earlier slot that also
+    // reaches the bridge.
+    const size_t back = ChromiumMajor() >= 146 ? kTableTagsToVariationPosition
+                                               : kTableTagsToVariationPosition - 2;
+    if (back < tags) {
+        ConfirmVariationSlot(base, tags - back, bridge);
     }
+}
+
+// Confirms a candidate against the bridge export and takes it if it matches.
+bool ConfirmVariationSlot(void** base, const size_t slot, const void* bridge)
+{
+    const auto fn = reinterpret_cast<uintptr_t>(base[slot]);
+    if (!InText(g_image, fn) || bridge == nullptr) {
+        return false;
+    }
+    // The wrapper reaches the one bridge export that answers the axis
+    // position, within its own prologue. onMakeClone reaches the same export,
+    // so a scan that took the first slot matching would answer with that.
+    // Whether this code reaches the bridge by direct call or tail jump within
+    // `span` bytes of its start.
+    const auto reaches = [&](const uintptr_t code, const unsigned span) {
+        if (!InText(g_image, code)) {
+            return false;
+        }
+        const auto* p = reinterpret_cast<const unsigned char*>(code);
+        for (unsigned off = 0; off + 5 <= span; ++off) {
+            if (p[off] != 0xE8 && p[off] != 0xE9) {
+                continue;
+            }
+            int32_t rel = 0;
+            std::memcpy(&rel, p + off + 1, sizeof(rel));
+            if (code + off + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel)) ==
+                reinterpret_cast<uintptr_t>(bridge)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     const auto* at = reinterpret_cast<const unsigned char*>(fn);
-    for (unsigned off = 0; off + 5 <= 0x60; ++off) {
+    // Wide enough to reach a call placed past a prologue that sets up several
+    // arguments, which is over 0x60 bytes into the virtual on some builds.
+    for (unsigned off = 0; off + 5 <= 0x100; ++off) {
         // A call or a tail jump; a wrapper this thin ends in the latter.
         if (at[off] != 0xE8 && at[off] != 0xE9) {
             continue;
         }
         int32_t rel = 0;
         std::memcpy(&rel, at + off + 1, sizeof(rel));
-        if (fn + off + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel)) ==
-            reinterpret_cast<uintptr_t>(bridge)) {
-            g_variation_index.store(static_cast<unsigned>(slot),
-                                    std::memory_order_relaxed);
+        const uintptr_t target =
+            fn + off + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
+        // The virtual may call a six-byte shim that tail jumps to the bridge
+        // rather than the bridge itself, which is what Electron 39 builds.
+        if (target == reinterpret_cast<uintptr_t>(bridge) || reaches(target, 0x20)) {
+            g_variation_index.store(static_cast<unsigned>(slot), std::memory_order_relaxed);
             Report("onGetVariationDesignPosition is slot %zu", slot);
-            return;
+            return true;
         }
     }
-    Report("slot %zu does not answer the axis position, so variable font "
-           "instances will draw at their default", slot);
+    return false;
+}
+
+// SkTypeface declares the axis position immediately after the COLR query, in
+// every revision Chromium 142 through 150 ships. The COLR slot is found by the
+// tag its function reads, so this needs no count and no version. A build with
+// no symbols has nothing to confirm the answer against, and ReadVariationCoords
+// checks it against the font's own fvar before it is trusted.
+void FindVariationSlotFromColr(void** base, const size_t colr_slot)
+{
+    if (g_variation_index.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    const size_t slot = colr_slot + 1;
+    if (slot >= typeface_bridge::kMaxSlotSearched ||
+        !InText(g_image, reinterpret_cast<uintptr_t>(base[slot]))) {
+        return;
+    }
+    void* bridge = dlsym(RTLD_DEFAULT, "fontations_ffi$cxxbridge1$194$variation_position");
+    if (bridge == nullptr) {
+        bridge = dlsym(RTLD_DEFAULT, "fontations_ffi$cxxbridge1$variation_position");
+    }
+    if (ConfirmVariationSlot(base, slot, bridge)) {
+        return;
+    }
+    g_variation_unconfirmed.store(true, std::memory_order_relaxed);
+    g_variation_index.store(static_cast<unsigned>(slot), std::memory_order_relaxed);
+    Report("onGetVariationDesignPosition is slot %zu, the virtual after the COLR "
+           "query; the font's own axes confirm it", slot);
+}
+
+// The axes the font itself declares, which is what an answer from the vtable
+// has to agree with.
+std::vector<uint32_t> FvarAxes(const std::vector<uint8_t>& font)
+{
+    const font_facts::Span fvar = font_facts::FindTable(font, kFvarTag);
+    if (fvar.data == nullptr || fvar.size < 16) {
+        return {};
+    }
+    const auto be16 = [&](const size_t at) {
+        return static_cast<size_t>(fvar.data[at]) << 8 | fvar.data[at + 1];
+    };
+    const size_t axes_at = be16(4);
+    const size_t count = be16(8);
+    const size_t size = be16(10);
+    if (count == 0 || count > 64 || size < 4 || axes_at + count * size > fvar.size) {
+        return {};
+    }
+    std::vector<uint32_t> tags;
+    tags.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const uint8_t* p = fvar.data + axes_at + i * size;
+        tags.push_back(static_cast<uint32_t>(p[0]) << 24 | static_cast<uint32_t>(p[1]) << 16 |
+                       static_cast<uint32_t>(p[2]) << 8 | p[3]);
+    }
+    return tags;
 }
 
 // Read under g_font_mutex, beside the bytes, so the coords and the font they
 // vary always answer together.
-void ReadVariationCoords(void* typeface)
+void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
 {
     const unsigned index = g_variation_index.load(std::memory_order_relaxed);
     if (index == 0 || g_var_coords.contains(typeface)) {
         return;
     }
+    // Only a variable font has anything to ask for, and on a build where the
+    // slot is unconfirmed this keeps the call off every other font.
+    const std::vector<uint32_t> axes = FvarAxes(font);
+    if (axes.empty()) {
+        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+        return;
+    }
     const auto fn = reinterpret_cast<VariationPositionFn>(
         (*reinterpret_cast<void***>(typeface))[index]);
     const int count = fn(typeface, nullptr, 0);
+    const bool unconfirmed = g_variation_unconfirmed.load(std::memory_order_relaxed);
+    const auto give_up = [&](const char* why) {
+        g_variation_index.store(0, std::memory_order_relaxed);
+        Report("slot %u %s, so it is not onGetVariationDesignPosition; variable fonts "
+               "will draw at their default instance", index, why);
+        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+    };
+    if (unconfirmed && count != static_cast<int>(axes.size())) {
+        give_up("does not answer the font's axis count");
+        return;
+    }
     if (count <= 0 || count > 64) {
         g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
         return;
@@ -1880,6 +2109,20 @@ void ReadVariationCoords(void* typeface)
     std::vector<dwrite_raster::VariationCoord> coords(static_cast<size_t>(count));
     if (fn(typeface, coords.data(), coords.size()) != count) {
         coords.clear();
+    }
+    if (unconfirmed) {
+        // The count alone is weak, since a neighbouring slot could return the
+        // same small number. The tags come from the font, so a slot answering
+        // all of them is the one that reads fvar.
+        for (const dwrite_raster::VariationCoord& c : coords) {
+            if (std::ranges::find(axes, c.axis) == axes.end()) {
+                give_up("answers an axis the font does not declare");
+                return;
+            }
+        }
+        g_variation_unconfirmed.store(false, std::memory_order_relaxed);
+        Report("slot %u answers the font's axes, so it is "
+               "onGetVariationDesignPosition", index);
     }
     g_var_coords.emplace(typeface, std::move(coords));
 }
@@ -1914,7 +2157,7 @@ const std::vector<uint8_t>& FontBytesLocked(void* typeface)
         } else {
             Report("typeface %p: rebuilt %zu bytes from its tables", typeface, bytes.size());
         }
-        ReadVariationCoords(typeface);
+        ReadVariationCoords(typeface, bytes);
         font = g_fonts.emplace(typeface, std::move(bytes)).first;
     }
     return font->second;
@@ -2577,8 +2820,6 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     // Blink reads VDMX while it builds the font, so the patch has to land
     // here and not at the first glyph.
     ResolveTypefaceFromContext(context, true);
-
-
     if (context == nullptr || metrics == nullptr || !chromium_patch::ParityWanted()) {
         return;
     }
@@ -2737,32 +2978,6 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
                facts.is_hinted ? 1 : 0, facts.gasp_known ? 1 : 0,
                facts.gasp_version_1_or_later ? 1 : 0, facts.gasp_symmetric_smoothing ? 1 : 0,
                facts.has_bitmap_strike ? 1 : 0, facts.has_cbdt ? 1 : 0);
-    }
-
-    if (!chromium_patch::ParityWanted()) {
-        return false;
-    }
-
-    if (font.empty()) {
-        return false;
-    }
-
-    // Says whether the box Skia is asking to have filled is the one
-    // OnChromiumMetrics wrote, which is what Windows draws into.
-    if (static const bool box_log = std::getenv("DWC_BOX_LOG") != nullptr; box_log) {
-        int left = 0;
-        int top = 0;
-        int right = 0;
-        int bottom = 0;
-        if (dwrite_raster::GlyphBounds(face_key, *use, g, rec, d, d.rendering_mode,
-                                       d.texture_type, &left, &top, &right, &bottom,
-                                       face_index, simulate_bold) &&
-            (left != g.left || top != g.top || right - left != g.width ||
-             bottom - top != g.height)) {
-            Report("box: glyph %u sub=(%u,%u) skia %d,%d %ux%u against dwrite %d,%d %dx%d",
-                   g.GlyphId(), g.SubX(), g.SubY(), g.left, g.top, g.width, g.height, left,
-                   top, right - left, bottom - top);
-        }
     }
 
     const skia_abi::PreBlend preblend = skia_abi::PreBlend::From(context);

@@ -42,6 +42,7 @@
 #include <vector>
 
 #include <dlfcn.h>
+#include <link.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
