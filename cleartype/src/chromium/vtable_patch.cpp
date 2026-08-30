@@ -1661,41 +1661,95 @@ bool IsBrowserProcess()
     return std::strstr(buf, "--type=") == nullptr;
 }
 
+// Whether a module's read-only data holds this file name. A __FILE__ from one
+// translation unit names the module that was built from it, which is how a
+// build that withholds its symbols is still recognized: CEF exports its cef_*
+// surface and nothing else, and keeps no symbol table at all.
+bool CarriesAnchor(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half) phnum,
+                   const char* anchor)
+{
+    // This library holds every anchor it looks for, since they are written
+    // down in it. Its own image is never the host's.
+    static const uintptr_t self = [] {
+        Dl_info info{};
+        return dladdr(reinterpret_cast<const void*>(&CarriesAnchor), &info) != 0
+                   ? reinterpret_cast<uintptr_t>(info.dli_fbase)
+                   : 0;
+    }();
+    if (self != 0 && base == self) {
+        return false;
+    }
+    const size_t length = std::strlen(anchor);
+    for (ElfW(Half) i = 0; i < phnum; ++i) {
+        const ElfW(Phdr)& p = phdr[i];
+        if (p.p_type != PT_LOAD || (p.p_flags & PF_X) != 0 || (p.p_flags & PF_W) != 0) {
+            continue;
+        }
+        const auto* begin = reinterpret_cast<const unsigned char*>(base + p.p_vaddr);
+        if (memmem(begin, p.p_filesz, anchor, length) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Skia's Fontations typeface, which is the class the raster patch replaces.
+constexpr char kFontationsAnchor[] = "skia/src/ports/SkTypeface_fontations.cpp";
+
+// The translation unit that defines GetFontRenderParamsFromFcPattern. It
+// names the module to look in, which fontconfig itself never is: a build that
+// links fontconfig shared has the same six property names in it, and the
+// function reading all six there is fontconfig's own.
+constexpr char kRenderParamsAnchor[] = "ui/gfx/linux/fontconfig_util.cc";
+
 void ScanLoadedImages()
 {
     if (g_done.exchange(true)) {
         return;
     }
     if (chromium_patch::ParityWanted() && IsBrowserProcess()) {
-        // The main executable only, which is where Chromium keeps this
-        // function whichever scaler it was built with. Looking more widely
-        // would reach fontconfig's own copies of the same property names.
+        // The module built from fontconfig_util.cc, which is the one holding
+        // the function. Looking everywhere would reach fontconfig's own copies
+        // of the same property names, and the function reading all six there
+        // is fontconfig's; the anchor is what tells the two apart.
         //
-        // A build that compiles fontconfig in holds those copies in the main
-        // executable too. The scan still identifies the target, because it
-        // requires one function to read all six property names and the
-        // runner-up to read fewer; on such a build the runner-up reads one,
-        // the same margin a dynamically linked one gives.
+        // A build that compiles fontconfig in holds those copies in the same
+        // module. The scan still identifies the target, because it requires
+        // one function to read all six property names and the runner-up to
+        // read fewer.
         //
         // No Fontations symbols are required here. This patch names its target
         // by the properties it reads and refuses when no single function reads
         // them all, so it applies to any Chromium build.
         ModuleList browser;
         dl_iterate_phdr(CollectModule, &browser);
+        const LoadedModule* carrying = nullptr;
+        const LoadedModule* executable = nullptr;
         for (unsigned i = 0; i < browser.count; ++i) {
             const LoadedModule& m = browser.mods[i];
-            if (m.name != nullptr && m.name[0] != '\0') {
-                continue;
+            if (m.name == nullptr || m.name[0] == '\0') {
+                executable = &m;
             }
-            render_params_patch::Apply(m.base, m.phdr, m.phnum);
-            break;
+            if (carrying == nullptr &&
+                CarriesAnchor(m.base, m.phdr, m.phnum, kRenderParamsAnchor)) {
+                carrying = &m;
+            }
+        }
+        if (const LoadedModule* m = carrying != nullptr ? carrying : executable; m != nullptr) {
+            render_params_patch::Apply(m->base, m->phdr, m->phnum);
         }
         return;
     }
     if (!ShouldScanThisProcess()) {
         return;
     }
-    if (EnvDisables("CHROMIUM_PATCH")) {
+    // A slot replaced at load cannot be put back, so the answer is asked
+    // before anything is written and not only when a glyph arrives.
+    // bold_fallback and bold_shaping gate their own installers the same way.
+    if (!chromium_patch::ParityWanted()) {
+        return;
+    }
+    if (EnvDisables("CLEARTYPE_CHROMIUM_PATCH")) {
         return;
     }
 
@@ -1704,23 +1758,39 @@ void ScanLoadedImages()
 
     // Out of the callback, since dl_iterate_phdr holds the loader's list lock
     // and the open()/mmap() below must not run under it.
+    //
+    // The module that names the bridge is taken first, since its symbols rank
+    // the candidate vtables. Failing that, the one carrying Skia's Fontations
+    // typeface, which is the same code with its names withheld. The executable
+    // is the last resort, and TryPatchModule refuses there when no vtable of
+    // the right shape reaches anything.
     for (unsigned i = 0; i < list.count; ++i) {
         const LoadedModule& m = list.mods[i];
         const char* path = m.name != nullptr && m.name[0] != '\0' ? m.name : "/proc/self/exe";
         std::vector<FfiSymbol> syms;
         // Well under what a real Fontations build exports, but enough to rule
         // out a few unrelated dynsym entries that contain the substring.
-        if (!FindFfiSymbols(path, "fontations_ffi", &syms) || syms.size() < 10) {
-            // A build can link the same Skia with nothing exported. Only the
-            // executable itself is worth the scan, and TryPatchModule refuses
-            // when the tag anchor finds no vtable of the right shape.
-            if (m.name != nullptr && m.name[0] != '\0') {
-                continue;
-            }
-            syms.clear();
+        if (FindFfiSymbols(path, "fontations_ffi", &syms) && syms.size() >= 10) {
+            TryPatchModule(m.base, m.phdr, m.phnum, path, syms);
+            return;
         }
-        TryPatchModule(m.base, m.phdr, m.phnum, path, syms);
+    }
+    for (unsigned i = 0; i < list.count; ++i) {
+        const LoadedModule& m = list.mods[i];
+        if (!CarriesAnchor(m.base, m.phdr, m.phnum, kFontationsAnchor)) {
+            continue;
+        }
+        const char* path = m.name != nullptr && m.name[0] != '\0' ? m.name : "/proc/self/exe";
+        Report("%s carries the Fontations typeface and names none of it", path);
+        TryPatchModule(m.base, m.phdr, m.phnum, path, {});
         return;
+    }
+    for (unsigned i = 0; i < list.count; ++i) {
+        const LoadedModule& m = list.mods[i];
+        if (m.name == nullptr || m.name[0] == '\0') {
+            TryPatchModule(m.base, m.phdr, m.phnum, "/proc/self/exe", {});
+            return;
+        }
     }
 }
 
@@ -2603,14 +2673,26 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const void* face_key = typeface;
     uint32_t face_index = 0;
     bool simulate_bold = false;
-    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
-        bold.bytes != nullptr || bold.simulate) {
+    const bold_fallback::Face bold = BoldSubstitute(context, font);
+    if (bold.bytes != nullptr || bold.simulate) {
         simulate_bold = bold.simulate;
         if (bold.bytes != nullptr) {
             use = bold.bytes;
             face_key = bold.bytes->data();
             face_index = bold.face_index;
         }
+    } else if ((rec.flags & skia_abi::kEmbolden) != 0) {
+        // The rec asks for a synthetic bold and no face was found to carry it.
+        // Drawing here would return a glyph of ordinary weight and report it
+        // as done, and Skia's own stroke never runs, so the run loses its
+        // bold. The glyph goes back to Skia, which strokes it as it would
+        // have without any of this. A build whose font list cannot be read is
+        // where this happens, since nothing is mapped to substitute.
+        static std::atomic said{false};
+        if (!said.exchange(true)) {
+            Report("no bold face is available, so emboldened glyphs stay with Skia");
+        }
+        return true;
     }
 
     // Without DirectWrite the tree takes the branch Skia takes for a font with
