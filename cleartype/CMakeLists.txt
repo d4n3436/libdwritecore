@@ -3,15 +3,16 @@ find_package(Threads REQUIRED)
 # The Chromium half needs an assembler for its vtable thunks.
 enable_language(ASM)
 
-add_library(cleartype SHARED
-  src/freetype.cpp
-  src/libxul_patch.cpp
-  src/fontconfig.cpp
-  src/prefs.cpp
-  src/parity_mode.cpp
-  # Chromium, Electron and the Electron applications. Gecko is patched
-  # through libxul_patch.cpp above; these reach Skia's scaler context
-  # instead. See src/chromium/vtable_patch.cpp.
+# OFF leaves the Chromium patch out altogether. ON compiles it in; it still
+# applies only where its targets are found, which each patch decides for
+# itself, and only when CLEARTYPE_CHROMIUM says so at run time.
+option(CLEARTYPE_CHROMIUM_PARITY
+  "Reproduce Chromium-on-Windows font selection, metrics and rasterization" ON)
+
+# Chromium, Electron and the Electron applications. Gecko is patched through
+# libxul_patch.cpp instead; these reach Skia's scaler context. See
+# src/chromium/vtable_patch.cpp.
+set(cleartype_chromium_sources
   src/chromium/vtable_patch.cpp
   src/chromium/windows_path.cpp
   src/chromium/typeface_bridge.cpp
@@ -28,15 +29,27 @@ add_library(cleartype SHARED
   src/chromium/generic_families.cpp
   src/chromium/static_fontconfig.cpp
   src/chromium/hook_thunk.S)
+if(NOT CLEARTYPE_CHROMIUM_PARITY)
+  set(cleartype_chromium_sources)
+endif()
+
+add_library(cleartype SHARED
+  src/freetype.cpp
+  src/libxul_patch.cpp
+  src/fontconfig.cpp
+  src/prefs.cpp
+  src/parity_mode.cpp
+  ${cleartype_chromium_sources})
 
 # OFF leaves the parity paths out altogether, for a plain FreeType-to-
 # DirectWrite interposer. ON compiles them in; they still apply only to a Gecko
 # process, which parity_mode.cpp decides at runtime.
-option(DWRITECORE_FIREFOX_PARITY
+option(CLEARTYPE_FIREFOX_PARITY
   "Reproduce Firefox-on-Windows glyph advances, metrics and synthetic oblique" ON)
 
 target_compile_definitions(cleartype
-  PRIVATE DWRITECORE_FIREFOX_PARITY=$<BOOL:${DWRITECORE_FIREFOX_PARITY}>
+  PRIVATE CLEARTYPE_FIREFOX_PARITY=$<BOOL:${CLEARTYPE_FIREFOX_PARITY}>
+  PRIVATE CLEARTYPE_CHROMIUM_PARITY=$<BOOL:${CLEARTYPE_CHROMIUM_PARITY}>
   # IDWriteFactory5 for the in-memory font file loader and IDWriteFactory2 for
   # the grid-fit and antialias arguments to CreateGlyphRunAnalysis are gated in
   # dwrite_3.h behind DWRITE_CORE or a Windows 10 NTDDI version.

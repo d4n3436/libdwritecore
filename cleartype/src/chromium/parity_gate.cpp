@@ -16,8 +16,7 @@ bool ParityWanted()
         if (!dwcft::Enabled()) {
             return false;
         }
-        const char* v = std::getenv("CHROMIUM_PATCH_DWRITE");
-        return v != nullptr && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0);
+        return !dwcft::IsOffValue(std::getenv("CLEARTYPE_CHROMIUM"));
     }();
     return wanted;
 }

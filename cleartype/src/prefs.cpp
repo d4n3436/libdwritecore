@@ -20,7 +20,7 @@
 //
 //----------------------------------------------------------------------------
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 #include "firefox_parity_data.h"
 #include "parity_mode.h"
@@ -273,4 +273,4 @@ __attribute__((constructor)) void SupplyWindowsPrefs()
 
 }  // namespace
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY

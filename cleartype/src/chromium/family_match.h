@@ -23,7 +23,12 @@
 #ifndef CHROMIUM_FAMILY_MATCH_H_INCLUDED
 #define CHROMIUM_FAMILY_MATCH_H_INCLUDED
 
+#ifndef CLEARTYPE_CHROMIUM_PARITY
+#  define CLEARTYPE_CHROMIUM_PARITY 1
+#endif
+
 namespace family_match {
+#if CLEARTYPE_CHROMIUM_PARITY
 
 // The set FcFontSort returned, reordered so the face DirectWrite would have
 // answered with sits first. cleartype/src/fontconfig.cpp owns the interposer
@@ -40,6 +45,13 @@ float OpenTypeWeight(int fc_weight);
 // cleartype/src/chromium/bold_fallback.cpp asks the same question of a family
 // whose faces it is choosing among.
 bool BeatsForWindows(float candidate, float best, float wanted);
+
+#else
+
+// Built without the Chromium patch, so the set goes back as it arrived.
+inline void ReorderForWindows(const void*, void*) {}
+
+#endif
 
 }  // namespace family_match
 

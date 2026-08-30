@@ -168,7 +168,7 @@ mkdir -p "$STATE"
 env_args=(--unset=WAYLAND_DISPLAY
           DISPLAY="$DISPLAY_NAME" DWC_URL="$URL" DWC_W="$WIDTH" DWC_H="$HEIGHT")
 [ -n "$LIBDIR" ]  && env_args+=(LD_LIBRARY_PATH="$LIBDIR")
-[ -n "$PRELOAD" ] && env_args+=(LD_PRELOAD="$PRELOAD" CHROMIUM_PATCH_DWRITE=1)
+[ -n "$PRELOAD" ] && env_args+=(LD_PRELOAD="$PRELOAD")
 
 # Occlusion throttling stays off because a sharded sweep runs two instances
 # on one screen, one window fully covering the other, and a covered window's

@@ -36,7 +36,7 @@
 //
 //  The first three answers are compiled in unconditionally. The two that turn
 //  hinting off are a statement about Firefox's advance arithmetic and not
-//  about rasterization, so they need a DWRITECORE_FIREFOX_PARITY build, as do
+//  about rasterization, so they need a CLEARTYPE_FIREFOX_PARITY build, as do
 //  the matching questions in the FcFontSort block below. Whether any of them
 //  is answered at all is decided by Answering, below.
 //
@@ -224,7 +224,7 @@ bool IntegerAnswer(const char* object, const int n, int* out)
         *out = kFcLcdDefault;
         return true;
     }
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // Only for Firefox: gfxFT2FontBase reads the unrounded advance when the
     // pattern says no hinting, which is what Windows measures with.
     if (Answers(object, n, "hintstyle")) {
@@ -241,7 +241,7 @@ bool BoolAnswer(const char* object, const int n, int* out)
         *out = 1;
         return true;
     }
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     if (Answers(object, n, "hinting")) {
         *out = 0;
         return true;
@@ -251,7 +251,7 @@ bool BoolAnswer(const char* object, const int n, int* out)
 }
 
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 // ---------------------------------------------------------------------------
 // Matching.
@@ -864,7 +864,7 @@ FcPattern* FcFontMatch(FcConfig* config, FcPattern* pattern, FcResult* result)
 
 namespace {
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 }  // namespace
 

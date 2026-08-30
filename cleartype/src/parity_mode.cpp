@@ -27,8 +27,8 @@
 //  and for a fork that renamed the binary. Matching a list of brand names
 //  would recognize none of those.
 //
-//  Either signal is enough. CLEARTYPE_FORCE_PARITY=0 or 1 overrides both,
-//  and CLEARTYPE=0 switches the whole library off ahead of either.
+//  Either signal is enough. CLEARTYPE_FIREFOX=0 turns it off whatever they
+//  say, and CLEARTYPE=0 switches the whole library off ahead of both.
 //
 //----------------------------------------------------------------------------
 
@@ -45,8 +45,6 @@
 
 namespace dwcft
 {
-namespace
-{
 
 bool IsOffValue(const char* v)
 {
@@ -54,8 +52,6 @@ bool IsOffValue(const char* v)
            (std::strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
             strcasecmp(v, "no") == 0 || strcasecmp(v, "false") == 0);
 }
-
-}  // namespace
 
 // Read once. An environment variable does not change under a running process
 // without an exec, and an exec starts this over.
@@ -67,35 +63,14 @@ bool Enabled()
 
 }  // namespace dwcft
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 namespace dwcft
 {
 namespace
 {
 
-using dwcft::IsOffValue;
-
 std::atomic g_gecko_loaded{false};
-
-enum class Override
-{
-    kAuto,
-    kOn,
-    kOff
-};
-
-Override ReadOverride()
-{
-    const char* v = std::getenv("CLEARTYPE_FORCE_PARITY");
-    if (v == nullptr || strcasecmp(v, "auto") == 0) {
-        return Override::kAuto;
-    }
-    if (IsOffValue(v)) {
-        return Override::kOff;
-    }
-    return Override::kOn;
-}
 
 // Is there a libxul.so next to this process's executable? Answered once: a
 // process does not change its executable without exec'ing, and an exec starts
@@ -165,17 +140,22 @@ bool ParityActive()
     if (!Enabled()) {
         return false;
     }
-    static const Override override_mode = ReadOverride();
-    if (override_mode != Override::kAuto) {
-        return override_mode == Override::kOn;
+    // Off on request, and otherwise whatever the process turns out to be.
+    // There is no way to turn it on where it does not belong: the parity work
+    // reproduces Firefox on Windows, and imposing that on a host that is not
+    // Gecko is wrong rather than merely unwanted.
+    static const bool wanted = !IsOffValue(std::getenv("CLEARTYPE_FIREFOX"));
+    if (!wanted) {
+        return false;
     }
 
-    // Checked before the flag, because it is the signal that is already true
-    // at the point the earliest decisions are made.
+    // The installation layout is the signal that is already true at the point
+    // the earliest decisions are made, before libxul has been opened and
+    // NoteGeckoLoaded can say so.
     static const bool install_layout = GeckoInstallLayout();
     return install_layout || g_gecko_loaded.load(std::memory_order_relaxed);
 }
 
 }  // namespace dwcft
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY

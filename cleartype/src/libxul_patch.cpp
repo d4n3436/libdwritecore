@@ -64,7 +64,7 @@
 //
 //----------------------------------------------------------------------------
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 #include "firefox_parity_data.h"
 #include "parity_mode.h"
@@ -2004,4 +2004,4 @@ void* dlopen(const char* file, const int mode)
     return handle;
 }
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY

@@ -30,7 +30,7 @@
 #include "parity_mode.h"
 #include "shim_exports.h"
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 #  include "firefox_parity_data.h"
 #endif
 
@@ -313,7 +313,7 @@ DEFINE_REAL(ft_request_size_fn, FT_Request_Size)
 DEFINE_REAL(ft_get_sfnt_table_fn, FT_Get_Sfnt_Table)
 DEFINE_REAL(ft_mulfix_fn, FT_MulFix)
 // Not interposed - only read, to answer the embedded-bitmap question below.
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 DEFINE_REAL(ft_load_sfnt_table_fn, FT_Load_Sfnt_Table)
 #endif
 
@@ -340,8 +340,8 @@ FT_Long MulFix(const FT_Long a, const FT_Long b)
 // ---------------------------------------------------------------------------
 // Firefox parity.
 //
-// Everything under DWRITECORE_FIREFOX_PARITY (opt-out: build with
-// -DDWRITECORE_FIREFOX_PARITY=0 for a plain FreeType-to-DirectWrite
+// Everything under CLEARTYPE_FIREFOX_PARITY (opt-out: build with
+// -DCLEARTYPE_FIREFOX_PARITY=0 for a plain FreeType-to-DirectWrite
 // interposer) reproduces what Firefox 154.0 does on Windows, translated from
 // the Firefox source at mozilla-release 9ce1ee6baeb9a3c326dbd180bdece65d8fc2eadc
 // (tag FIREFOX_154_0_RELEASE). Each site names the Firefox file and function
@@ -357,8 +357,8 @@ FT_Long MulFix(const FT_Long a, const FT_Long b)
 //   gfx/src/nsFontMetrics.cpp, layout/painting/nsCSSRendering.cpp
 // ---------------------------------------------------------------------------
 
-#ifndef DWRITECORE_FIREFOX_PARITY
-#  define DWRITECORE_FIREFOX_PARITY 1
+#ifndef CLEARTYPE_FIREFOX_PARITY
+#  define CLEARTYPE_FIREFOX_PARITY 1
 #endif
 
 // ---------------------------------------------------------------------------
@@ -600,7 +600,7 @@ void InitOptions()
     // size->metrics and the OS/2 line gap on a shared FT_Face, so every
     // consumer of that face in the process sees numbers made right for one
     // code path.
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     g_options.windows_metrics = EnvIsOff("CLEARTYPE_WINDOWS_METRICS", true);
 #endif
 
@@ -663,7 +663,7 @@ thread_local char g_thread_name[16 + 1];
 thread_local bool g_thread_named = false;
 }  // namespace
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 static const char* ThisThreadName()
 {
     return g_thread_named ? g_thread_name : nullptr;
@@ -772,7 +772,7 @@ Factories GetFactories()
     return snapshot;
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 // Created when this library is loaded, not on first use: gfxFT2FontBase::
 // InitMetrics runs in Firefox's content processes, whose sandbox
 // (security/sandbox/linux) starts after process startup and from then on
@@ -896,7 +896,7 @@ struct CachedMode
     bool answered = false;  // false: GetRecommendedRenderingMode failed
 };
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 // One EBLC bitmapSizeTable / EBSC bitmapScaleTable entry, as
 // gfxDWriteFont::HasBitmapStrikeForSize reads them.
 struct EblcStrike
@@ -965,7 +965,7 @@ struct WinInstance
     DWRITE_FONT_METRICS font_metrics;
     WinMetrics metrics;
 };
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 struct FaceEntry
 {
@@ -979,7 +979,7 @@ struct FaceEntry
     // Properties of the file, answered once; -1 until asked.
     int is_cjk = -1;
     bool strikes_read = false;
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     std::vector<EblcStrike> eblc;
     std::vector<EbscStrike> ebsc;
     int has_colr = -1;
@@ -1062,7 +1062,7 @@ void EraseFaceLocked(const size_t index)
             faces.push_back(cached.face);
         }
     }
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     for (const WinInstance& inst : g_faces[index].instances) {
         if (inst.dwrite_face != nullptr) {
             faces.push_back(inst.dwrite_face);
@@ -1974,7 +1974,7 @@ bool AxesSwapped(const DWRITE_MATRIX& m)
 // and are either exact for upright horizontal text (xx, yy, ft_delta, the
 // subpixel dx, the cbox shift) or recovered elsewhere - see ExactEmSize for the
 // char size.
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 float SkewForAngle(const int angle_256)
 {
@@ -2009,7 +2009,7 @@ bool ExactObliqueSkew(const FT_Matrix& m, float* skew)
     return false;
 }
 
-#else  // !DWRITECORE_FIREFOX_PARITY
+#else  // !CLEARTYPE_FIREFOX_PARITY
 
 // Without Firefox to reproduce there is no sender whose quantization is known,
 // so the matrix is whatever the caller sent.
@@ -2039,7 +2039,7 @@ bool MatrixIsIdentity(const FT_Matrix& m)
            within_one(m.yx, 0) && within_one(m.yy, 0x10000);
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 // The TTAG_* spellings live in a private FreeType header.
 constexpr FT_ULong kTagEBLC = FT_MAKE_TAG('E', 'B', 'L', 'C');
@@ -2205,7 +2205,7 @@ bool FaceHasCOLRLocked(FaceEntry* entry)
     return entry->has_colr != 0;
 }
 
-#else  // !DWRITECORE_FIREFOX_PARITY
+#else  // !CLEARTYPE_FIREFOX_PARITY
 
 inline bool IsBitmapFontLocked(FaceEntry*, double) { return false; }
 inline bool FaceHasCOLRLocked(FaceEntry*) { return false; }
@@ -2775,7 +2775,7 @@ void RecordRequestedEmSize(FT_Face face, const FT_Fixed pixel_size_26_6)
     pthread_mutex_unlock(&g_faces_mutex);
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 FT_Fixed RequestedEmSize(FT_Face face)
 {
     FT_Fixed requested = 0;
@@ -2794,7 +2794,7 @@ FT_Fixed RequestedEmSize(FT_Face face)
 // Taken from the 16.16 scale factors, not from x_ppem and y_ppem, which are
 // whole pixels. FT_MulFix(units_per_EM, x_scale) is the scaled em in 26.6.
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 // Undo the quantization Firefox applies on the way into FreeType.
 //
 // The size Firefox lays out and rasterizes with is a CSS computed font-size,
@@ -2842,7 +2842,7 @@ bool ExactEmSize(const FT_Fixed em_size_26_6, double* exact)
     *exact = px;
     return true;
 }
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 // The size FreeType is actually scaling outlines by, snapping and all, in 26.6
 // fixed point.
@@ -2881,7 +2881,7 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
     if (!GetScaledEmSize(face, em_size, x_over_y)) {
         return false;
     }
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // The recorded request is only trusted when its whole-pixel rounding is
     // the ppem FreeType settled on, which ties it to the size object that is
     // currently installed on the face.
@@ -2903,14 +2903,14 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
 
 bool GetEmSize(FT_Face face, double* em_size, float* x_over_y)
 {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     return GetEmSizeWithRequest(face, RequestedEmSize(face), em_size, x_over_y);
 #else
     return GetEmSizeWithRequest(face, 0, em_size, x_over_y);
 #endif
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 // ---------------------------------------------------------------------------
 // The Windows font instance.
@@ -3616,11 +3616,11 @@ void CapSfntCopiesLocked(Copies& copies, const SfntKey& keep)
     }
 }
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 size_t SfntCopyCountLocked()
 {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     return g_os2_copies.size() + g_post_copies.size();
 #else
     return 0;
@@ -3647,7 +3647,7 @@ void LogTableCensus(const char* when)
     faces = g_faces.size();
     for (const FaceEntry& entry : g_faces) {
         dwrite_faces += entry.dwrite_faces.size();
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
         instances += entry.instances.size();
 #endif
     }
@@ -3715,7 +3715,7 @@ void MaybeLogTableCensus()
     LogTableCensus("while running");
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 // The families the parity path asks for by name: the intersection of
 // firefox_parity_data.h with Microsoft's Windows 11 font list. A machine
 // without them still renders, since fontconfig substitutes, but a chain that
@@ -3883,7 +3883,7 @@ void WarnOnMissingParityFonts()
             stderr,
             "cleartype: %u of the %zu fonts parity needs are not installed "
             "and have no metric-compatible substitute (%s) - text will not "
-            "match Windows. Install them, or set CLEARTYPE_FORCE_PARITY=0.\n",
+            "match Windows. Install them, or set CLEARTYPE_FIREFOX=0.\n",
             unmatched_count, std::size(kParityFamilies),
             unmatched.c_str());
     }
@@ -4031,7 +4031,7 @@ void* SubstitutePost(FT_Face face, void* real_table)
     return result;
 }
 
-#else  // !DWRITECORE_FIREFOX_PARITY
+#else  // !CLEARTYPE_FIREFOX_PARITY
 
 inline void ApplyWindowsMetrics(FT_Face, const char*) {}
 inline void* SubstituteOS2(FT_Face, void* real_table) { return real_table; }
@@ -4040,7 +4040,7 @@ void ForgetSfntCopiesLocked(FT_Face) {}
 
 #endif
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 // The glyph ApplyWindowsAdvance last answered for on this thread, so that the
 // embolden strength computed for it right afterwards can be recognized. See
@@ -4191,7 +4191,7 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
                                      (static_cast<FT_Fixed>(strength) << 10);
 }
 
-#else  // !DWRITECORE_FIREFOX_PARITY
+#else  // !CLEARTYPE_FIREFOX_PARITY
 
 inline void ApplyWindowsAdvance(FT_Face) {}
 inline void ApplyWindowsBoldAdvance(FT_Long, FT_Long, FT_Long) {}
@@ -4256,7 +4256,7 @@ bool InstallBitmap(FT_GlyphSlot slot, const std::vector<BYTE>& texture, const in
     return true;
 }
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 enum class RasterCaller { WebRender, Skia };
 
@@ -4485,7 +4485,7 @@ SkiaDWParams SkiaDWParamsLocked(FaceEntry* entry, const IDWriteFontFace* dwrite_
     return p;
 }
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 // One glyph, rasterized by DirectWrite, in FreeType's own frame of
 // reference: `left` is pixels right of the pen origin, `top` is pixels above
@@ -4501,7 +4501,7 @@ struct DWriteGlyphImage
     int top = 0;
 };
 
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
 
 // gfx/wr/wr_glyph_rasterizer/src/rasterizer.rs FontInstance::get_extra_strikes
 // for FontInstanceFlags::MULTISTRIKE_BOLD, with x_scale 1.
@@ -4570,7 +4570,7 @@ void ApplyMultistrikeBold(std::vector<BYTE>* texture, int* width, const int heig
     *width = static_cast<int>(dest_width);
 }
 
-#endif  // DWRITECORE_FIREFOX_PARITY
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 // Holds a counted reference for the length of a scope.
 //
@@ -4699,7 +4699,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
 
     bool multistrike = false;
     bool bitmap_font = false;
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // gfx/thebes/gfxDWriteFontList.cpp gfxDWriteFontEntry::CreateFontInstance,
     // switching on gfx.font_rendering.directwrite.bold_simulation
     // (firefox_parity_data.h kDirectWriteBoldSimulation): 0 never the
@@ -4750,7 +4750,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     float exact_skew = 0.0f;
     const bool exact_oblique =
         dwcft::ParityActive() && ExactObliqueSkew(combined, &exact_skew);
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     const bool skia_caller = CurrentRasterCaller() == RasterCaller::Skia;
 #else
     constexpr bool skia_caller = false;
@@ -4817,7 +4817,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     // has something to put in it.
     bool pass_transform = need_transform;
     if (skia_caller) {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
         const bool axis_aligned =
             !exact_oblique && ((combined.xy == 0 && combined.yx == 0) ||
                                (combined.xx == 0 && combined.yy == 0));
@@ -4972,7 +4972,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
                 channels = 1;
             }
             int out_width = static_cast<int>(width);
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
             if (multistrike) {
                 // platform/windows/font.rs rasterize_glyph:
                 //   let (strike_scale, pixel_step) = if bitmaps { (y_scale, 1.0) }
@@ -5608,7 +5608,7 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
                                          double* em_height, double* max_ascent,
                                          double* max_descent)
 {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
     // nothing clears when the face dies, so nothing may dereference it until
     // the face table has confirmed it is still live. That table is the
@@ -5683,7 +5683,7 @@ extern "C" int CleartypeWindowsLeading(double* internal_leading, double* externa
                                        double* em_height, double* max_ascent,
                                        double* max_descent)
 {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
     // nothing clears when the face dies, so nothing may dereference it until
     // the face table has confirmed it is still live. That table is the
@@ -5748,7 +5748,7 @@ extern "C" int CleartypeWindowsCharWidth(double* ave_char_width, double* max_adv
                                          double* em_height, double* max_ascent,
                                          double* max_descent)
 {
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
     // nothing clears when the face dies, so nothing may dereference it until
     // the face table has confirmed it is still live. That table is the
@@ -5850,7 +5850,7 @@ void FT_Outline_Get_CBox(const FT_Outline* outline, FT_BBox* acbox)
         return;
     }
     real(outline, acbox);
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     // FreeType asks for this from inside FT_Load_Glyph and FT_Render_Glyph to
     // build slot->metrics and size its own bitmap, and its own answer is the
     // right one there. See the re-entry guard above.
@@ -5922,7 +5922,7 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
     // fills an A8 glyph, whose Windows counterpart is SkScalerContext_DW's
     // grayscale analysis; it is only taken in the Firefox parity build.
     const bool lcd_target = abitmap != nullptr && abitmap->pixel_mode == FT_PIXEL_MODE_LCD;
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     const bool gray_target = dwcft::ParityActive() && abitmap != nullptr &&
                              abitmap->pixel_mode == FT_PIXEL_MODE_GRAY &&
                              abitmap->num_grays == 256;
@@ -6022,7 +6022,7 @@ FT_Error FT_Render_Glyph(FT_GlyphSlot slot, const FT_Render_Mode render_mode)
 
     const Options& options = GetOptions();
     MaybeLogTableCensus();
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     WarnOnMissingParityFonts();
 #endif
 
@@ -6032,7 +6032,7 @@ FT_Error FT_Render_Glyph(FT_GlyphSlot slot, const FT_Render_Mode render_mode)
     // DWRITE_TEXTURE_CLEARTYPE_3x1 texture and takes the G channel for Alpha
     // (convert_to_bgra). LCD_V has no ClearType texture and is left to FreeType.
     const bool grayscale = render_mode == FT_RENDER_MODE_NORMAL;
-#if DWRITECORE_FIREFOX_PARITY
+#if CLEARTYPE_FIREFOX_PARITY
     const bool handled =
         render_mode == FT_RENDER_MODE_LCD || (grayscale && dwcft::ParityActive());
 #else

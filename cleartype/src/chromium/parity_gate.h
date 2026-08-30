@@ -11,13 +11,25 @@
 //
 //----------------------------------------------------------------------------
 
+#ifndef CLEARTYPE_CHROMIUM_PARITY
+#  define CLEARTYPE_CHROMIUM_PARITY 1
+#endif
+
 #ifndef CHROMIUM_PARITY_GATE_H_INCLUDED
 #define CHROMIUM_PARITY_GATE_H_INCLUDED
 
 namespace chromium_patch {
-
-// CHROMIUM_PATCH_DWRITE=1 or =on.
+#if CLEARTYPE_CHROMIUM_PARITY
+// On unless CLEARTYPE_CHROMIUM says otherwise, and off whenever CLEARTYPE is
+// off.
 bool ParityWanted();
+
+#else
+
+// Built without the Chromium patch, so nothing of it applies.
+inline bool ParityWanted() { return false; }
+
+#endif
 
 }  // namespace chromium_patch
 
