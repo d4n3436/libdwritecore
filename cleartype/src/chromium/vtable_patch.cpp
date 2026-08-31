@@ -62,7 +62,6 @@
 #include "dwrite_raster.h"
 #include "render_params.h"
 #include "parity_gate.h"
-#include "render_params_patch.h"
 #include "windows_path.h"
 
 #include <algorithm>
@@ -1848,7 +1847,7 @@ void ScanLoadedImages()
             }
         }
         if (const LoadedModule* m = carrying != nullptr ? carrying : executable; m != nullptr) {
-            render_params_patch::Apply(m->base, m->phdr, m->phnum);
+            render_params::ApplyToImage(m->base, m->phdr, m->phnum);
         }
         return;
     }

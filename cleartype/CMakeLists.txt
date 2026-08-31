@@ -20,7 +20,6 @@ set(cleartype_chromium_sources
   src/chromium/dwrite_raster.cpp
   src/chromium/parity_gate.cpp
   src/chromium/render_params.cpp
-  src/chromium/render_params_patch.cpp
   src/chromium/fallback_order.cpp
   src/chromium/family_match.cpp
   src/chromium/bold_fallback.cpp

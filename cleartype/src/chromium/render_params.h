@@ -1,26 +1,24 @@
 //+--------------------------------------------------------------------------
 //
-//  render_params.h - the font settings Chromium takes from the host, mirrored
-//  from what Windows would have answered.
+//  render_params.h - the font settings Chromium takes from the host, answered
+//  the way Windows answers them.
 //
-//  How a glyph is rasterized is settled before DirectWrite is ever asked for
-//  it. Electron reads the host's settings once per WebContents in
-//  shell/browser/api/electron_api_web_contents.cc and pushes them to every
-//  renderer, where web_view_impl.cc hands them to WebFontRenderStyle and
-//  web_font_render_style.cc turns them into an SkFont. Subpixel rendering
-//  becomes SkFont::Edging::kSubpixelAntiAlias, which is what makes the mask
-//  LCD16 rather than A8.
+//  How a glyph is rasterized is settled before DWriteCore is ever asked for
+//  it. Chromium reads the host's settings once in the browser process and
+//  pushes them to every renderer, where WebFontRenderStyle turns them into an
+//  SkFont; subpixel rendering becomes SkFont::Edging::kSubpixelAntiAlias,
+//  which is what makes the mask LCD16 rather than A8.
 //
-//  The same Electron line runs on both platforms, but GetFontRenderParams
-//  does not. ui/gfx/font_render_params_win.cc reads the ClearType registry
-//  and states the rest, while ui/gfx/font_render_params_linux.cc asks
-//  fontconfig and the desktop, so a Linux Electron renders with whatever the
-//  desktop says. On a session set to grayscale antialiasing that is A8, and
-//  no amount of getting DirectWrite right afterwards produces ClearType.
+//  ui/gfx/font_render_params_win.cc reads the ClearType registry and states
+//  the rest, while ui/gfx/font_render_params_linux.cc asks fontconfig and the
+//  desktop, so a Linux Chromium rasterizes with whatever the desktop says. On
+//  a session set to grayscale antialiasing that is A8, whatever DWriteCore is
+//  asked for afterwards.
 //
-//  This applies font_render_params_win.cc's answer to the SkScalerContextRec,
-//  the last place those decisions are still visible. Font smoothing on with
-//  ClearType is what Windows ships, so that branch is taken as read.
+//  Two entry points, at the two places those decisions are still visible: the
+//  SkScalerContextRec each scaler context is built from, and the function the
+//  browser process reads the settings with. Font smoothing on with ClearType
+//  is what Windows ships, so that branch is taken as read.
 //
 //----------------------------------------------------------------------------
 
@@ -28,6 +26,8 @@
 #define CHROMIUM_RENDER_PARAMS_H_INCLUDED
 
 #include <cstdint>
+
+#include <link.h>
 
 namespace render_params {
 
@@ -37,6 +37,13 @@ namespace render_params {
 // kGenA8FromLCD_Flag there, and that flag is the only evidence that the
 // surface could not display subpixel text.
 void ApplyWindowsParams(void* rec, uint16_t flags_before_filter);
+
+// Replace the loaded image's GetFontRenderParamsFromFcPattern with one that
+// states those same answers, for the browser process, which is where Chromium
+// reads them once and sends them to every renderer over Mojo. Needed because
+// Chrome, Electron and CEF link fontconfig statically, so interposing it
+// reaches nothing.
+void ApplyToImage(uintptr_t base, const ElfW(Phdr)* phdr, ElfW(Half) phnum);
 
 }  // namespace render_params
 
