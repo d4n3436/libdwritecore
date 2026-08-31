@@ -105,9 +105,43 @@ return 1;
 
 # Resolves after the next paint, so the screenshot is taken of a frame that
 # includes whatever was just changed.
+# Two frames is enough for layout, but not for an image that decodes on
+# another thread: its first painted frame can land after the capture, which
+# reads as a small blank patch on the slower side. Decoding is awaited first,
+# then the frames.
 PAINTED = """
 const done = arguments[arguments.length - 1];
-requestAnimationFrame(() => requestAnimationFrame(() => done(1)));
+const decoded = Array.from(document.images)
+    .filter(i => i.currentSrc)
+    .map(i => i.decode().catch(() => {}));
+// A background image decodes off the main thread and is not in
+// document.images, so there is nothing to await for it. Its first painted
+// frame can land after a two-frame settle, which reads as a blank patch on
+// whichever side is busier. Frames are counted until three in a row arrive
+// less than 12 ms apart, which is the compositor having caught up.
+//
+// The deadline is measured from the moment this starts. A frame timestamp is
+// never ahead of performance.now(), so comparing the two against each other
+// gives a value that is at best zero and the wait never ends; a machine busy
+// enough to miss the 12 ms mark forever is exactly when the escape is needed.
+Promise.all(decoded).then(() => {
+  const start = performance.now();
+  let quiet = 0;
+  let last = start;
+  let settled = false;
+  const finish = () => { if (!settled) { settled = true; done(1); } };
+  const tick = (now) => {
+    quiet = (now - last) < 12 ? quiet + 1 : 0;
+    last = now;
+    if (quiet >= 3 || performance.now() - start > 400) { finish(); return; }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  // A window nothing composites never gets a frame, and a browser running
+  // where no desktop is drawn is exactly that. The timer is the only thing
+  // that ends the wait there.
+  setTimeout(finish, 600);
+});
 """
 
 POLL = 0.02
@@ -440,6 +474,7 @@ def converge_inner_size(browser, want_w, want_h, deadline):
     """
     end = time.time() + deadline
     agreed = 0
+    forced = False
     while agreed < 4:
         iw, ih, ow, oh = browser.script(INNER)
         if (iw, ih) == (want_w, want_h):
@@ -451,7 +486,19 @@ def converge_inner_size(browser, want_w, want_h, deadline):
                      % (want_w, want_h, iw, ih))
         if browser.set_window_rect(want_w + max(ow - iw, 0),
                                    want_h + max(oh - ih, 0)) is False:
-            time.sleep(POLL)
+            # An app that sizes its own window answers False. Electron's does
+            # and already holds the size, so this is only reached where the
+            # two sides disagree: cefsimple opens 800x600 and cefclient 784x485,
+            # and comparing those compares two different pages. The layout
+            # viewport is overridden instead, which is what the screenshot is
+            # taken of.
+            if forced or not hasattr(browser, "call"):
+                time.sleep(POLL)
+                continue
+            browser.call("Emulation.setDeviceMetricsOverride",
+                         {"width": want_w, "height": want_h,
+                          "deviceScaleFactor": 1, "mobile": False})
+            forced = True
             continue
         # Clamped: a window that is not yet mapped reports placeholder outer
         # values, and the subtraction would then ask for a negative size.
@@ -494,6 +541,21 @@ def hide_scrollbars(browser):
     if not hasattr(browser, "call"):
         return
     browser.call("Emulation.setScrollbarsHidden", {"hidden": True})
+
+
+def pin_color_scheme(browser):
+    """Hold both sides to the same prefers-color-scheme.
+
+    Which one an app reports is a property of the app and its desktop, not of
+    the font stack: cefsimple on a bare X server answers dark and cefclient on
+    the guest answers light, which makes every pixel of every page differ.
+    Light is pinned because that is what both Electrons already report. Only
+    the CDP driver can do this.
+    """
+    if not hasattr(browser, "call"):
+        return
+    browser.call("Emulation.setEmulatedMedia",
+                 {"features": [{"name": "prefers-color-scheme", "value": "light"}]})
 
 
 # The scroll part of MARK, without the marker. Scrollbars are already hidden

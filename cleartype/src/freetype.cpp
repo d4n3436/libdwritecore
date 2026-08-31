@@ -716,6 +716,17 @@ bool WindowsMetrics()
 // The face whose sfnt tables were last handed out on this thread.
 static thread_local FT_Face g_last_sfnt_face = nullptr;
 
+
+// The size gfxFT2FontBase::InitMetrics is measuring at, read out of the font
+// itself by libxul_patch.cpp. The face alone does not name an instance, since
+// several fonts share one face at different sizes and the face carries
+// whichever size was installed last.
+static thread_local FT_Fixed g_claimed_em_26_6 = 0;
+
+
+
+
+
 // This thread's name, recorded on the way in. See ThisThreadName's comment for
 // why it is caught here rather than read back with prctl(PR_GET_NAME).
 namespace {
@@ -1014,8 +1025,8 @@ struct WinInstance
     bool bitmap_font;               // IsCJKFont() && HasBitmapStrikeForSize()
     bool bad_underline;             // gfxFontEntry::mIsBadUnderlineFont
     bool descent_fold;              // see ApplyWindowsMetrics
-    // mFontFace. A counted reference, not a borrowed one: the face cache
-    // below is bounded and releases its oldest entry, while this cache is
+    // mFontFace, held as a counted reference. The face cache below is
+    // bounded and releases its oldest entry, while this cache is
     // bounded separately and larger, so an instance can outlive the cache
     // entry it was built from. Without a reference of its own it would be
     // measuring glyphs through a freed face.
@@ -1047,7 +1058,7 @@ struct FaceEntry
     // The em size the caller last asked for, in 26.6 pixels, or 0. Not the
     // same as the one FreeType then scales by: head.flags bit 3 ("force ppem
     // to integer values") makes tt_size_reset recompute x_scale and y_scale
-    // from the rounded ppem, and DirectWrite honours no such thing.
+    // from the rounded ppem, and DirectWrite honors no such thing.
     FT_Fixed requested_em_26_6 = 0;
     // Tracks only FT_Set_Transform's *matrix*. Its delta needs no field: see
     // the interposer for why. The matrix itself is kept, not just whether it
@@ -2959,6 +2970,30 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
     return true;
 }
 
+// The em size an InitMetrics accessor answers at. A claimed size is taken as
+// given, since it comes from the font whose metrics are about to be written.
+// GetEmSizeWithRequest trusts a recorded request only when it rounds to the
+// ppem currently installed, which cannot separate two sizes a fraction apart
+// on one face.
+bool GetEmSizeClaimed(FT_Face face, const FT_Fixed requested, double* em_size,
+                      float* x_over_y)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (g_claimed_em_26_6 > 0) {
+        if (!GetScaledEmSize(face, em_size, x_over_y)) {
+            return false;
+        }
+        *em_size = static_cast<double>(g_claimed_em_26_6) / 64.0;
+        double exact = 0.0;
+        if (ExactEmSize(g_claimed_em_26_6, &exact)) {
+            *em_size = exact;
+        }
+        return true;
+    }
+#endif
+    return GetEmSizeWithRequest(face, requested, em_size, x_over_y);
+}
+
 bool GetEmSize(FT_Face face, double* em_size, float* x_over_y)
 {
 #if CLEARTYPE_FIREFOX_PARITY
@@ -3076,6 +3111,10 @@ double WinSyntheticBoldAdvance(const WinInstance& inst, const double plain_advan
         return plain_advance;
     }
     constexpr double app_units_per_px = 60.0;
+    // The tracking goes in as a fraction and Gecko rounds the sum once, in
+    // gfxHarfBuzzShaper::SetGlyphsFromRun. Rounding it to whole app units here
+    // first, which is the order gfxShapedText::ApplyTrackingToClusters reads
+    // as, moves an advance whose app-unit value sits on a half step.
     const double tracking =
         NSlround(WinSyntheticBoldOffset(inst.adjusted_size) * app_units_per_px) / app_units_per_px;
     return plain_advance + tracking;
@@ -3104,6 +3143,40 @@ double WinBoldGlyphAdvanceLocked(FaceEntry* entry, const WinInstance& inst, cons
         return -1.0;
     }
     return static_cast<double>(NSlround(WinMeasureGlyphWidth(inst, bold, glyph) * 65536.0)) / 65536.0;
+}
+
+// The ink top and right of one glyph on the face DirectWrite is simulating bold
+// on, in pixels, which is what gfxDWriteFont::GetGlyphBounds measures on
+// Windows:
+//
+//     bounds = (leftSideBearing, topSideBearing - verticalOriginY,
+//               advanceWidth - leftSideBearing - rightSideBearing, ...)
+//     bounds.Scale(mFUnitsConvFactor)
+//
+// so the top is verticalOriginY - topSideBearing and the right edge is
+// advanceWidth - rightSideBearing, both in design units. False when the
+// simulated face cannot be built or the glyph has no metrics. Called with
+// g_faces_mutex held.
+bool WinBoldGlyphInkLocked(FaceEntry* entry, const WinInstance& inst, const UINT16 glyph,
+                           double* top, double* right)
+{
+    const Factories factories = GetFactories();
+    if (factories.factory == nullptr) {
+        return false;
+    }
+    IDWriteFontFace* bold =
+        GetDWriteFaceLocked(entry, factories.factory, DWRITE_FONT_SIMULATIONS_BOLD, inst.axes);
+    if (bold == nullptr) {
+        return false;
+    }
+    DWRITE_GLYPH_METRICS gm{};
+    if (FAILED(bold->GetDesignGlyphMetrics(&glyph, 1, &gm))) {
+        return false;
+    }
+    const double conv = static_cast<double>(inst.funits_conv);
+    *top = static_cast<double>(gm.verticalOriginY - gm.topSideBearing) * conv;
+    *right = static_cast<double>(static_cast<INT32>(gm.advanceWidth) - gm.rightSideBearing) * conv;
+    return true;
 }
 
 // gfxFont::GetCharAdvance: -1.0 when the font has no glyph for the character.
@@ -3349,7 +3422,6 @@ bool ComputeWinInstanceLocked(FaceEntry* entry, const double size, WinInstance* 
         inst->use_subpixel_positions = false;
     }
     inst->bad_underline = IsBadUnderlineFamily(entry->face->family_name);
-
     WinMetrics& m = inst->metrics;
     std::memset(&m, 0, sizeof(m));
     const float f = inst->funits_conv;
@@ -3429,6 +3501,14 @@ bool ComputeWinInstanceLocked(FaceEntry* entry, const double size, WinInstance* 
     WinSanitizeMetrics(&m, inst->bad_underline);
     inst->valid = true;
     return true;
+}
+
+// Two em sizes are the same instance. 26.6 is the resolution every size in
+// here arrives at, and the resolution the instance cache keys on.
+bool SizesMatch(const double a, const double b)
+{
+    return static_cast<FT_Fixed>(std::floor(a * 64.0 + 0.5)) ==
+           static_cast<FT_Fixed>(std::floor(b * 64.0 + 0.5));
 }
 
 // The instance for this face at this requested size, computed on first use.
@@ -4022,6 +4102,57 @@ void* SubstituteOS2(FT_Face face, void* real_table)
     return done ? reinterpret_cast<void*>(result) : real_table;
 }
 
+// gfxFT2FontBase::InitMetrics' own external leading, which is what sits in the
+// struct unless gfxFont::SanitizeMetrics replaced it from a line-gap-override
+// descriptor. Every input is one this library set, so the answer is exact:
+// the size metrics come from ApplyWindowsMetrics and the OS/2 table from
+// SubstituteOS2. Called with g_faces_mutex held.
+//
+//   lineHeight   = size->metrics.height, or the typo trio when OS/2 has one
+//   emHeight     = floor(units_per_EM * yScale + 0.5)
+//   internal     = floor(maxHeight - emHeight + 0.5)
+//   lineHeight   = floor(max(lineHeight, maxHeight) + 0.5)
+//   external     = lineHeight - internal - emHeight
+double LinuxExternalLeadingLocked(FT_Face face, const WinInstance& inst)
+{
+    const FT_Size_Metrics& sm = face->size->metrics;
+    const double y_scale = static_cast<double>(sm.y_scale) / 65536.0 / 64.0;
+    double max_ascent = static_cast<double>(sm.ascender) / 64.0;
+    double max_descent = -static_cast<double>(sm.descender) / 64.0;
+    double line_height = static_cast<double>(sm.height) / 64.0;
+    const double em_scaled = static_cast<double>(face->units_per_EM) * y_scale;
+
+    // The table Gecko read: SubstituteOS2' copy for this size when it made one,
+    // and the face's own otherwise.
+    const TT_OS2* os2 = nullptr;
+    SfntKey key;
+    key.face = face;
+    key.size_26_6 = inst.size_26_6;
+    const auto found = g_os2_copies.find(key);
+    if (found != g_os2_copies.end()) {
+        os2 = &found->second;
+    } else if (ft_get_sfnt_table_fn real = real_FT_Get_Sfnt_Table()) {
+        os2 = static_cast<const TT_OS2*>(real(face, FT_SFNT_OS2));
+    }
+    if (os2 != nullptr && os2->sTypoAscender != 0 && y_scale > 0.0) {
+        const double em_ascent = static_cast<double>(os2->sTypoAscender) * y_scale;
+        const double em_descent = -static_cast<double>(os2->sTypoDescender) * y_scale;
+        line_height = static_cast<double>(os2->sTypoAscender - os2->sTypoDescender +
+                                          os2->sTypoLineGap) * y_scale;
+        constexpr FT_UShort kUseTypoMetrics = 1 << 7;
+        if ((os2->fsSelection & kUseTypoMetrics) != 0 ||
+            (max_ascent == 0.0 && max_descent == 0.0)) {
+            max_ascent = static_cast<double>(NSlround(em_ascent));
+            max_descent = static_cast<double>(NSlround(em_descent));
+        }
+    }
+    const double max_height = max_ascent + max_descent;
+    const double em_height = std::floor(em_scaled + 0.5);
+    const double internal = std::floor(max_height - em_height + 0.5);
+    line_height = std::floor(std::max(line_height, max_height) + 0.5);
+    return line_height - internal - em_height;
+}
+
 // The per-size post copy, carrying the Windows underlineOffset as Linux reads
 // it: InitMetrics takes post->underlinePosition * yScale when the face has
 // underline metrics and the value is non-zero. For a bad-underline family the
@@ -4140,6 +4271,62 @@ thread_local PendingAdvance g_pending_advance = {};
 // the one SharedFTFace the entry holds, so nothing about the load says which
 // instance made it. It is taken as false here and corrected in
 // ApplyWindowsBoldAdvance, which runs late enough to know.
+// The ink box of one glyph in pixels, built the way
+// gfx/thebes/gfxDWriteFonts.cpp gfxDWriteFont::GetGlyphBounds builds it:
+//
+//     bounds = (leftSideBearing, topSideBearing - verticalOriginY,
+//               advanceWidth - leftSideBearing - rightSideBearing,
+//               advanceHeight - topSideBearing - bottomSideBearing)
+//     bounds.Scale(mFUnitsConvFactor)
+//
+// Design units throughout, so no rasterizer has touched it. FreeType instead
+// reports the control box of the scaled outline, which encloses the Bezier
+// control points as well as the curve itself and so is never smaller.
+struct WinInkBox
+{
+    double left, top, right, bottom;
+};
+
+bool WinGlyphInkBox(IDWriteFontFace* dwrite_face, const float funits_conv, const UINT16 glyph,
+                    WinInkBox* box)
+{
+    DWRITE_GLYPH_METRICS gm{};
+    if (dwrite_face == nullptr || FAILED(dwrite_face->GetDesignGlyphMetrics(&glyph, 1, &gm))) {
+        return false;
+    }
+    const double conv = static_cast<double>(funits_conv);
+    const auto width = static_cast<INT32>(gm.advanceWidth);
+    const auto height = static_cast<INT32>(gm.advanceHeight);
+    box->left = static_cast<double>(gm.leftSideBearing) * conv;
+    box->top = static_cast<double>(gm.verticalOriginY - gm.topSideBearing) * conv;
+    box->right = static_cast<double>(width - gm.rightSideBearing) * conv;
+    box->bottom = static_cast<double>(height - gm.verticalOriginY - gm.bottomSideBearing) * conv;
+    return true;
+}
+
+// Puts that box into the slot, in the shape gfxFT2FontBase::GetFTGlyphExtents
+// reads it back out of:
+//
+//     x = horiBearingX;      x2 = x + width
+//     y = -horiBearingY;     y2 = y + height
+//
+// so the height carries the bearing with it. A degenerate box is left alone,
+// since an empty one is how that function is told to fall back to the
+// font-wide ascent and descent for a color glyph with no outline.
+void SetGlyphInkBox(FT_GlyphSlot slot, const WinInkBox& box)
+{
+    const auto x = static_cast<FT_Pos>(llround(box.left * 64.0));
+    const auto x2 = static_cast<FT_Pos>(llround(box.right * 64.0));
+    const auto y = static_cast<FT_Pos>(llround(box.top * 64.0));
+    const auto y2 = static_cast<FT_Pos>(llround(box.bottom * 64.0));
+    if (x2 > x && y + y2 > 0) {
+        slot->metrics.horiBearingX = x;
+        slot->metrics.width = x2 - x;
+        slot->metrics.horiBearingY = y;
+        slot->metrics.height = y + y2;
+    }
+}
+
 void ApplyWindowsAdvance(FT_Face face)
 {
     if (face == nullptr || face->glyph == nullptr || !FT_IS_SCALABLE(face) ||
@@ -4164,9 +4351,14 @@ void ApplyWindowsAdvance(FT_Face face)
         return;
     }
     const UINT16 glyph = static_cast<UINT16>(face->glyph->glyph_index);
-    const double advance_px =
-        WinGlyphAdvance(*instance, glyph, FT_HAS_MULTIPLE_MASTERS(face) != 0);
+    double advance_px = WinGlyphAdvance(*instance, glyph, FT_HAS_MULTIPLE_MASTERS(face) != 0);
+    WinInkBox box{};
+    const bool have_box = face->glyph->format == FT_GLYPH_FORMAT_OUTLINE &&
+                          WinGlyphInkBox(instance->dwrite_face, instance->funits_conv, glyph, &box);
     pthread_mutex_unlock(&g_faces_mutex);
+    if (have_box) {
+        SetGlyphInkBox(face->glyph, box);
+    }
     // Both arithmetics leave a whole number of 1/65536 px.
     face->glyph->linearHoriAdvance = static_cast<FT_Fixed>(llround(advance_px * 65536.0));
     g_pending_advance.face = face;
@@ -4236,13 +4428,21 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
     const WinInstance* instance =
         entry != nullptr ? GetWinInstanceLocked(entry, em_size) : nullptr;
     double advance_px = -1.0;
+    double win_ink_top = -1.0;
+    double win_ink_right = -1.0;
     bool win_fattens_outline = true;
+    double extents_scale = 1.0;
     if (instance != nullptr && instance->valid && instance->dwrite_face != nullptr) {
         // The two cases WinBoldGlyphAdvanceLocked answers for by tracking.
         // gfxDWriteFontEntry::CreateFontInstance keeps DirectWrite's simulation
         // away from a webfont and from a COLR font, so their outlines are drawn
         // at their plain weight and only the advance moves.
         win_fattens_outline = !(entry->memory != nullptr || FaceHasCOLRLocked(entry));
+        if (win_fattens_outline) {
+            WinBoldGlyphInkLocked(entry, *instance,
+                                  static_cast<UINT16>(face->glyph->glyph_index),
+                                  &win_ink_top, &win_ink_right);
+        }
         advance_px = WinBoldGlyphAdvanceLocked(entry, *instance,
                                                static_cast<UINT16>(face->glyph->glyph_index),
                                                FT_HAS_MULTIPLE_MASTERS(face) != 0);
@@ -4265,12 +4465,37 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         gm.horiBearingY -= strength;
         gm.height -= strength;
         gm.width -= strength;
+    } else if (win_ink_top > 0.0 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        // Where Windows does fatten the outline, the glyph top it reports is
+        // the one DirectWrite's simulated face carries, and GetFTGlyphExtents
+        // reaches its own by adding the strength to a bearing FreeType already
+        // rounded. Two roundings land it one or two 26.6 steps away. Placing
+        // the bearing so that the sum is the nearest step to the Windows value
+        // leaves at most half a step. y2 is read before y moves, so the height
+        // follows the bearing to hold the descent still.
+        FT_Glyph_Metrics& gm = face->glyph->metrics;
+        const FT_Pos want = static_cast<FT_Pos>(llround(win_ink_top * 64.0)) - strength;
+        const FT_Pos delta = want - gm.horiBearingY;
+        gm.horiBearingY += delta;
+        gm.height += delta;
+        // The right edge the same way. GetFTGlyphExtents reads
+        // x2 = horiBearingX + width and then adds the strength, so the width
+        // is placed to land that sum on the Windows edge. The bearing is left
+        // where it is, since the left edge is not one of the two the
+        // emboldening moves.
+        if (win_ink_right > 0.0) {
+            const FT_Pos want_x2 = static_cast<FT_Pos>(llround(win_ink_right * 64.0)) - strength;
+            if (want_x2 > gm.horiBearingX) {
+                gm.width = want_x2 - gm.horiBearingX;
+            }
+        }
     }
     if (advance_px < 0.0) {
         return;
     }
-    face->glyph->linearHoriAdvance = static_cast<FT_Fixed>(llround(advance_px * 65536.0)) -
-                                     (static_cast<FT_Fixed>(strength) << 10);
+    face->glyph->linearHoriAdvance =
+        static_cast<FT_Fixed>(llround(advance_px * extents_scale * 65536.0)) -
+        (static_cast<FT_Fixed>(strength) << 10);
 }
 
 #else  // !CLEARTYPE_FIREFOX_PARITY
@@ -4398,6 +4623,34 @@ RasterCaller CurrentRasterCaller()
         }
     }
     return cached == 1 ? RasterCaller::WebRender : RasterCaller::Skia;
+}
+
+// True on a thread WebRender rasterizes blob images on, which is where a Skia
+// A8 glyph belongs to the blob path rather than to a DrawTargetSkia consumer.
+//
+// gfx/webrender_bindings/src/moz2d_renderer.rs rasterize_blob runs either on
+// the rayon pool ("WRWorker<tag>#<n>") or, when there are too few blobs to be
+// worth installing a job, serially on the thread that asked, which is the
+// scene builder ("WRSceneBuilder<tag>"). Both were seen answering for the same
+// page. Nothing else in Gecko draws Skia glyphs on those threads.
+//
+// The FreeType library cannot separate these two callers the way it separates
+// Skia from WebRender: both are Skia and both use Skia's library. The thread
+// is the only signal there is, and it is the subsystem's own name for itself,
+// so it says which of Gecko's rasterizers is running and not merely where.
+bool OnBlobRasterThread()
+{
+    static const char* const kBlobThreadPrefixes[] = { "WRWorke", "WRScene", "WRRende" };
+    const char* name = ThisThreadName();
+    if (name == nullptr) {
+        return false;
+    }
+    for (const char* prefix : kBlobThreadPrefixes) {
+        if (std::strncmp(name, prefix, 7) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The same question for one face, which the thread cannot always answer.
@@ -4619,12 +4872,12 @@ SkiaDWParams SkiaDWParamsLocked(FaceEntry* entry, const IDWriteFontFace* dwrite_
 
     p.texture_type = DWRITE_TEXTURE_CLEARTYPE_3x1;
     p.antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE;
+    p.grid_fit_mode = DWRITE_GRID_FIT_MODE_ENABLED;
     if (have_factory2 && a8) {
         // kA8_Format without kGenA8FromLCD_Flag.
         p.texture_type = DWRITE_TEXTURE_ALIASED_1x1;
         p.antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE;
     }
-    p.grid_fit_mode = DWRITE_GRID_FIT_MODE_ENABLED;
 
     if (p.measuring_mode != DWRITE_MEASURING_MODE_NATURAL &&
         FaceHasTable(entry->face, FT_MAKE_TAG('C', 'B', 'D', 'T'))) {
@@ -4843,7 +5096,11 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     FT_Matrix combined = identity;
     if (face_transformed) {
         combined = face_matrix;
-        simulations = DWRITE_FONT_SIMULATIONS_NONE;
+        // The shear carries the synthetic oblique, so the oblique simulation
+        // would apply it a second time. The bold is a separate reshape and
+        // survives, since a face can ask for both.
+        simulations = static_cast<DWRITE_FONT_SIMULATIONS>(
+            static_cast<int>(simulations) & ~static_cast<int>(DWRITE_FONT_SIMULATIONS_OBLIQUE));
     } else if (pending.has_matrix) {
         combined = pending.matrix;
     }
@@ -4860,7 +5117,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     // SYNTHETIC_BOLD -> DWRITE_FONT_SIMULATIONS_BOLD in get_font_face();
     // MULTISTRIKE_BOLD -> apply_multistrike_bold.
     if (dwcft::ParityActive() &&
-        (pending.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0 && !face_transformed) {
+        (pending.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0) {
         const bool data_user_font = entry->memory != nullptr;
         bool use_bold_sim = false;
         switch (firefox_parity::kDirectWriteBoldSimulation) {
@@ -5486,6 +5743,51 @@ void FT_Done_Glyph(FT_Glyph glyph)
     real(glyph);
 }
 
+// Whether this load is the one WebRender takes a glyph's pixels from for a
+// face Windows draws from an embedded strike.
+//
+// gfxDWriteFont::GetScaledFont sends useEmbeddedBitmap to WebRender as
+// FontInstanceFlags::EMBEDDED_BITMAPS, and platform/unix/font.rs turns the
+// absence of that flag into FT_LOAD_NO_BITMAP. The Linux flag comes from
+// fontconfig, which answers for a font and not for a font at a size, so
+// src/fontconfig.cpp says no to embeddedbitmap and the strike is put back
+// here, for the faces and the sizes IsBitmapFontLocked names.
+//
+// The format matters as much as the pixels. rasterize_glyph reads the slot's
+// format before it rasterizes, and an outline there reaches the batch as
+// GlyphFormat::Alpha, which leaves SubpixelDirection::Horizontal and a
+// snap_bias of 0.125; a strike gives GlyphFormat::Bitmap, None and 0.5. That
+// is a whole pixel of placement for every subpixel phase from 0.5 up.
+//
+// Skia keeps the transform and the subpixel offset for a bitmap font, so only
+// the WebRender path asks for the strike itself.
+// Raised while FT_GlyphSlot_Embolden loads a glyph again without its strike,
+// so the load below does not hand the strike straight back.
+thread_local bool g_suppress_strike = false;
+
+static bool StrikeBelongsToThisLoad(FT_Face face)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (g_suppress_strike || !dwcft::ParityActive() || face == nullptr ||
+        face->size == nullptr || CallerForFace(face) == RasterCaller::Skia) {
+        return false;
+    }
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (!GetEmSize(face, &em_size, &x_over_y)) {
+        return false;
+    }
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    const bool bitmap_font = entry != nullptr && IsBitmapFontLocked(entry, em_size);
+    pthread_mutex_unlock(&g_faces_mutex);
+    return bitmap_font;
+#else
+    (void)face;
+    return false;
+#endif
+}
+
 // The synthetic-styling family. Each one reshapes an outline in place, which
 // is invisible to a shim that rasterizes from a font file by glyph index -
 // see the PendingOutline comment. Each is classified into the DirectWrite
@@ -5500,6 +5802,30 @@ void FT_GlyphSlot_Embolden(FT_GlyphSlot slot)
     ft_glyphslot_embolden_fn real = real_FT_GlyphSlot_Embolden();
     if (real == nullptr) {
         return;
+    }
+    // A strike, which this function smears one pixel sideways. DirectWrite
+    // draws the same glyph through its bold simulation instead, fattening the
+    // stems unevenly and antialiasing the edges, and nothing renders a bitmap
+    // glyph afterwards for the shim to correct it in.
+    //
+    // The glyph is loaded again without the strike first. FreeType owns a
+    // strike glyph's bitmap and frees it at the next load, so swapping that
+    // buffer for one of this shim's is a double free; an outline slot holds no
+    // bitmap at all, which is the state InstallBitmap already installs into.
+    if (slot != nullptr && slot->face != nullptr &&
+        slot->format == FT_GLYPH_FORMAT_BITMAP && StrikeBelongsToThisLoad(slot->face)) {
+        const FT_UInt index = slot->glyph_index;
+        g_suppress_strike = true;
+        const FT_Error error = FT_Load_Glyph(slot->face, index,
+                                             FT_LOAD_NO_BITMAP |
+                                                 FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH);
+        g_suppress_strike = false;
+        if (error == 0 && slot->format == FT_GLYPH_FORMAT_OUTLINE) {
+            RecordSimulation(&slot->outline, DWRITE_FONT_SIMULATIONS_BOLD);
+            if (RenderThroughDWrite(slot, false)) {
+                return;
+            }
+        }
     }
     real(slot);
     if (slot != nullptr) {
@@ -5587,7 +5913,7 @@ void FT_Outline_Transform(const FT_Outline* outline, const FT_Matrix* matrix)
 // FT_LOAD_NO_HINTING wins over any target mode, so adding it here leaves the
 // render mode the caller asked for alone. See IntegerAnswer in
 // src/fontconfig.cpp.
-FT_Int32 UnhintedLoadFlags(const FT_Int32 load_flags)
+static FT_Int32 UnhintedLoadFlags(const FT_Int32 load_flags)
 {
 #if CLEARTYPE_FIREFOX_PARITY
     if (dwcft::ParityActive()) {
@@ -5606,6 +5932,10 @@ FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 l
     if (real == nullptr) {
         return FT_Err_Invalid_Library_Handle;
     }
+    FT_Int32 flags = UnhintedLoadFlags(load_flags);
+    if ((flags & FT_LOAD_NO_BITMAP) != 0 && StrikeBelongsToThisLoad(face)) {
+        flags &= ~FT_LOAD_NO_BITMAP;
+    }
     // Before the load, not after: FreeType applies an FT_Set_Transform delta
     // by calling FT_Outline_Translate from inside FT_Load_Glyph, and that
     // translate does belong to the glyph being loaded. Clearing first drops
@@ -5616,7 +5946,7 @@ FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 l
     // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     InRealFreeType inside(face != nullptr && face->glyph != nullptr ? &face->glyph->outline
                                                                      : nullptr);
-    const FT_Error error = real(face, glyph_index, UnhintedLoadFlags(load_flags));
+    const FT_Error error = real(face, glyph_index, flags);
     if (error == 0) {
         if (face != nullptr && face->glyph != nullptr) {
             SetPendingOutlineFace(&face->glyph->outline, face);
@@ -5780,6 +6110,7 @@ extern "C" void CleartypeEndInitMetrics(void)
 {
 #if CLEARTYPE_FIREFOX_PARITY
     g_last_sfnt_face = nullptr;
+    g_claimed_em_26_6 = 0;
 #endif
 }
 
@@ -5808,7 +6139,7 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
     double em_size = 0.0;
     float x_over_y = 1.0f;
     if (face->size == nullptr ||
-        !GetEmSizeWithRequest(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
         !(em_size > 0.0)) {
         pthread_mutex_unlock(&g_faces_mutex);
         return 0;
@@ -5861,7 +6192,7 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
 // So this is corrected after the fact, the same way the underline is.
 extern "C" int CleartypeWindowsLeading(double* internal_leading, double* external_leading,
                                        double* em_height, double* max_ascent,
-                                       double* max_descent)
+                                       double* max_descent, double* linux_external)
 {
 #if CLEARTYPE_FIREFOX_PARITY
     // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
@@ -5884,7 +6215,7 @@ extern "C" int CleartypeWindowsLeading(double* internal_leading, double* externa
     double em_size = 0.0;
     float x_over_y = 1.0f;
     if (face->size == nullptr ||
-        !GetEmSizeWithRequest(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
         !(em_size > 0.0)) {
         pthread_mutex_unlock(&g_faces_mutex);
         return 0;
@@ -5899,13 +6230,14 @@ extern "C" int CleartypeWindowsLeading(double* internal_leading, double* externa
         *em_height = m.emHeight;
         *max_ascent = m.maxAscent - fold;
         *max_descent = m.maxDescent + fold;
+        *linux_external = LinuxExternalLeadingLocked(face, *inst);
         answered = 1;
     }
     pthread_mutex_unlock(&g_faces_mutex);
     return answered;
 #else
     (void)internal_leading; (void)external_leading; (void)em_height;
-    (void)max_ascent; (void)max_descent;
+    (void)max_ascent; (void)max_descent; (void)linux_external;
     return 0;
 #endif
 }
@@ -5949,7 +6281,7 @@ extern "C" int CleartypeWindowsCharWidth(double* ave_char_width, double* max_adv
     double em_size = 0.0;
     float x_over_y = 1.0f;
     if (face->size == nullptr ||
-        !GetEmSizeWithRequest(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
         !(em_size > 0.0)) {
         pthread_mutex_unlock(&g_faces_mutex);
         return 0;
@@ -5971,6 +6303,105 @@ extern "C" int CleartypeWindowsCharWidth(double* ave_char_width, double* max_adv
 #else
     (void)ave_char_width; (void)max_advance; (void)em_height;
     (void)max_ascent; (void)max_descent;
+    return 0;
+#endif
+}
+
+// The whole-pixel size gfxDWriteFont::ComputeMetrics rounds mAdjustedSize to
+// for the face last measured, or 0 when that face keeps the size it was asked
+// for. The three identifying fields come back the way the accessors above
+// return them, so the caller can confirm both answers are about one instance.
+//
+// space_width, zero_width and ideographic_width come with it.
+// gfxFT2FontBase::InitMetrics takes those three from advances of its own,
+// measured before the caller has rounded anything. Windows measures all three
+// through the rounded instance, so its own values go in instead.
+extern "C" int CleartypeWindowsStrikeSize(double* rounded, double* unrounded,
+                                         double* space_width, double* zero_width,
+                                         double* ideographic_width, double* em_height,
+                                         double* max_ascent, double* max_descent)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    // g_last_sfnt_face is a bare FT_Face that FT_Get_Sfnt_Table remembers and
+    // nothing clears when the face dies, so nothing may dereference it until
+    // the face table has confirmed it is still live. That table is the
+    // authority, and it answers only under the lock.
+    FT_Face face = g_last_sfnt_face;
+    if (face == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    // Resolve the system font collection before locking. Building it under
+    // g_faces_mutex deadlocks; see WarmSystemCollection.
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    if (entry == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;                            // the face is gone
+    }
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (face->size == nullptr ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !(em_size > 0.0)) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
+    int answered = 0;
+    if (inst != nullptr && inst->valid && inst->bitmap_font &&
+        !SizesMatch(inst->adjusted_size, em_size)) {
+        const WinMetrics& m = inst->metrics;
+        const double fold = inst->descent_fold ? 0.5 : 0.0;
+        *rounded = inst->adjusted_size;
+        *unrounded = em_size;
+        *space_width = m.spaceWidth;
+        *zero_width = m.zeroWidth;
+        *ideographic_width = m.ideographicWidth;
+        *em_height = m.emHeight;
+        *max_ascent = m.maxAscent - fold;
+        *max_descent = m.maxDescent + fold;
+        answered = 1;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return answered;
+#else
+    (void)rounded; (void)unrounded; (void)space_width; (void)zero_width;
+    (void)ideographic_width; (void)em_height; (void)max_ascent; (void)max_descent;
+    return 0;
+#endif
+}
+
+// Names the face the running InitMetrics is about, read out of the font itself.
+//
+// The accessors below answer for g_last_sfnt_face, the face whose sfnt tables
+// were handed out most recently, and a font whose tables Gecko already held
+// reads none, so they answer about whichever face came before it. Refused
+// unless the face table already knows the pointer, so a wrong guess at the
+// object's layout claims nothing.
+extern "C" int CleartypeClaimFace(void* candidate, double ft_size)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (candidate == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    auto* face = static_cast<FT_Face>(candidate);
+    pthread_mutex_lock(&g_faces_mutex);
+    const bool known = FindFaceLocked(face) != nullptr;
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (!known) {
+        return 0;
+    }
+    g_last_sfnt_face = face;
+    // gfxFT2FontBase::LockFTFace converts mFTSize this way, so the instance
+    // named here is the one the face was set to for this font.
+    g_claimed_em_26_6 = (ft_size > 0.0 && ft_size < 65536.0)
+                            ? static_cast<FT_Fixed>(ft_size * 64.0 + 0.5)
+                            : 0;
+    return 1;
+#else
+    (void)candidate;
+    (void)ft_size;
     return 0;
 #endif
 }
@@ -6050,14 +6481,16 @@ void FT_Outline_Get_CBox(const FT_Outline* outline, FT_BBox* acbox)
         return;
     }
     // Measured for both targets and unioned, since which one the caller will
-    // render is not known here.
+    // render is not known here. Skia clips the rasterizer to this box in
+    // generateGlyphImage, so too large costs a little empty mask and too small
+    // loses ink, and the union is the safe direction.
     //
     // `grayscale` reaches SkiaDWParamsLocked as its a8 flag, where it decides
     // the texture type, the antialias mode and which CreateGlyphRunAnalysis
-    // overload runs, so the two answers bound different analyses. Skia clips
-    // the rasterizer to this box in generateGlyphImage. Too large costs a
-    // little empty mask and too small loses ink, so the union is the safe
-    // direction.
+    // overload runs, so the two answers bound different analyses. A gray
+    // target is drawn by FreeType now and not by DirectWrite, and the gray
+    // measurement stays because it bounds the same ink: on Arial 'H' at 48px
+    // the two agree on 28x35 at (3,-35) to the pixel.
     DWriteGlyphImage image;
     bool measured = RasterizeThroughDWrite(face, glyph_index, outline, false, &image,
                                            /*measure_only=*/true);
@@ -6087,6 +6520,114 @@ void FT_Outline_Get_CBox(const FT_Outline* outline, FT_BBox* acbox)
 #endif
 }
 
+#if CLEARTYPE_FIREFOX_PARITY
+// True where Skia fills the glyph with blitFatAntiRect, which is the one case
+// its scan converter does not snap.
+//
+// SkScan::AAAFillPath takes the mask blitter when MaskAdditiveBlitter can hold
+// the glyph - at most 32 pixels wide and SkAlign4(width) * height at most 1024
+// bytes - and tries try_blit_fat_anti_rect first. That wants a path
+// SkPathRaw::isRect accepts and a rounded-out width of at least 3, and it
+// blits the rectangle from its own edges without ever building an
+// SkAnalyticEdge, so no SnapY runs. Arial's 'l' takes this path and its
+// neighbor 'i', two contours, does not.
+static bool SkiaBlitsAsFatRect(const FT_Outline* outline, const FT_Bitmap* abitmap)
+{
+    constexpr unsigned kMaxWidth = 32;
+    constexpr unsigned kMaxStorage = 1024;
+    if (abitmap->width > kMaxWidth ||
+        ((abitmap->width + 3u) & ~3u) * abitmap->rows > kMaxStorage) {
+        return false;
+    }
+    if (outline->n_contours != 1 || outline->n_points < 4 || outline->n_points > 5) {
+        return false;
+    }
+    // A closing point repeating the first is the five-point form.
+    int corners = outline->n_points;
+    if (corners == 5) {
+        if (outline->points[4].x != outline->points[0].x ||
+            outline->points[4].y != outline->points[0].y) {
+            return false;
+        }
+        corners = 4;
+    }
+    for (short i = 0; i < outline->n_points; ++i) {
+        if ((outline->tags[i] & FT_CURVE_TAG_ON) == 0) {
+            return false;
+        }
+    }
+    // Four axis-aligned edges that alternate, which is what a rectangle is.
+    bool previous_horizontal = false;
+    for (int i = 0; i < corners; ++i) {
+        const FT_Vector& a = outline->points[i];
+        const FT_Vector& b = outline->points[(i + 1) % corners];
+        const bool horizontal = a.y == b.y && a.x != b.x;
+        const bool vertical = a.x == b.x && a.y != b.y;
+        if (!horizontal && !vertical) {
+            return false;
+        }
+        if (i > 0 && horizontal == previous_horizontal) {
+            return false;
+        }
+        previous_horizontal = horizontal;
+    }
+    FT_Pos left = outline->points[0].x;
+    FT_Pos right = left;
+    for (int i = 1; i < corners; ++i) {
+        left = outline->points[i].x < left ? outline->points[i].x : left;
+        right = outline->points[i].x > right ? outline->points[i].x : right;
+    }
+    // roundOut, in whole pixels, must leave a rectangle at least 3 wide.
+    const long spans = (right + 63) / 64 - (left >= 0 ? left / 64 : (left - 63) / 64);
+    return spans >= 3;
+}
+
+// Rounds an A8 glyph's outline to where Skia's own scan converter puts an
+// edge, then rasterizes it through real FreeType.
+//
+// On Windows these masks come from the outline and not from DirectWrite:
+// SkScalerContext::GenerateImageFromPath fills the path through
+// SkScan::AntiFillPath, which supersamples four times vertically and computes
+// exact horizontal coverage per subscanline, with SkEdge::setLine rounding
+// each endpoint to the nearest subscanline. A horizontal edge therefore lands
+// on a quarter pixel and the row it fringes carries a whole number of
+// quarters, where FreeType would answer the true area. Rounding the y
+// coordinates first makes the two agree.
+//
+// Measured on Arial 'H' at 48px in an <svg><text>: 175 differing pixels when
+// the glyph came from DirectWrite's grayscale analysis, 29 from plain
+// FreeType, 0 with this. Rendering four times as tall and averaging the bands
+// was tried as well and is worse, since each band is quantized to a byte
+// before the average and FreeType already integrates the whole pixel exactly.
+//
+// The caller's outline is restored before returning, since Skia reads the same
+// slot again for the path.
+static FT_Error SkiaScanlineBitmap(ft_outline_get_bitmap_fn real, FT_Library library,
+                                   FT_Outline* outline, const FT_Bitmap* abitmap)
+{
+    if (outline->n_points <= 0 || outline->points == nullptr) {
+        return real(library, outline, abitmap);
+    }
+    if (SkiaBlitsAsFatRect(outline, abitmap)) {
+        return real(library, outline, abitmap);
+    }
+    std::vector<FT_Pos> saved(static_cast<size_t>(outline->n_points));
+    for (short i = 0; i < outline->n_points; ++i) {
+        saved[static_cast<size_t>(i)] = outline->points[i].y;
+        // 26.6 units, so a quarter of a pixel is 16 of them. Rounded half away
+        // from zero, which is what SkFDot6Round does to the supersampled
+        // coordinate.
+        const FT_Pos y = outline->points[i].y;
+        outline->points[i].y = y >= 0 ? ((y + 8) & ~15) : -((-y + 8) & ~15);
+    }
+    const FT_Error err = real(library, outline, abitmap);
+    for (short i = 0; i < outline->n_points; ++i) {
+        outline->points[i].y = saved[static_cast<size_t>(i)];
+    }
+    return err;
+}
+#endif
+
 FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT_Bitmap* abitmap)
 {
     ft_outline_get_bitmap_fn real = real_FT_Outline_Get_Bitmap();
@@ -6104,10 +6645,12 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
     RecordSkiaLibrary(library);
 #endif
 
-    // An LCD target is the subpixel case for any caller. A gray target is
-    // how Skia's cairo-FT port (SkScalerContextFTUtils::generateGlyphImage)
-    // fills an A8 glyph, whose Windows counterpart is SkScalerContext_DW's
-    // grayscale analysis; it is only taken in the Firefox parity build.
+    // An LCD target is the subpixel case for any caller, and DirectWrite
+    // answers it. A gray target is how Skia's cairo-FT port
+    // (SkScalerContextFTUtils::generateGlyphImage) fills an A8 glyph, and its
+    // Windows counterpart is not DirectWrite at all but Skia's own scan
+    // converter over the outline; SkiaScanlineBitmap says how that was
+    // measured. Only the parity build takes the gray one.
     const bool lcd_target = abitmap != nullptr && abitmap->pixel_mode == FT_PIXEL_MODE_LCD;
 #if CLEARTYPE_FIREFOX_PARITY
     const bool gray_target = dwcft::ParityActive() && abitmap != nullptr &&
@@ -6117,9 +6660,14 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
     const bool gray_target = false;
 #endif
     if (!InterposerWanted() || outline == nullptr || abitmap == nullptr ||
-        (!lcd_target && !gray_target) || abitmap->buffer == nullptr ||
-        abitmap->rows == 0 || abitmap->width == 0 ||
+        abitmap->buffer == nullptr || abitmap->rows == 0 || abitmap->width == 0 ||
         std::getenv("CLEARTYPE_FORCE_FALLBACK") != nullptr) {
+        return real(library, outline, abitmap);
+    }
+    if (gray_target && OnBlobRasterThread()) {
+        return SkiaScanlineBitmap(real, library, outline, abitmap);
+    }
+    if (!lcd_target && !gray_target) {
         return real(library, outline, abitmap);
     }
 

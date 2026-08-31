@@ -46,6 +46,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -286,6 +287,36 @@ def side_base(shots, tag, page):
     return "%s/%s" % (shots, tag)
 
 
+def check_cell(shots, url, scroll):
+    """Refuse a cell directory and a URL that name different pages.
+
+    The cell and the URL arrive as independent arguments and nothing else ties
+    them together, so cell1 with cell2's URL reopens the page that was named,
+    walks that DOM and charges the other image's pixels to it. The answer looks
+    like a finding. compare_pages.sh writes `<index> <path> <scroll>` per line
+    beside the cells, which says what each one actually holds.
+    """
+    match = re.match(r"cell(\d+)$", os.path.basename(shots.rstrip("/")))
+    if match is None:
+        return
+    index = match.group(1)
+    listing = os.path.join(os.path.dirname(shots.rstrip("/")), "cells")
+    if not os.path.exists(listing):
+        return
+    with open(listing) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != index:
+                continue
+            if parts[1] not in url:
+                sys.exit("cell%s holds %s, but the url given is %s"
+                         % (index, parts[1], url))
+            if len(parts) > 2 and int(parts[2]) != scroll:
+                sys.exit("cell%s was captured at scroll %s, not %d"
+                         % (index, parts[2], scroll))
+            return
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("shots")
@@ -305,6 +336,7 @@ def main():
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--limit", type=int, default=14)
     args = ap.parse_args()
+    check_cell(args.shots, args.url, args.scroll)
 
     base = side_base(args.shots, args.tag, args.page)
     other = side_base(args.shots, args.tag_b or args.tag + "W", args.page)

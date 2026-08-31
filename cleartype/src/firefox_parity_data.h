@@ -55,7 +55,7 @@ constexpr unsigned kWebRenderThreadPrefixCount = 3;
 //
 // kPage is the system values, which reach WebRender's glyph rasterizer and
 // every Skia consumer through gfx.font_rendering.freetype.*. kBlob is
-// gfx/2d/DWriteSettings.cpp's own initialisers, sGamma{2.2f} and
+// gfx/2d/DWriteSettings.cpp's own initializers, sGamma{2.2f} and
 // sEnhancedContrast{1.0f}, which Firefox's blob rasterizer is reached
 // before gfxVars replace. DrawTargetSkia::UpdateSurfaceProps has no such
 // split on Linux, where the prefs are in place before anything draws.
@@ -531,6 +531,72 @@ struct CommonFallbackRule
     "pref(\"ui.font.-moz-field.weight\", \"400\");\n"
     "pref(\"ui.font.-moz-field.italic\", false);\n"
     ;
+
+
+// gfx/thebes/StandardFonts-win10.inc kFontSubstitutes, the table
+// gfxDWriteFontList::GetFontSubstitutes loads before it reads the registry's
+// own HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes.
+// gfxDWriteFontList::FindAndAddFamiliesLocked rewrites the key name through it
+// before any family lookup, so the answer never depends on the language.
+// gfxFcPlatformFontList has no such step and hands the name to fontconfig,
+// whose answer for "Times" under lang=hy is Sylfaen where Windows has Times
+// New Roman.
+struct FontSubstitute
+{
+    const char* substitute;
+    const char* actual;
+};
+
+inline constexpr FontSubstitute kFontSubstitutes[] = {
+    { "Arabic Transparent", "Arial" },
+    { "Arial Baltic", "Arial" },
+    { "Arial CE", "Arial" },
+    { "Arial CYR", "Arial" },
+    { "Arial Greek", "Arial" },
+    { "Arial TUR", "Arial" },
+    { "Courier New Baltic", "Courier New" },
+    { "Courier New CE", "Courier New" },
+    { "Courier New CYR", "Courier New" },
+    { "Courier New Greek", "Courier New" },
+    { "Courier New TUR", "Courier New" },
+    { "Helv", "Microsoft Sans Serif" },
+    { "Helvetica", "Arial" },
+    { "MS Shell Dlg 2", "Tahoma" },
+    { "Tahoma Armenian", "Tahoma" },
+    { "Times", "Times New Roman" },
+    { "Times New Roman Baltic", "Times New Roman" },
+    { "Times New Roman CE", "Times New Roman" },
+    { "Times New Roman CYR", "Times New Roman" },
+    { "Times New Roman Greek", "Times New Roman" },
+    { "Times New Roman TUR", "Times New Roman" },
+    { "Tms Rmn", "Times New Roman" },
+    { "MS Shell Dlg", "Microsoft Sans Serif" },
+    { "Arial (Arabic)", "Arial" },
+    { "Courier New (Arabic)", "Courier New" },
+    { "Times New Roman (Arabic)", "Times New Roman" },
+    { "Courier", "Courier New" },
+    { "Fixedsys Greek", "Fixedsys" },
+    { "MS Serif Greek", "Times New Roman" },
+    { "MS Sans Serif Greek", "Microsoft Sans Serif" },
+    { "Small Fonts Greek", "Arial" },
+    { "System Greek", "System" },
+    { "Arial (Hebrew)", "Arial" },
+    { "Courier New (Hebrew)", "Courier New" },
+    { "David Transparent", "David" },
+    { "Fixed Miriam Transparent", "Miriam Fixed" },
+    { "Miriam Transparent", "Miriam" },
+    { "Rod Transparent", "Rod" },
+    { "Times New Roman (Hebrew)", "Times New Roman" },
+    { "\u6a19\u6e96\u660e\u671d", "\uff2d\uff33 \u660e\u671d" },
+    { "\u6a19\u6e96\u30b4\u30b7\u30c3\u30af", "\uff2d\uff33 \u30b4\u30b7\u30c3\u30af" },
+    { "\u30b4\u30b7\u30c3\u30af", "\uff2d\uff33 \u30b4\u30b7\u30c3\u30af" },
+    { "\uff7a\uff9e\uff7c\uff6f\uff78", "\uff2d\uff33 \u30b4\u30b7\u30c3\u30af" },
+    { "\uff78\uff70\uff98\uff74", "Courier New" },
+    { "\uff80\uff72\uff91\uff7d\uff9e\uff9b\uff8f\uff9d", "Times New Roman" },
+    { "\uff8d\uff99\uff8d\uff9e\uff81\uff76", "Arial" },
+    { "FangSong_GB2312", "FangSong" },
+    { "KaiTi_GB2312", "KaiTi" },
+};
 
 }  // namespace firefox_parity
 

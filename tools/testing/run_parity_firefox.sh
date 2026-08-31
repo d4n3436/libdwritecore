@@ -3,12 +3,14 @@
 # run_parity_firefox.sh - start a Firefox configured for Windows parity.
 #
 #   run_parity_firefox.sh start [options]          # here, under Xvfb
-#   run_parity_firefox.sh stop
+#   run_parity_firefox.sh stop [--port N]
 #   run_parity_firefox.sh guest <domain> [options] # in a libvirt guest
 #   run_parity_firefox.sh guest-stop <domain>
 #
 # Options:
-#   --port N        Marionette port                     (default 2828)
+#   --port N        Marionette port                     (default 2828). Each
+#                   port keeps its own state directory, so two browsers on two
+#                   ports run side by side and stop names one of them.
 #   --display :N    X display to create                 (default :99)
 #   --size WxH      X screen size                       (default 2560x1440)
 #   --shim PATH     the interceptor to preload          (default: the build)
@@ -20,6 +22,28 @@
 #                   say in the first place.
 #   --url URL       first page to open                  (default about:blank)
 #   --profile DIR   keep the profile here               (default: a temp dir)
+#   --capture-port N  where the guest's capture server listens (default PORT+1)
+#   --guest-firefox PATH  the guest's firefox.exe, when it should not be the
+#                   one in Program Files. The measurement reference depends on
+#                   this: a build whose xul.dll is patched to load dwcore.dll
+#                   instead of dwrite.dll runs on DWriteCore, and the stock
+#                   install runs on the system DirectWrite. Also DWC_GUEST_FIREFOX.
+#   --rdp           run the guest's browser in its own RDP session, so the
+#                   console session stays exactly as its user left it. Needs a
+#                   FreeRDP client here and two lines in ~/.dwc-guest-rdp, the
+#                   account name and its password.
+#   --hide-console  disconnect the guest's console session once the capture
+#                   server is up. It keeps compositing, so captures stay real,
+#                   but the guest sits at its logon screen until guest-stop
+#                   puts the session back. Off by default: that screen belongs
+#                   to whoever is using the guest.
+#
+# The guest can also be driven with nothing on its console. Set STAGE_DIR and
+# STAGE_URL  and the guest block builds wincap.exe, starts it in the browser's
+# session, and disconnects that session. The desktop falls back to the logon
+# screen and keeps compositing, so captures taken through `guest:<ip>:<capture-port>`
+# are real paints of a window nobody is looking at. Without those two variables
+# nothing changes and captures come off the console framebuffer as before.
 #
 # Both settings this starts Firefox with are load-bearing, and each was found
 # by a comparison that failed without it:
@@ -44,7 +68,7 @@ unset LD_PRELOAD
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-STATE="${TMPDIR:-/tmp}/dwc-parity-firefox.$(id -u)"
+STATE_BASE="${TMPDIR:-/tmp}/dwc-parity-firefox.$(id -u)"
 
 usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -158,8 +182,7 @@ COMMAND="$1"; shift
 
 GUEST_DOMAIN=""
 case "$COMMAND" in
-    stop) stop_all; exit 0 ;;
-    start) ;;
+    stop|start) ;;
     guest|guest-stop)
         [ $# -ge 1 ] || usage
         GUEST_DOMAIN="$1"; shift ;;
@@ -173,6 +196,14 @@ SHIM="$(find_shim)"
 URL="about:blank"
 PROFILE=""
 USE_PREFS=1
+CAPTURE_PORT=""
+HIDE_CONSOLE=0
+RDP_SESSION=0
+GUEST_FIREFOX="${DWC_GUEST_FIREFOX:-}"
+RDP_CREDS="${DWC_RDP_CREDS:-$HOME/.dwc-guest-rdp}"
+RDP_DISPLAY="${DWC_RDP_DISPLAY:-:98}"
+STAGE_DIR="${STAGE_DIR:-}"
+STAGE_URL="${STAGE_URL:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -184,9 +215,38 @@ while [ $# -gt 0 ]; do
         --no-prefs) USE_PREFS=0; export CLEARTYPE_PREFS=0; shift ;;
         --url)     URL="$2"; shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
+        --capture-port) CAPTURE_PORT="$2"; shift 2 ;;
+        --hide-console) HIDE_CONSOLE=1; shift ;;
+        --rdp)     RDP_SESSION=1; shift ;;
+        --guest-firefox) GUEST_FIREFOX="$2"; shift 2 ;;
         *) usage ;;
     esac
 done
+
+[ -n "$CAPTURE_PORT" ] || CAPTURE_PORT=$((PORT + 1))
+
+# One state directory per Marionette port. The pid files live here, so sharing
+# one directory means a second browser's start kills the first one.
+STATE="$STATE_BASE.$PORT"
+
+if [ "$COMMAND" = stop ]; then
+    stop_all
+    exit 0
+fi
+
+# Who the guest's scheduled tasks run as. The INTERACTIVE group means whoever
+# is logged on, which is the console user; naming the harness account instead
+# is what puts the browser in the RDP session and nowhere else.
+RDP_USER=""
+GUEST_PRINCIPAL="New-ScheduledTaskPrincipal -GroupId 'INTERACTIVE' -RunLevel Limited"
+if [ "$RDP_SESSION" = 1 ]; then
+    if [ ! -r "$RDP_CREDS" ]; then
+        echo "no guest credentials at $RDP_CREDS: line 1 the account, line 2 its password" >&2
+        exit 1
+    fi
+    RDP_USER="$(sed -n 1p "$RDP_CREDS")"
+    GUEST_PRINCIPAL="New-ScheduledTaskPrincipal -UserId '$RDP_USER' -LogonType Interactive -RunLevel Limited"
+fi
 
 # ---------------------------------------------------------------------------
 # The guest side
@@ -210,12 +270,150 @@ run_guest() {                             # run_guest <powershell text>
     return $status
 }
 
+# A session of the harness's own, so the guest's console session is left
+# alone. An RDP logon gets a composited desktop the same way the console does,
+# and it is a different session, so nothing the browser draws reaches whoever
+# is using the guest and nothing here has to disconnect them.
+#
+# The client draws into an Xvfb nobody reads. It exists because a *connected*
+# session is the one Windows keeps composing; the pixels this end receives are
+# thrown away, and the ones that matter are read inside the guest by wincap.
+start_rdp_session() {                     # start_rdp_session <guest ip>
+    local ip="$1" client pass
+    client="$(command -v xfreerdp3 || command -v xfreerdp || true)"
+    if [ -z "$client" ]; then
+        echo "no FreeRDP client here; install freerdp for --rdp" >&2
+        return 1
+    fi
+    pass="$(sed -n 2p "$RDP_CREDS")"
+
+    if ! xdpyinfo -display "$RDP_DISPLAY" >/dev/null 2>&1; then
+        Xvfb "$RDP_DISPLAY" -screen 0 "${SIZE}x24" -nolisten tcp \
+            >"$STATE.rdp-xvfb.log" 2>&1 &
+        local j
+        for j in $(seq 1 40); do
+            xdpyinfo -display "$RDP_DISPLAY" >/dev/null 2>&1 && break
+            sleep 0.25
+        done
+    fi
+
+    pkill -f "xfreerdp.*$ip" 2>/dev/null
+    DISPLAY="$RDP_DISPLAY" "$client" "/v:$ip" "/u:$RDP_USER" "/p:$pass" \
+        "/size:$SIZE" /cert:ignore /log-level:ERROR +auto-reconnect \
+        >"$STATE.rdp.log" 2>&1 &
+
+    # Wait for Windows to say the session is up, not for the client to say it
+    # connected: the logon still has a profile to load, and a task started
+    # before that lands nowhere.
+    local i state=""
+    for i in $(seq 1 60); do
+        state="$(run_guest "
+\$u = quser 2>\$null | Select-String '$RDP_USER'
+if (\$u) { Write-Output (\$u -replace '.*(Active|Disc).*', '\$1') }
+" 2>/dev/null | tr -d '\r' | grep -oE 'Active|Disc' | tail -1)"
+        [ "$state" = "Active" ] && break
+        sleep 2
+    done
+    if [ "$state" != "Active" ]; then
+        echo "the $RDP_USER session never came up; see $STATE.rdp.log" >&2
+        return 1
+    fi
+    echo "guest session for $RDP_USER is up"
+}
+
+# Captures with nothing on the console. wincap.exe runs inside the browser's
+# own session and asks the window to render itself, which works while that
+# session is disconnected; QEMU's screendump cannot, because it photographs
+# whatever the console is scanning out. The session is disconnected only once
+# the capture server has answered, so a failure here leaves the guest usable.
+start_capture() {                         # start_capture <guest ip>
+    local ip="$1"
+    command -v x86_64-w64-mingw32-g++ >/dev/null || {
+        echo "no x86_64-w64-mingw32-g++; captures stay on the console" >&2
+        return 1
+    }
+    [ -d "$STAGE_DIR" ] || { echo "no directory at STAGE_DIR=$STAGE_DIR" >&2; return 1; }
+
+    local work="$STATE.wincap"
+    mkdir -p "$work"
+    x86_64-w64-mingw32-g++ -std=c++17 -O2 "$HERE/wincap.c" -o "$work/wincap.exe" \
+        -lws2_32 -lgdi32 -luser32 -static 2>"$work/build.log" || {
+        cat "$work/build.log" >&2
+        return 1
+    }
+    local stamp staged
+    stamp="$(sha256sum "$work/wincap.exe" | cut -c1-16)"
+    staged="wincap.$stamp.exe"
+    cp "$work/wincap.exe" "$STAGE_DIR/$staged"
+
+    # Under SystemDrive and not TEMP, for the reason the profile directory is:
+    # the agent runs as SYSTEM, so its TEMP is one the interactive user cannot
+    # read, and this has to be started by that user to land in their session.
+    # wincap binds INADDR_ANY, so it needs the firewall hole but no port proxy.
+    run_guest "
+\$exe = Join-Path \$env:SystemDrive '$staged'
+if (-not (Test-Path \$exe)) {
+    Invoke-WebRequest -UseBasicParsing '$STAGE_URL/$staged' -OutFile \$exe
+}
+icacls \$exe /grant '*S-1-5-32-545:RX' | Out-Null
+# Matched on the prefix: the staged file carries a build stamp, so the process
+# is wincap.<stamp>, and an older one left listening answers for a window that
+# is no longer the browser's.
+Get-Process | Where-Object { \$_.Name -like 'wincap*' } | Stop-Process -Force
+schtasks /delete /tn dwccap /f 2>&1 | Out-Null
+\$act = New-ScheduledTaskAction -Execute \$exe -Argument '--serve $CAPTURE_PORT --class MozillaWindowClass'
+\$pri = $GUEST_PRINCIPAL
+Register-ScheduledTask -TaskName 'dwccap' -Action \$act -Principal \$pri | Out-Null
+Start-ScheduledTask -TaskName 'dwccap'
+netsh advfirewall firewall delete rule name=dwc-capture 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-capture dir=in action=allow protocol=TCP localport=$CAPTURE_PORT | Out-Null
+Write-Output 'capture server started'
+" || return 1
+
+    local i size=""
+    for i in $(seq 1 30); do
+        size="$(python3 "$HERE/wincap_size.py" "$ip" "$CAPTURE_PORT")"
+        case "$size" in
+            ""|"0 0") sleep 1 ;;
+            *) break ;;
+        esac
+    done
+    if [ -z "$size" ] || [ "$size" = "0 0" ]; then
+        echo "no window answered on $ip:$CAPTURE_PORT; captures stay on the console" >&2
+        return 1
+    fi
+    echo "captures at guest:$ip:$CAPTURE_PORT, window $size"
+}
+
+# Disconnecting the console is what takes the browser off the guest's screen,
+# and it is also what puts the guest at its logon screen for as long as the
+# sweep runs. That is somebody's desktop, so it is never done unasked.
+hide_console() {
+    run_guest "
+\$s = (Get-Process firefox -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
+if (-not \$s) { Write-Error 'no firefox to take the session id from'; exit 1 }
+tsdiscon \$s
+Write-Output ('disconnected session ' + \$s)
+"
+}
+
 if [ "$COMMAND" = "guest-stop" ]; then
+    pkill -f "xfreerdp.*/v:" 2>/dev/null
     run_guest "
 Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process | Where-Object { \$_.Name -like 'wincap*' } | Stop-Process -Force
 schtasks /delete /tn dwcff /f 2>&1 | Out-Null
+schtasks /delete /tn dwccap /f 2>&1 | Out-Null
 netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 | Out-Null
 netsh advfirewall firewall delete rule name=dwc-marionette | Out-Null
+netsh advfirewall firewall delete rule name=dwc-capture 2>&1 | Out-Null
+# The harness's own session, if there is one. Never the console user's.
+\$h = quser 2>\$null | Select-String 'dwcparity'
+if (\$h) { logoff (\$h -replace '.*?\s(\d+)\s+(Active|Disc).*', '\$1') 2>&1 | Out-Null }
+# Back onto the console. Logging in again instead would open a second session
+# and leave this one running with nobody attached to it.
+\$d = (quser 2>\$null | Select-String 'Disc') -replace '.*\s(\d+)\s+Disc.*', '\$1'
+if (\$d) { tscon \$d /dest:console 2>&1 | Out-Null }
 Write-Output 'guest stopped'
 "
     exit $?
@@ -226,6 +424,14 @@ if [ "$COMMAND" = "guest" ] && [ "$USE_PREFS" = 1 ]; then
     echo "Windows Firefox given them answers with what they say instead of with" >&2
     echo "what Windows does." >&2
     exit 2
+fi
+
+if [ "$COMMAND" = "guest" ] && [ "$RDP_SESSION" = 1 ]; then
+    GUEST_IP="$(python3 "$HERE/vmexec.py" "$GUEST_DOMAIN" powershell -NoProfile -Command \
+        "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -First 1).IPAddress" \
+        2>/dev/null | tr -d '\r' | tail -1)"
+    [ -n "$GUEST_IP" ] || { echo "no address for $GUEST_DOMAIN" >&2; exit 1; }
+    start_rdp_session "$GUEST_IP" || exit 1
 fi
 
 if [ "$COMMAND" = "guest" ]; then
@@ -256,6 +462,12 @@ if [ "$COMMAND" = "guest" ]; then
         # there. Only the side whose page server is not loopback shows it,
         # which is this one.
         echo 'user_pref("browser.chrome.site_icons", false);'
+        # Light content on both sides, whatever theme each machine is set to.
+        # A page with a prefers-color-scheme rule otherwise reads the guest's
+        # Windows theme on one side and the GTK theme on the other, and
+        # clagnut-pangrams came back 0.0000% identical for that alone. 1 is
+        # Light in modules/libpref/init/StaticPrefList.yaml.
+        echo 'user_pref("layout.css.prefers-color-scheme.content-override", 1);'
         echo 'user_pref("datareporting.policy.dataSubmissionEnabled", false);'
     } > "$GUEST_PREFS"
     CHUNKS="$(base64 -w0 < "$GUEST_PREFS" | fold -w1200)"
@@ -286,16 +498,18 @@ Write-Output ('user.js ' + (Get-Item (Join-Path \$profileDir 'user.js')).Length 
 " || exit 1
 
     run_guest "
-\$exe = @((Join-Path \$env:ProgramFiles 'Mozilla Firefox\firefox.exe'),
+\$exe = @('$GUEST_FIREFOX',
+          (Join-Path \$env:ProgramFiles 'Mozilla Firefox\firefox.exe'),
           (Join-Path \${env:ProgramFiles(x86)} 'Mozilla Firefox\firefox.exe')) |
-        Where-Object { Test-Path \$_ } | Select-Object -First 1
+        Where-Object { \$_ -and (Test-Path \$_) } | Select-Object -First 1
 if (-not \$exe) { Write-Error 'no firefox.exe in the guest'; exit 1 }
+Write-Output ('firefox: ' + \$exe)
 Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
 schtasks /delete /tn dwcff /f 2>&1 | Out-Null
 \$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile'
 \$a = '-marionette -remote-allow-system-access -no-remote -profile \"' + \$profileDir + '\" \"$URL\"'
 \$act = New-ScheduledTaskAction -Execute \$exe -Argument \$a
-\$pri = New-ScheduledTaskPrincipal -GroupId 'INTERACTIVE' -RunLevel Limited
+\$pri = $GUEST_PRINCIPAL
 Register-ScheduledTask -TaskName 'dwcff' -Action \$act -Principal \$pri | Out-Null
 Start-ScheduledTask -TaskName 'dwcff'
 Write-Output 'started'
@@ -317,6 +531,9 @@ Write-Output ('marionette at ' + \$ip + ':$PORT')
         2>/dev/null | tr -d '\r' | tail -1)"
     if [ -n "$GUEST_IP" ]; then
         DWC_TESTING_DIR="$HERE" warm_up "$GUEST_IP" "$PORT"
+        if [ -n "$STAGE_DIR" ] && [ -n "$STAGE_URL" ]; then
+            start_capture "$GUEST_IP" && [ "$HIDE_CONSOLE" = 1 ] && hide_console
+        fi
     fi
     exit $status
 fi
@@ -341,10 +558,22 @@ mkdir -p "$PROFILE"
     echo "user_pref(\"browser.cache.check_doc_frequency\", 1);"
     # Both sides alike; see the guest block above for what it is for.
     echo "user_pref(\"browser.chrome.site_icons\", false);"
+    echo "user_pref(\"layout.css.prefers-color-scheme.content-override\", 1);"
     echo "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");"
     echo "user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);"
     echo "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);"
 } >> "$PROFILE/user.js"
+
+# A browser whose Marionette cannot bind still starts, and every later command
+# then reaches whoever already holds the port. That reads as a shim that did
+# nothing, so refuse instead. It catches a browser this script has lost track
+# of, which is what happens when TMPDIR or the port changes under a running one.
+if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+    exec 3<&- 2>/dev/null
+    echo "port $PORT is already in use; stop that browser first" >&2
+    ss -ltnp 2>/dev/null | grep ":$PORT " >&2
+    exit 1
+fi
 
 if command -v Xvfb >/dev/null 2>&1; then
     Xvfb "$DISPLAY_NAME" -screen 0 "${SIZE}x24" >/dev/null 2>&1 &
@@ -373,6 +602,12 @@ echo $! > "$STATE/firefox.pid"
 
 for _ in $(seq 1 60); do
     if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+        # The guest gets this at the end of its own start; this side needs it
+        # for the same reason. A loopback page server skips the "Looking up"
+        # panel but not the one a subresource puts up, and a panel that appears
+        # for one cell of a sweep and not the next is a constant-size
+        # difference on whichever page it lands on.
+        DWC_TESTING_DIR="$HERE" warm_up 127.0.0.1 "$PORT"
         echo "firefox on $DISPLAY_NAME, marionette 127.0.0.1:$PORT${SHIM:+, shim $SHIM}"
         echo "profile $PROFILE"
         exit 0

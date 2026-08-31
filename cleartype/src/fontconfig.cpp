@@ -61,6 +61,9 @@
 #include "chromium/fallback_order.h"
 #include "chromium/family_match.h"
 #include "chromium/parity_gate.h"
+#if CLEARTYPE_FIREFOX_PARITY
+#include "firefox_parity_data.h"
+#endif
 #include "parity_mode.h"
 #include "shim_exports.h"
 #include "windows_fonts.h"
@@ -112,6 +115,11 @@ struct FcValue
 constexpr int kFcRgbaRgb = 1;
 constexpr int kFcHintSlight = 1;
 constexpr int kFcLcdDefault = 1;
+// FC_WEIGHT_LIGHT, FC_WEIGHT_DEMILIGHT and FC_WEIGHT_REGULAR.
+constexpr int kFcWeightLight = 50;
+constexpr int kFcWeightDemilight = 55;
+constexpr int kFcWeightRegular = 80;
+constexpr int kFcWeightBold = 200;
 
 using FcPatternGetIntegerFn = FcResult (*)(const FcPattern*, const char*, int, int*);
 using FcPatternGetBoolFn = FcResult (*)(const FcPattern*, const char*, int, FcBool*);
@@ -463,6 +471,33 @@ bool EditInPlace(FcPattern* pattern)
 // This runs inside another process's fontconfig calls, so the null checks
 // below cover arguments no caller in this library chose.
 // ReSharper disable once CppDFAConstantConditions
+// The family Windows resolves this name to, or null when it resolves to
+// itself. gfxDWriteFontList::FindAndAddFamiliesLocked rewrites the key name
+// through the substitute table before it looks a family up, so the answer is
+// the same whatever language asked; gfxFcPlatformFontList has no such step and
+// hands the name to fontconfig, which answers "Times" under lang=hy with
+// Sylfaen where Windows has Times New Roman.
+//
+// AddSubstitute records a row only when the actual font is installed, and
+// skips one whose own name is an installed family, so both tests are applied
+// here against the families Windows ships.
+const char* WindowsFontSubstitute(const char* family)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (family == nullptr || !dwcft::ParityActive() || ShipsWithWindows(family)) {
+        return nullptr;
+    }
+    for (const firefox_parity::FontSubstitute& sub : firefox_parity::kFontSubstitutes) {
+        if (strcasecmp(sub.substitute, family) == 0 && ShipsWithWindows(sub.actual)) {
+            return sub.actual;
+        }
+    }
+#else
+    (void)family;
+#endif
+    return nullptr;
+}
+
 void KeepRequestedFamilyFirst(FcPattern* pattern, const char* wanted)
 {
     static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
@@ -780,6 +815,29 @@ FcBool FcConfigSubstitute(FcConfig* config, FcPattern* pattern, const int kind)
         }
     }
 
+    // Windows substitutes the name before it looks for a family, so the
+    // substituted one is what fontconfig is asked about and what stays first.
+    if (const char* actual = WindowsFontSubstitute(wanted.c_str())) {
+        static auto del = Next<FcPatternDelFn>("FcPatternDel");
+        static auto add_string = Next<FcPatternAddStringFn>("FcPatternAddString");
+        if (del != nullptr && add_string != nullptr) {
+            std::vector<std::string> rest;
+            for (int i = 1;; ++i) {
+                FcChar8* name = nullptr;
+                if (get_string(pattern, "family", i, &name) != kFcResultMatch || name == nullptr) {
+                    break;
+                }
+                rest.emplace_back(reinterpret_cast<const char*>(name));
+            }
+            del(pattern, "family");
+            add_string(pattern, "family", reinterpret_cast<const FcChar8*>(actual));
+            for (const std::string& name : rest) {
+                add_string(pattern, "family", reinterpret_cast<const FcChar8*>(name.c_str()));
+            }
+            wanted.assign(actual);
+        }
+    }
+
     const FcBool ok = real(config, pattern, kind);
     if (!wanted.empty()) {
         KeepRequestedFamilyFirst(pattern, wanted.c_str());
@@ -898,6 +956,125 @@ namespace {
 
 }  // namespace
 
+#if CLEARTYPE_FIREFOX_PARITY
+// Whether this pattern's family also carries a LIGHT face.
+//
+// gfxFcPlatformFontList::MapFcWeight buckets a fontconfig weight into hundreds
+// and DEMILIGHT lands in the same 300 bucket as LIGHT, so a family carrying
+// both has two faces at one weight and the order decides between them.
+// DirectWrite reports the Semilight face's real 350 and reaches it only where
+// Regular does not cover the character. Answering REGULAR for that face gives
+// the same result. LIGHT keeps everything below 400, and at 400 and above
+// Semilight ties with the family's own Regular face and loses the tie, since
+// FindAllFontsForStyle keeps the standard face ahead of it.
+//
+// Only where a LIGHT face exists to be separated from. A family with a
+// Semilight and no Light, such as Leelawadee UI or Nirmala UI, has 350 as the
+// closest face to every weight below 400, and moving it to the 400 bucket
+// would hand those weights to Regular.
+// Whether any face of this pattern's family is bold. Blink on Linux starts
+// synthetic bold at `weight + 200` of the face it selected, where Windows
+// starts it at 600 flat, so a family with no bold face draws regular text at
+// 600 on Linux and emboldened text on Windows. Reporting the regular face one
+// fontconfig step lighter moves the Linux threshold onto Windows', and asking
+// this first keeps every family that has a real bold face untouched.
+bool FamilyHasBoldFace(const FcPattern* p)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    static auto get_integer = Next<FcPatternGetIntegerFn>("FcPatternGetInteger");
+    static auto get_fonts = Next<FcConfigGetFontsFn>("FcConfigGetFonts");
+    if (p == nullptr || get_string == nullptr || get_integer == nullptr ||
+        get_fonts == nullptr) {
+        return true;
+    }
+
+    static pthread_mutex_t bold_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static std::vector<std::string>* bold = nullptr;
+
+    FcChar8* family = nullptr;
+    if (get_string(p, "family", 0, &family) != kFcResultMatch || family == nullptr) {
+        return true;
+    }
+    const auto* name = reinterpret_cast<const char*>(family);
+
+    pthread_mutex_lock(&bold_mutex);
+    if (bold == nullptr) {
+        bold = new std::vector<std::string>();
+        // The real font set, since asking our own export here would re-enter
+        // the call that got us here.
+        if (FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
+            const auto* view = reinterpret_cast<const FontSetLayout*>(all);
+            for (int i = 0; view->fonts != nullptr && i < view->nfont; ++i) {
+                int weight = 0;
+                if (get_integer(view->fonts[i], "weight", 0, &weight) != kFcResultMatch ||
+                    weight < kFcWeightBold) {
+                    continue;
+                }
+                for (int f = 0; ; ++f) {
+                    FcChar8* other = nullptr;
+                    if (get_string(view->fonts[i], "family", f, &other) != kFcResultMatch ||
+                        other == nullptr) {
+                        break;
+                    }
+                    bold->emplace_back(reinterpret_cast<const char*>(other));
+                }
+            }
+        }
+    }
+    const bool found = std::ranges::find(*bold, name) != bold->end();
+    pthread_mutex_unlock(&bold_mutex);
+    return found;
+}
+
+bool FamilyHasLightFace(const FcPattern* p)
+{
+    static auto get_string = Next<FcPatternGetStringFn>("FcPatternGetString");
+    static auto get_integer = Next<FcPatternGetIntegerFn>("FcPatternGetInteger");
+    static auto get_fonts = Next<FcConfigGetFontsFn>("FcConfigGetFonts");
+    if (p == nullptr || get_string == nullptr || get_integer == nullptr ||
+        get_fonts == nullptr) {
+        return false;
+    }
+
+    // The real font set, since asking our own export here would re-enter the
+    // cache that calls this.
+    static pthread_mutex_t light_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static std::vector<std::string>* light = nullptr;
+
+    FcChar8* family = nullptr;
+    if (get_string(p, "family", 0, &family) != kFcResultMatch || family == nullptr) {
+        return false;
+    }
+    const auto* name = reinterpret_cast<const char*>(family);
+
+    pthread_mutex_lock(&light_mutex);
+    if (light == nullptr) {
+        light = new std::vector<std::string>();
+        if (FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
+            const auto* view = reinterpret_cast<const FontSetLayout*>(all);
+            for (int i = 0; view->fonts != nullptr && i < view->nfont; ++i) {
+                int weight = 0;
+                if (get_integer(view->fonts[i], "weight", 0, &weight) != kFcResultMatch ||
+                    weight != kFcWeightLight) {
+                    continue;
+                }
+                for (int f = 0; ; ++f) {
+                    FcChar8* other = nullptr;
+                    if (get_string(view->fonts[i], "family", f, &other) != kFcResultMatch ||
+                        other == nullptr) {
+                        break;
+                    }
+                    light->emplace_back(reinterpret_cast<const char*>(other));
+                }
+            }
+        }
+    }
+    const bool found = std::ranges::find(*light, name) != light->end();
+    pthread_mutex_unlock(&light_mutex);
+    return found;
+}
+#endif
+
 extern "C" __attribute__((visibility("default")))
 FcResult FcPatternGetInteger(const FcPattern* p, const char* object, const int n, int* value)
 {
@@ -916,7 +1093,25 @@ FcResult FcPatternGetInteger(const FcPattern* p, const char* object, const int n
         }
         return kFcResultNoMatch;
     }
-    return real(p, object, n, value);
+    const FcResult result = real(p, object, n, value);
+    // Skia builds a typeface's SkFontStyle from this, and Blink then compares
+    // the run's weight against it. One step lighter maps to 396 instead of
+    // 400, which is what puts the Linux synthetic-bold threshold on 600 where
+    // Windows has it. Only for a family with no bold face; everywhere else the
+    // bolder face is the one selected and its own weight is what gets read.
+    if (result == kFcResultMatch && value != nullptr && *value == kFcWeightRegular &&
+        Answers(object, n, "weight") && chromium_patch::ParityWanted() &&
+        !dwcft::IsOffValue(std::getenv("DWC_WEIGHT_600")) && !FamilyHasBoldFace(p)) {
+        *value = kFcWeightRegular - 1;
+    }
+#if CLEARTYPE_FIREFOX_PARITY
+    if (result == kFcResultMatch && value != nullptr && *value == kFcWeightDemilight &&
+        Answers(object, n, "weight") && dwcft::ParityActive() &&
+        FamilyHasLightFace(p)) {
+        *value = kFcWeightRegular;
+    }
+#endif
+    return result;
 }
 
 extern "C" __attribute__((visibility("default")))

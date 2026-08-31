@@ -69,6 +69,10 @@ import viewport_protocol as vp
 # pixel its top left corner.
 MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
+const s = document.createElement('style');
+s.id = '__dwc_no_scrollbars';
+s.textContent = '*{scrollbar-width:none!important}';
+document.documentElement.appendChild(s);
 const d = document.createElement('div');
 d.id = '__dwc_origin_mark';
 d.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:8px;height:8px;'

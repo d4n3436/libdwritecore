@@ -385,6 +385,8 @@ uintptr_t FindOwningFunction(const Image& image, const FunctionStarts& starts,
 
 // The one place in the relocated read-only data that holds this function: its
 // vtable slot. More than one, and which to write is a guess.
+void** FindVtableSlot(const Image& image, uintptr_t function);
+
 void** FindVtableSlot(const Image& image, const uintptr_t function)
 {
     void** found = nullptr;
@@ -456,6 +458,9 @@ constexpr unsigned kMetricsMaxAscent = 12;
 constexpr unsigned kMetricsMaxDescent = 13;
 constexpr unsigned kMetricsMaxAdvance = 14;
 constexpr unsigned kMetricsAveCharWidth = 15;
+constexpr unsigned kMetricsSpaceWidth = 16;
+constexpr unsigned kMetricsZeroWidth = 17;
+constexpr unsigned kMetricsIdeographicWidth = 18;
 constexpr unsigned kMetricsFields = 19;
 
 // How far into the object to look for it. gfxFT2FontBase::mMetrics sits after
@@ -915,7 +920,7 @@ void MarkBadUnderlineFamilies()
 //
 // A glyph mask is blended against the text color through a gamma curve, and on
 // Windows that curve is not one value for the whole page.
-// gfx/2d/DWriteSettings.cpp answers with its own initialisers, sGamma{2.2f} and
+// gfx/2d/DWriteSettings.cpp answers with its own initializers, sGamma{2.2f} and
 // sEnhancedContrast{1.0f}, until gfxVars deliver the system values, and the
 // blob rasterizer that draws SVG text runs before they do.
 //
@@ -1015,7 +1020,7 @@ int SetBlobTextGammaOnce()
     }
     *gamma = GammaAsScalar(firefox_parity::kBlobGamma);
     Report("libxul: SVG text gamma %.2f rather than %.2f, as DWriteSettings' "
-           "initialisers leave it on Windows",
+           "initializers leave it on Windows",
            static_cast<double>(GammaAsScalar(firefox_parity::kBlobGamma)),
            static_cast<double>(GammaAsScalar(firefox_parity::kPageGamma)));
     return 1;
@@ -1108,9 +1113,98 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
     return found;
 }
 
+// gfxFont::mAdjustedSize, the size everything below the metrics is scaled
+// from and the one gfxFontconfigFont::GetScaledFont hands WebRender.
+//
+// gfx/thebes/gfxFont.h declares it between the style and a pair of tracking
+// fields that nothing has touched by the time InitMetrics returns:
+//
+//     gfxFontStyle mStyle;
+//     mutable gfxFloat mAdjustedSize;
+//     gfxFloat mTracking = 0.0;
+//     gfxFloat mCachedTrackingSize = -1.0;
+//
+// gfxFT2FontBase::mMetrics sits after everything gfxFont carries, so the field
+// lies between the object's start and the struct FindMetrics located. The two
+// trailing fields identify it; the size on its own appears several times over.
+double* FindAdjustedSize(void* self, const double* metrics, const double size)
+{
+    // The distance back from the metrics struct is fixed by the build, so it
+    // is learned once and used from then on. A second run of doubles matching
+    // the same pattern makes the search ambiguous and nothing is written.
+    static std::atomic<size_t> known{0};
+
+    auto* base = static_cast<double*>(self);
+    if (metrics < base + 3) {
+        return nullptr;
+    }
+    if (const size_t delta = known.load(std::memory_order_relaxed); delta != 0) {
+        double* at = const_cast<double*>(metrics) - delta;
+        if (at >= base && SameDouble(at[0], size)) {
+            return at;
+        }
+    }
+    double* found = nullptr;
+    for (const double* at = metrics - 3; at >= base; --at) {
+        if (SameDouble(at[0], size) && SameDouble(at[1], 0.0) && SameDouble(at[2], -1.0)) {
+            if (found != nullptr) {
+                return nullptr;              // ambiguous, so nothing is written
+            }
+            found = const_cast<double*>(at);
+        }
+    }
+    if (found != nullptr) {
+        known.store(static_cast<size_t>(metrics - found), std::memory_order_relaxed);
+    }
+    return found;
+}
+
+// Where the RefPtr<SharedFTFace> sits in the font, in words from its start.
+// gfxFT2FontBase declares `RefPtr<mozilla::gfx::SharedFTFace> mFTFace; Metrics
+// mMetrics;`, so it is the word before the struct FindMetrics locates. Learned
+// from the first font whose struct was found, then used before the accessors
+// are asked anything.
+std::atomic<size_t> g_ftface_word{0};
+
+// SharedFTFace keeps `FT_Face mFace` behind an atomic refcount, so the face is
+// one of the first few words of it. Each word is offered to the shim, which
+// knows its own faces and refuses anything else.
+// mFTSize, the size this font set the face to. `Metrics mMetrics; int
+// mFTLoadFlags; bool mEmbolden; gfxFloat mFTSize;` puts it one word past the
+// struct, the int and the bool sharing that word.
+constexpr size_t kFTSizeWord = kMetricsFields + 1;
+
+void ClaimOwnFace(void* self)
+{
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    if (self == nullptr || at == 0) {
+        return;
+    }
+    auto* const shared = static_cast<void* const*>(self)[at - 1];
+    if (shared == nullptr) {
+        return;
+    }
+    // The face alone does not name an instance. Several fonts share one face
+    // at sizes that round to the same ppem, and the face carries whichever was
+    // installed last, so the size goes with the claim. A size out of range is
+    // passed as zero and the shim falls back to the one the face carries.
+    double ft_size = 0.0;
+    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord,
+                sizeof(ft_size));
+    if (!(ft_size > 0.0) || !(ft_size < 65536.0)) {
+        ft_size = 0.0;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (CleartypeClaimFace(static_cast<void* const*>(shared)[i], ft_size) != 0) {
+            return;
+        }
+    }
+}
+
 extern "C" void DwcInitMetrics(void* self)
 {
     g_init_metrics(self);
+    ClaimOwnFace(self);
 
     // Not about this font: the one place in the parent that is reached once
     // the font list exists. Settles after one success.
@@ -1125,11 +1219,16 @@ extern "C" void DwcInitMetrics(void* self)
     // the struct, and they agree on them, so whichever answered will do.
     double em = 0.0, asc = 0.0, desc = 0.0;
     double il = 0.0, el = 0.0;
-    const bool leading = CleartypeWindowsLeading(&il, &el, &em, &asc, &desc) != 0;
+    double linux_el = 0.0;
+    const bool leading = CleartypeWindowsLeading(&il, &el, &em, &asc, &desc, &linux_el) != 0;
     double uo = 0.0, us = 0.0, fold = 0.0;
     const bool underline = CleartypeWindowsUnderline(&uo, &us, &em, &asc, &desc, &fold) != 0;
     double ave = 0.0, adv = 0.0, cw_em = 0.0, cw_asc = 0.0, cw_desc = 0.0;
     const bool char_width = CleartypeWindowsCharWidth(&ave, &adv, &cw_em, &cw_asc, &cw_desc) != 0;
+    double rounded = 0.0, unrounded = 0.0, sk_space = 0.0, sk_zero = 0.0, sk_ideo = 0.0;
+    double sk_em = 0.0, sk_asc = 0.0, sk_desc = 0.0;
+    const bool strike = CleartypeWindowsStrikeSize(&rounded, &unrounded, &sk_space, &sk_zero,
+                                                   &sk_ideo, &sk_em, &sk_asc, &sk_desc) != 0;
     // All three are read together and the claim is then dropped. The answers
     // belong to this call alone, and a later InitMetrics that returns before
     // reading OS/2 would otherwise be handed this face's numbers.
@@ -1142,6 +1241,40 @@ extern "C" void DwcInitMetrics(void* self)
     if (found == nullptr) {
         return;
     }
+    if (g_ftface_word.load(std::memory_order_relaxed) == 0) {
+        g_ftface_word.store(
+            static_cast<size_t>(reinterpret_cast<void**>(found) -
+                                static_cast<void**>(self)),
+            std::memory_order_relaxed);
+    }
+
+    // gfxDWriteFont::ComputeMetrics rounds mAdjustedSize onto the strike it is
+    // about to draw from, and gfxFT2FontBase::InitMetrics has no such step, so
+    // the size Firefox hands WebRender is the fractional one and WebRender
+    // resamples the strike by req_size / y_ppem.
+    if (strike && SameDouble(sk_em, em) && SameDouble(sk_asc, asc) &&
+        SameDouble(sk_desc, desc)) {
+        // Both sizes or neither. GetFTGlyphExtents scales every advance it
+        // reads by GetAdjustedSize() / mFTSize, so writing both leaves that
+        // scale at 1 and the advance arrives as Windows measured it. Writing
+        // mAdjustedSize alone would leave a scale to divide out, and the only
+        // state available for that is per face and size, which several fonts
+        // share.
+        const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+        double* const adjusted =
+            at != 0 ? FindAdjustedSize(self, found, unrounded) : nullptr;
+        if (adjusted != nullptr) {
+            *adjusted = rounded;
+            std::memcpy(static_cast<void**>(self) + at + kFTSizeWord, &rounded,
+                        sizeof(rounded));
+            // Windows measures these three through the rounded instance and
+            // InitMetrics through the unrounded one, so they are replaced
+            // outright.
+            found[kMetricsSpaceWidth] = sk_space;
+            found[kMetricsZeroWidth] = sk_zero;
+            found[kMetricsIdeographicWidth] = sk_ideo;
+        }
+    }
 
     // The pair that sizes a text control and places nothing.
     if (char_width && SameDouble(cw_em, em) && SameDouble(cw_asc, asc) &&
@@ -1150,7 +1283,24 @@ extern "C" void DwcInitMetrics(void* self)
         found[kMetricsMaxAdvance] = adv;
     }
 
-    if (leading) {
+    // gfxFont::SanitizeMetrics replaces the external leading outright when the
+    // @font-face rule carries line-gap-override, and it changes nothing else.
+    // An ascent or descent override moves maxAscent or maxDescent, so
+    // FindMetrics already declines those; this one slips past it.
+    //
+    // linux_external is what InitMetrics derived before SanitizeMetrics ran, so
+    // a field that no longer holds it is the author's override. Both platforms
+    // apply that override alike, and replacing it here would undo it.
+    //
+    // The test allows half a pixel. The reconstruction rebuilds InitMetrics'
+    // arithmetic from the size metrics and the OS/2 table and lands within a
+    // rounding step of it, while an override is written as a percentage of the
+    // font size and moves the leading by whole pixels. A tighter test would
+    // read the rounding step as an override.
+    const bool overridden =
+        leading && std::fabs(found[kMetricsExternalLeading] - linux_el) > 0.5;
+
+    if (leading && !overridden) {
         // gfxFT2FontBase::InitMetrics writes floor(size + 0.5) into emHeight
         // where gfxDWriteFont::ComputeMetrics writes the unrounded
         // mAdjustedSize, so all three fields that make a line height are put
@@ -1185,7 +1335,7 @@ extern "C" void DwcInitMetrics(void* self)
             found[kMetricsMaxDescent] = desc - fold;
         }
     }
-    if (leading) {
+    if (leading && !overridden) {
         // gfxDWriteFonts.cpp: emAscent = emHeight * maxAscent / maxHeight, and
         // emDescent is the remainder. InitMetrics derived both from the
         // rounded emHeight, so they no longer sum to the one written above.
