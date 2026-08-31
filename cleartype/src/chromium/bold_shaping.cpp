@@ -183,8 +183,8 @@ struct Funcs
         return (shape || shape_full) && blob_create && blob_destroy && face_create &&
                face_destroy &&
                face_upem && face_glyphs && font_create && font_sub &&
-               font_destroy && font_face && font_get_scale && font_set_scale &&
-               font_get_ptem && font_set_ptem && font_set_funcs &&
+               font_destroy && font_face && font_set_scale && font_set_ptem &&
+               font_set_funcs &&
                ot_set_funcs && var_axes;
     }
 };
@@ -435,6 +435,13 @@ void ForgetFont(hb_font_t* font)
 size_t g_klass_offset = 0;
 size_t g_data_offset = 0;
 bool g_layout_known = false;
+// Where the scale and ptem sit, for a build that inlined their getters.
+// libcef.so is that build: it names hb_font_set_scale and hb_font_set_ptem and
+// neither of the two reads.
+size_t g_scale_offset = 0;
+size_t g_ptem_offset = 0;
+bool g_scale_known = false;
+bool g_ptem_known = false;
 
 // How far into an hb_font_t to look. Past both fields, and clamped to the end
 // of the page so a short allocation is never read past.
@@ -456,6 +463,13 @@ void LearnFontLayout()
     // Its own address, so nothing else in the font can hold the same value.
     static char sentinel = 0;
     hb.font_set_funcs(font, klass, &sentinel, nullptr);
+    // Values no font would hold by accident, planted through the setters that
+    // this build does name so the reads that it does not can be measured.
+    constexpr int kScaleX = 0x5EDCAFE;
+    constexpr int kScaleY = 0x5EDBABE;
+    constexpr float kPtem = 4321.5f;
+    hb.font_set_scale(font, kScaleX, kScaleY);
+    hb.font_set_ptem(font, kPtem);
 
     const long page = sysconf(_SC_PAGESIZE);
     const auto at = reinterpret_cast<uintptr_t>(font);
@@ -478,7 +492,30 @@ void LearnFontLayout()
             ++data_seen;
         }
     }
+    // The scale is two ints in a row and the ptem one float, so each is looked
+    // for at its own alignment rather than the pointer's.
+    size_t scale_at = 0;
+    size_t ptem_at = 0;
+    unsigned scale_seen = 0;
+    unsigned ptem_seen = 0;
+    for (size_t off = 0; off + 2 * sizeof(int) <= limit; off += sizeof(int)) {
+        if (ReadAt<int>(font, off) == kScaleX &&
+            ReadAt<int>(font, off + sizeof(int)) == kScaleY) {
+            scale_at = off;
+            ++scale_seen;
+        }
+    }
+    for (size_t off = 0; off + sizeof(float) <= limit; off += sizeof(float)) {
+        if (ReadAt<float>(font, off) == kPtem) {
+            ptem_at = off;
+            ++ptem_seen;
+        }
+    }
     hb.font_destroy(font);
+    g_scale_known = scale_seen == 1;
+    g_ptem_known = ptem_seen == 1;
+    g_scale_offset = scale_at;
+    g_ptem_offset = ptem_at;
 
     // Either field appearing twice means the wrong one could be read, so the
     // whole route is declined rather than half trusted.
@@ -562,6 +599,22 @@ void InstallAtLoad()
     if (at == nullptr) {
         return;
     }
+    // Where hb_shape_full is a function of its own, hb_shape is replaced and
+    // the replacement calls it, which is what HarfBuzz's own hb_shape does.
+    // A build that inlined hb_shape_full leaves nothing to call, so hb_shape is
+    // left standing and its callers are moved onto the replacement instead;
+    // the replacement then calls the real hb_shape.
+    if (hb.shape_full == nullptr) {
+        const unsigned moved =
+            hb_abi::RedirectCallsTo(at, reinterpret_cast<void*>(&::hb_shape));
+        if (moved == 0) {
+            Report("hb_shape %p has no reachable call site, so nothing is swapped", at);
+        } else {
+            Report("hb_shape_full is inlined here, so %u call(s) of hb_shape %p were "
+                   "moved onto the replacement", moved, at);
+        }
+        return;
+    }
     const char* why = nullptr;
     if (code_patch::WriteDetour(at, reinterpret_cast<void*>(&::hb_shape), &why)) {
         Report("hb_shape %p replaced where it stands%s%s", at,
@@ -633,9 +686,15 @@ void hb_shape(hb_font_t* font, hb_buffer_t* buffer, const hb_feature_t* features
     // they are read off it rather than kept.
     int x_scale = 0;
     int y_scale = 0;
-    hb.font_get_scale(font, &x_scale, &y_scale);
+    if (hb.font_get_scale != nullptr) {
+        hb.font_get_scale(font, &x_scale, &y_scale);
+    } else {
+        x_scale = ReadAt<int>(font, g_scale_offset);
+        y_scale = ReadAt<int>(font, g_scale_offset + sizeof(int));
+    }
     hb.font_set_scale(bold, x_scale, y_scale);
-    hb.font_set_ptem(bold, hb.font_get_ptem(font));
+    hb.font_set_ptem(bold, hb.font_get_ptem != nullptr ? hb.font_get_ptem(font)
+                                                       : ReadAt<float>(font, g_ptem_offset));
 
     Shape(hb, bold, buffer, features, num_features);
 }

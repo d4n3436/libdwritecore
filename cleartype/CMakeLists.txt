@@ -30,6 +30,8 @@ set(cleartype_chromium_sources
   src/chromium/static_fontconfig.cpp
   src/chromium/cef_system_font.cpp
   src/chromium/bold_weight.cpp
+  src/chromium/colr_outline.cpp
+  src/chromium/weight_style.cpp
   src/chromium/hook_thunk.S)
 if(NOT CLEARTYPE_CHROMIUM_PARITY)
   set(cleartype_chromium_sources)

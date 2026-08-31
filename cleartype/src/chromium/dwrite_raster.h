@@ -72,17 +72,19 @@ int FamilyMatchWeight(const char* family, int weight);
 // process that will actually rasterize.
 bool Available();
 
-// Fill `image_buffer` with this glyph's mask, laid out the way Skia expects
-// for the glyph's own mask format and row bytes. False means the glyph was
-// declined and Skia's own generateImage should run instead, which is the
-// answer for a color glyph, an unsupported mask format, or any DirectWrite
-// call that fails.
+// `simulate_bold` and `simulate_oblique` ask DirectWrite for the face carrying
+// its own bold or oblique simulation, which is what Skia's DirectWrite font
+// manager leaves in place for a font with bitmap strikes. With
+// `simulate_oblique` the caller must pass a rec with no pre-skew, since the
+// slant belongs to the face and no longer to the matrix.
+
 // The advance Windows would measure for this glyph, in pixels. False when it
 // cannot be had, and the caller should keep whatever Skia computed.
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   uint16_t glyph_id, const skia_abi::Rec& rec,
                   const windows_path::Decision& decision, float* advance_x, float* advance_y,
-                  uint32_t face_index = 0, bool simulate_bold = false);
+                  uint32_t face_index = 0, bool simulate_bold = false,
+                  bool simulate_oblique = false);
 
 // SkScalerContext_DW::generateDWMetrics, the box DirectWrite will fill.
 // Fontations instead rounds out an unhinted outline, which can sit a pixel
@@ -96,13 +98,15 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision,
                  windows_path::RenderingMode rendering_mode,
                  windows_path::TextureType texture_type,
-                 int* left, int* top, int* right, int* bottom, uint32_t face_index = 0, bool simulate_bold = false);
+                 int* left, int* top, int* right, int* bottom, uint32_t face_index = 0,
+                 bool simulate_bold = false, bool simulate_oblique = false);
 
 // The font-wide metrics Windows would report, written into an SkFontMetrics.
 // False when they cannot be had, and the caller keeps Skia's own.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision, void* sk_font_metrics,
-                 uint32_t face_index = 0, bool simulate_bold = false);
+                 uint32_t face_index = 0, bool simulate_bold = false,
+                 bool simulate_oblique = false);
 
 // SkScalerContext_DW::generatePath, the outline DirectWrite hands Skia on
 // Windows. `size` is fTextSizeRender, and the verbs and points come back in
@@ -113,12 +117,18 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   uint16_t glyph_id, float size, std::vector<uint8_t>* verbs,
                   std::vector<path_abi::Point>* points, uint32_t face_index = 0,
-                  bool simulate_bold = false);
+                  bool simulate_bold = false, bool simulate_oblique = false);
 
+// Fill `image_buffer` with this glyph's mask, laid out the way Skia expects
+// for the glyph's own mask format and row bytes. False means the glyph was
+// declined and Skia's own generateImage should run instead, which is the
+// answer for a color glyph, an unsupported mask format, or any DirectWrite
+// call that fails.
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer, uint32_t face_index = 0, bool simulate_bold = false);
+                 void* image_buffer, uint32_t face_index = 0, bool simulate_bold = false,
+                 bool simulate_oblique = false);
 
 }  // namespace dwrite_raster
 

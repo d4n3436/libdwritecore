@@ -46,6 +46,12 @@ bool BothZero(const float a, const float b)
 
 skia_abi::Rec WithWindowsHinting(skia_abi::Rec rec)
 {
+    // Skia's as-paths strike sets hinting to none on both platforms, so
+    // Windows disables grid fitting for it. Every other rec arrives saying
+    // none because fontconfig said so, which Windows would not have.
+    if (rec.AsPaths()) {
+        return rec;
+    }
     rec.flags &= static_cast<uint16_t>(~skia_abi::kHintingMask);
     rec.flags |= static_cast<uint16_t>(skia_abi::kHintingNormal << skia_abi::kHintingShift);
     return rec;

@@ -75,6 +75,13 @@ struct Face
 // family has an italic face, which Windows answers with that face instead.
 Face RealBoldFor(const std::vector<uint8_t>& font, bool oblique);
 
+// The file DirectWrite would answer a bold request for this family with, for a
+// caller that has the family's name and not its bytes. `path` points into the
+// map and lives as long as the process. False when the family has no bold face
+// mapped, or when an oblique run is being answered and the family has a real
+// italic face, which Windows would reach instead.
+bool BoldFileFor(const char* family, bool oblique, const char** path, uint32_t* face_index);
+
 }  // namespace bold_fallback
 
 #endif  // CHROMIUM_BOLD_FALLBACK_H_INCLUDED

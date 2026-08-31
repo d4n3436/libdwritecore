@@ -126,7 +126,9 @@ chromium_filter_rec_thunk:
 //   rdx  the glyph
 //   rcx  the arena
 //
-// The original runs first and fills that buffer; the probe then sees the
+// A color glyph's bounds are measured inside the original, so the pre stage
+// runs first and sets the subpixel position that measuring walk reads. The
+// original then runs and fills the buffer; the probe after it sees the
 // finished metrics and replaces the advance, which is the one field Windows
 // measures differently. rax must come back holding the buffer, as the ABI
 // requires of a function returning through memory.
@@ -147,11 +149,23 @@ chromium_metrics_thunk:
     .cfi_adjust_cfa_offset 8
     push %rdx
     .cfi_adjust_cfa_offset 8
-    sub $8, %rsp
+    // rcx is the arena, the fourth argument, and a call would destroy it.
+    // Saving it here also keeps the eight bytes the alignment needs.
+    push %rcx
     .cfi_adjust_cfa_offset 8
+    // The pre stage takes the scaler context and the glyph, so the second and
+    // third arguments become its first and second. The four pushes above are
+    // at rbp-8 through rbp-32, which is where they come back from.
+    mov %rsi, %rdi
+    mov %rdx, %rsi
+    call OnChromiumMetricsPre@PLT
+    mov -8(%rbp), %rdi
+    mov -16(%rbp), %rsi
+    mov -24(%rbp), %rdx
+    mov -32(%rbp), %rcx
     movq g_original_metrics(%rip), %rax
     call *%rax
-    add $8, %rsp
+    pop %rcx
     .cfi_adjust_cfa_offset -8
     pop %rdx
     .cfi_adjust_cfa_offset -8

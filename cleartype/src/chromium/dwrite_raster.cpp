@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -170,12 +171,13 @@ bool EnsureFactory()
 }
 
 // What identifies one font face: the bytes it was built from, which face of a
-// collection it is, and whether DirectWrite is simulating bold on it.
+// collection it is, and which simulations DirectWrite is applying to it.
 struct FaceKey
 {
     const void* typeface;
     uint32_t face_index;
     bool simulate_bold;
+    bool simulate_oblique;
 
     bool operator==(const FaceKey& other) const = default;
 };
@@ -186,7 +188,8 @@ struct KeyHash
     {
         return std::hash<const void*>{}(k.typeface) ^
                (std::hash<uint32_t>{}(k.face_index) << 1) ^
-               static_cast<size_t>(k.simulate_bold);
+               (static_cast<size_t>(k.simulate_bold) << 2) ^
+               (static_cast<size_t>(k.simulate_oblique) << 3);
     }
 };
 
@@ -234,13 +237,14 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
 IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes,
-                         const uint32_t face_index, const bool simulate_bold)
+                         const uint32_t face_index, const bool simulate_bold,
+                         const bool simulate_oblique)
 {
     // A simulated face is a different face for the same bytes, and so is every
     // other face of a collection, whose bytes are the whole file and therefore
     // the same for all of them.
     static std::unordered_map<FaceKey, IDWriteFontFace*, KeyHash> faces;
-    const FaceKey key{typeface, face_index, simulate_bold};
+    const FaceKey key{typeface, face_index, simulate_bold, simulate_oblique};
     if (const auto it = faces.find(key); it != faces.end()) {
         return it->second;
     }
@@ -257,8 +261,9 @@ IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes
         SUCCEEDED(g_dw.loader->CreateInMemoryFontFileReference(
             g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()), nullptr, &file)) &&
         file != nullptr) {
-        const DWRITE_FONT_SIMULATIONS sims = simulate_bold ? DWRITE_FONT_SIMULATIONS_BOLD
-                                                          : DWRITE_FONT_SIMULATIONS_NONE;
+        const auto sims = static_cast<DWRITE_FONT_SIMULATIONS>(
+            (simulate_bold ? DWRITE_FONT_SIMULATIONS_BOLD : 0) |
+            (simulate_oblique ? DWRITE_FONT_SIMULATIONS_OBLIQUE : 0));
         if (FAILED(g_dw.factory5->CreateFontFace(type, 1, &file, face_index, sims, &face))) {
             face = nullptr;
         }
@@ -744,7 +749,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::RenderingMode rendering_mode,
                  const windows_path::TextureType texture_type, int* left, int* top,
                  int* right, int* bottom, const uint32_t face_index,
-                 const bool simulate_bold)
+                 const bool simulate_bold, const bool simulate_oblique)
 {
     if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) {
         return false;
@@ -753,7 +758,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
     if (face == nullptr) {
         return false;
     }
@@ -835,7 +840,8 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   const uint16_t glyph_id, const skia_abi::Rec& rec,
                   const windows_path::Decision& decision, float* advance_x, float* advance_y,
-                  const uint32_t face_index, const bool simulate_bold)
+                  const uint32_t face_index, const bool simulate_bold,
+                  const bool simulate_oblique)
 {
     if (advance_x == nullptr || advance_y == nullptr) {
         return false;
@@ -844,7 +850,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
     if (face == nullptr) {
         return false;
     }
@@ -901,7 +907,8 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
 // disagreement here becomes a whole pixel of line height.
 bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const windows_path::Decision& decision, void* sk_font_metrics,
-                 const uint32_t face_index, const bool simulate_bold)
+                 const uint32_t face_index, const bool simulate_bold,
+                 const bool simulate_oblique)
 {
     if (sk_font_metrics == nullptr) {
         return false;
@@ -910,7 +917,7 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
     if (face == nullptr) {
         return false;
     }
@@ -981,13 +988,13 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   const uint16_t glyph_id, const float size, std::vector<uint8_t>* verbs,
                   std::vector<path_abi::Point>* points, const uint32_t face_index,
-                  const bool simulate_bold)
+                  const bool simulate_bold, const bool simulate_oblique)
 {
     const std::lock_guard lock(g_mutex);
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
     if (face == nullptr) {
         return false;
     }
@@ -1004,8 +1011,8 @@ bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
 bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  const skia_abi::Rec& rec, const skia_abi::Glyph& glyph,
                  const skia_abi::PreBlend& preblend, const windows_path::Decision& decision,
-                 void* image_buffer, const uint32_t face_index,
-                 const bool simulate_bold)
+                 void* image_buffer, const uint32_t face_index, const bool simulate_bold,
+                 const bool simulate_oblique)
 {
     // Only a plain outline glyph. COLRv0, COLRv1 and embedded bitmaps are
     // drawn by Skia through paths an alpha texture cannot stand in for.
@@ -1021,7 +1028,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (!EnsureFactory()) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold);
+    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
     if (face == nullptr) {
         return false;
     }
@@ -1198,5 +1205,6 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     }
     return true;
 }
+
 
 }  // namespace dwrite_raster

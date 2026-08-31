@@ -386,4 +386,28 @@ Face RealBoldFor(const std::vector<uint8_t>& font, const bool oblique)
     return Face{&mapped.bytes, named->second.face_index};
 }
 
+
+bool BoldFileFor(const char* family, const bool oblique, const char** path,
+                 uint32_t* face_index)
+{
+    if (family == nullptr || path == nullptr || face_index == nullptr) {
+        return false;
+    }
+    std::string key(family);
+    for (char& c : key) {
+        c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    }
+    const auto& by_family = BoldByFamily();
+    const auto found = by_family.find(key);
+    if (found == by_family.end() || found->second.path.empty()) {
+        return false;
+    }
+    if (oblique && found->second.has_italic) {
+        return false;
+    }
+    *path = found->second.path.c_str();
+    *face_index = found->second.face_index;
+    return true;
+}
+
 }  // namespace bold_fallback

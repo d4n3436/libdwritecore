@@ -59,6 +59,9 @@
 #include "font_facts.h"
 #include "bold_fallback.h"
 #include "bold_shaping.h"
+#include "bold_weight.h"
+#include "colr_outline.h"
+#include "weight_style.h"
 #include "dwrite_raster.h"
 #include "render_params.h"
 #include "parity_gate.h"
@@ -72,6 +75,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -94,6 +98,7 @@ void chromium_font_metrics_thunk();
 void chromium_path_thunk();
 void OnChromiumFontMetrics(void* context, void* metrics);
 void OnChromiumMetrics(void* result, void* context, const void* glyph);
+void OnChromiumMetricsPre(void* context, const void* glyph);
 void OnChromiumPath(void* result, void* context, const void* glyph);
 size_t ChromiumGetTableData(const void* self, uint32_t tag, size_t offset, size_t length,
                             void* data);
@@ -103,6 +108,9 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 // Read by hook_thunk.S's tail jump. Set before the slot is patched.
 void* g_original = nullptr;
 void* g_original_filter_rec = nullptr;
+// Where it was written, so a vtable the image scan picked by shape can be
+// given its function back once the one Skia dispatches through is known.
+std::vector<void**> g_filter_rec_slots;
 void* g_original_metrics = nullptr;
 void* g_original_font_metrics = nullptr;
 void* g_original_path = nullptr;
@@ -330,6 +338,72 @@ bool FindFfiSymbols(const char* path, const char* want_substr, std::vector<FfiSy
     return true;
 }
 
+// The module holding Chromium, for a symbol table read after the walk.
+char g_image_path[512] = {};
+
+// The address a build that kept its symbol table gives a class's vtable
+// outright. Returns the link-time value, so the load base still has to be
+// added. Chromium's own builds are stripped and answer nothing; CEF ships a
+// full .symtab, and there the shape search has nothing to add.
+uintptr_t NamedVtable(const char* path, const char* want)
+{
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(ElfW(Ehdr)))) {
+        close(fd);
+        return 0;
+    }
+    const auto size = static_cast<size_t>(st.st_size);
+    void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) {
+        return 0;
+    }
+    uintptr_t found = 0;
+    const auto* base = static_cast<const unsigned char*>(map);
+    const auto* ehdr = reinterpret_cast<const ElfW(Ehdr)*>(base);
+    if (std::memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 && ehdr->e_shoff != 0 &&
+        ehdr->e_shnum != 0 && ehdr->e_shstrndx < ehdr->e_shnum &&
+        static_cast<uint64_t>(ehdr->e_shoff) +
+                static_cast<uint64_t>(ehdr->e_shnum) * ehdr->e_shentsize <= size) {
+        const auto* shdrs = reinterpret_cast<const ElfW(Shdr)*>(base + ehdr->e_shoff);
+        for (ElfW(Half) i = 0; i < ehdr->e_shnum && found == 0; ++i) {
+            const ElfW(Shdr)& sh = shdrs[i];
+            if ((sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM) ||
+                sh.sh_entsize == 0 || sh.sh_link >= ehdr->e_shnum ||
+                sh.sh_offset + sh.sh_size > size) {
+                continue;
+            }
+            const ElfW(Shdr)& str = shdrs[sh.sh_link];
+            if (str.sh_offset + str.sh_size > size) {
+                continue;
+            }
+            const size_t count = sh.sh_size / sh.sh_entsize;
+            const auto* syms = reinterpret_cast<const ElfW(Sym)*>(base + sh.sh_offset);
+            for (size_t j = 0; j < count; ++j) {
+                if (syms[j].st_shndx == SHN_UNDEF || syms[j].st_value == 0 ||
+                    syms[j].st_name >= str.sh_size) {
+                    continue;
+                }
+                const auto* name =
+                    reinterpret_cast<const char*>(base + str.sh_offset + syms[j].st_name);
+                if (std::strcmp(name, want) == 0) {
+                    found = syms[j].st_value;
+                    break;
+                }
+            }
+        }
+    }
+    munmap(map, size);
+    return found;
+}
+
 // Set once the vtable slot has actually been written, so the constructor
 // knows whether it is worth loading DirectWrite at all.
 std::atomic g_patched{false};
@@ -504,6 +578,7 @@ void** VtableBaseFrom(const Image& image, void** known_slot)
 
 void FindVariationSlot(void** base, void** data_slot);
 void FindVariationSlotFromColr(void** base, size_t colr_slot);
+bool PatchTypefaceByName(const Image& image);
 bool ConfirmVariationSlot(void** base, size_t slot, const void* bridge);
 bool HoldsColrTag(uintptr_t fn);
 unsigned ChromiumMajor();
@@ -537,6 +612,7 @@ void PatchTypefaceSlots(void** base, void** data_slot)
     if (void** slot = base + kFilterRecSlot; InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
         g_original_filter_rec = *slot;
         if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
+            g_filter_rec_slots.push_back(slot);
             Report("onFilterRec %p replaced through vtable slot %p; the Windows font "
                    "render params will be applied to every scaler context",
                    g_original_filter_rec, static_cast<void*>(slot));
@@ -560,8 +636,38 @@ void PatchTypefaceSlots(void** base, void** data_slot)
     }
 }
 
+// The typeface vtable a build that kept its symbol table names outright. The
+// searches below read the table off whatever holds onGetTableTags or builds a
+// scaler context, and on CEF neither is the one Skia dispatches through, which
+// leaves the rec unfiltered until a scaler context turns up. By then the recs
+// a page opened with are cached and keep Skia's own antialiasing rather than
+// the Windows render params.
+bool PatchTypefaceByName(const Image& image)
+{
+    for (const char* named : {"_ZTV21SkTypeface_Fontations", "_ZTV19SkTypeface_FreeType"}) {
+        const uintptr_t value = NamedVtable(g_image_path, named);
+        if (value == 0) {
+            continue;
+        }
+        // A vtable symbol names the object, which opens with the offset to top
+        // and the typeinfo pointer; the virtuals follow.
+        auto* base = reinterpret_cast<void**>(image.base + value + 2 * sizeof(void*));
+        if (!InText(image, reinterpret_cast<uintptr_t>(base[kFilterRecSlot]))) {
+            continue;
+        }
+        Report("%s names the typeface vtable at %p", named, static_cast<void*>(base));
+        PatchTypefaceSlots(base, nullptr);
+        return true;
+    }
+    return false;
+}
+
 void InstallRecFilter(const Image& image, const std::vector<uintptr_t>& calls_tags)
 {
+    if (PatchTypefaceByName(image)) {
+        return;
+    }
+
     if (calls_tags.size() != 1) {
         Report("the Fontations typeface vtable is not identifiable, so the "
                "Windows render params cannot be applied");
@@ -913,31 +1019,46 @@ std::atomic g_typeface_resolved{false};
 //
 // Its COLR slot is found by the tag, and the table calls sit a fixed distance
 // along.
+void ResolveTypefaceVtable(const void* typeface, bool may_patch, bool through_proxy);
+
+// Set once the slots the patch writes have been written, which is a step past
+// resolving where they are.
+std::atomic g_typeface_patched{false};
+
 void ResolveTypefaceFromContext(const void* context, const bool may_patch)
 {
-    static std::atomic patched{false};
     if (g_typeface_resolved.load(std::memory_order_acquire) &&
-        (!may_patch || patched.load(std::memory_order_acquire))) {
+        (!may_patch || g_typeface_patched.load(std::memory_order_acquire))) {
         return;
     }
     // Marked only once the search below succeeds. The first glyph can arrive
     // with a typeface this cannot read, and settling the answer on that would
     // stand the search down for the life of the process on one bad sample.
-    // Retried on calls 1, 2, 4, 8 and so on instead, so a process that never
-    // resolves settles into doing almost nothing while one that later paints
-    // through a readable typeface still finds it.
+    // Every call at first, since the typefaces that reach here early are
+    // mostly proxies and only a few carry the vtable being looked for. After
+    // that on calls 1, 2, 4, 8 and so on, so a process that never resolves
+    // settles into doing almost nothing while one that later paints through a
+    // readable typeface still finds it.
+    constexpr unsigned kEveryCall = 256;
     static std::atomic<unsigned> attempts{0};
     if (const unsigned n = attempts.fetch_add(1, std::memory_order_relaxed);
-        (n & (n + 1)) != 0) {
+        n >= kEveryCall && (n & (n + 1)) != 0) {
         return;
     }
     if (g_image.text_count == 0 || context == nullptr) {
         return;
     }
-    const auto* typeface = skia_abi::Read<const void*>(context, skia_abi::kContextTypeface);
-    if (typeface == nullptr) {
-        return;
+    if (const auto* typeface = skia_abi::Read<const void*>(context, skia_abi::kContextTypeface);
+        typeface != nullptr) {
+        ResolveTypefaceVtable(typeface, may_patch, false);
     }
+}
+
+// `through_proxy` says this is the typeface behind a proxy, so the walk stops
+// here rather than following another.
+void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
+                           const bool through_proxy)
+{
     auto* vptr = *static_cast<uintptr_t* const*>(typeface);
     auto* base = VtableBaseFrom(g_image, reinterpret_cast<void**>(vptr));
     if (base == nullptr) {
@@ -1005,7 +1126,7 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
                                      static_cast<unsigned>(tags_at + 1));
         g_typeface_resolved.store(true, std::memory_order_release);
         if (may_patch) {
-            patched.store(true, std::memory_order_release);
+            g_typeface_patched.store(true, std::memory_order_release);
         }
         Report("typeface vtable %p resolved from a live scaler context: "
                "COLR slot %u, onGetTableTags slot %zu, onGetTableData %zu",
@@ -1021,6 +1142,30 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         //
         // onFilterRec is read when a scaler context is built, so writing it
         // reaches every context made after this.
+        // The vtable the image scan settled on is not always the one Skia
+        // dispatches through, and where it is not, the rec filter never runs.
+        // Patching this one as well is only sound while both hold the same
+        // function, since the thunk calls through one pointer.
+        if (may_patch && g_original_filter_rec != nullptr) {
+            void** slot = reinterpret_cast<void**>(base) + kFilterRecSlot;
+            if (*slot != reinterpret_cast<void*>(&chromium_filter_rec_thunk) &&
+                InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
+                if (*slot != g_original_filter_rec) {
+                    // The thunk calls through one pointer, so the tables the
+                    // scan guessed at are given theirs back.
+                    for (void** guessed : g_filter_rec_slots) {
+                        (void)WriteSlot(guessed, g_original_filter_rec);
+                    }
+                    g_filter_rec_slots.clear();
+                    g_original_filter_rec = *slot;
+                }
+                if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
+                    g_filter_rec_slots.push_back(slot);
+                    Report("onFilterRec %p replaced on the live typeface vtable",
+                           g_original_filter_rec);
+                }
+            }
+        }
         if (may_patch && g_original_filter_rec == nullptr) {
             if (void** slot = reinterpret_cast<void**>(base) + kFilterRecSlot;
                 InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
@@ -1051,7 +1196,23 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
         }
         return;
     }
-    Report("no slot of the live typeface vtable holds the COLR tag");
+    // SkTypeface_FCI derives from SkTypeface_proxy and forwards the table
+    // calls, so its own vtable reaches none of the bridge. The typeface it
+    // proxies for does, and it is the one Skia reads the font through.
+    if (const auto* inner = skia_abi::Read<const void*>(
+            typeface, typeface_bridge::kProxyRealTypeface);
+        inner != nullptr && inner != typeface &&
+        (reinterpret_cast<uintptr_t>(inner) & 7) == 0 && !through_proxy) {
+        if (const auto* inner_vptr = skia_abi::Read<const void*>(inner, 0);
+            inner_vptr != nullptr && (reinterpret_cast<uintptr_t>(inner_vptr) & 7) == 0) {
+            ResolveTypefaceVtable(inner, may_patch, true);
+            return;
+        }
+    }
+    static std::atomic said{false};
+    if (!said.exchange(true)) {
+        Report("no slot of the live typeface vtable holds the COLR tag");
+    }
 }
 
 // The address a rip-relative lea reaches, which is how position-independent
@@ -1072,6 +1233,9 @@ bool LeaTarget(const unsigned char* q, uintptr_t* target)
 // the vtable entry holding that function is the typeface's.
 bool PatchTypefaceByScalerRef(const Image& image, const CodeMap& map, const uintptr_t sc_vptr)
 {
+    if (chromium_patch::ParityWanted() && PatchTypefaceByName(image)) {
+        return true;
+    }
     std::vector<uintptr_t> makers;
     for (unsigned s = 0; s < image.text_count; ++s) {
         const Region& r = image.text[s];
@@ -1156,6 +1320,7 @@ void TryPatchModule(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Hal
     }
 
     g_image = image;
+    (void)std::snprintf(g_image_path, sizeof(g_image_path), "%s", path);
 
     // Which fontations symbols are rasterization-only, by runtime address.
     std::vector<uintptr_t> ffi;
@@ -1909,7 +2074,11 @@ void ScanLoadedImages()
 // Rebuilding walks every table, so it happens once per typeface and the
 // answers are then only re-derived when the size changes.
 std::mutex g_font_mutex;
-std::unordered_map<const void*, std::vector<uint8_t>> g_fonts;
+// Shared, since a caller needs the bytes outside the lock and these fonts run
+// to tens of megabytes; copying one per glyph is what the cache exists to
+// avoid.
+using FontBytes = std::shared_ptr<const std::vector<uint8_t>>;
+std::unordered_map<const void*, FontBytes> g_fonts;
 std::unordered_map<const void*, std::vector<dwrite_raster::VariationCoord>> g_var_coords;
 
 // onGetVariationDesignPosition, called through each typeface's own vtable so
@@ -2110,7 +2279,7 @@ void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
         coords.clear();
     }
     if (unconfirmed) {
-        // The count alone is weak, since a neighbouring slot could return the
+        // The count alone is weak, since a neighboring slot could return the
         // same small number. The tags come from the font, so a slot answering
         // all of them is the one that reads fvar.
         for (const dwrite_raster::VariationCoord& c : coords) {
@@ -2144,19 +2313,21 @@ void HoldTypeface(void* typeface)
     }
 }
 
-const std::vector<uint8_t>& FontBytesLocked(void* typeface)
+FontBytes FontBytesLocked(void* typeface)
 {
     auto font = g_fonts.find(typeface);
     if (font == g_fonts.end()) {
         HoldTypeface(typeface);
-        std::vector<uint8_t> bytes = typeface_bridge::ReadFontFile(typeface);
-        if (bytes.empty()) {
+        auto bytes = std::make_shared<std::vector<uint8_t>>(
+            typeface_bridge::ReadFontFile(typeface));
+        if (bytes->empty()) {
             Report("typeface %p: no font (its onGetTableTags/onGetTableData could not be "
                    "identified, or the tables would not read)", typeface);
         } else {
-            Report("typeface %p: rebuilt %zu bytes from its tables", typeface, bytes.size());
+            Report("typeface %p: rebuilt %zu bytes from its tables", typeface,
+                   bytes->size());
         }
-        ReadVariationCoords(typeface, bytes);
+        ReadVariationCoords(typeface, *bytes);
         font = g_fonts.emplace(typeface, std::move(bytes)).first;
     }
     return font->second;
@@ -2180,7 +2351,7 @@ windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int 
     }
 
     const windows_path::FontFacts facts =
-        font_facts::Describe(FontBytesLocked(typeface), gasp_ppem, bitmap_ppem);
+        font_facts::Describe(*FontBytesLocked(typeface), gasp_ppem, bitmap_ppem);
     cache[typeface] = {gasp_ppem, bitmap_ppem, facts};
     return facts;
 }
@@ -2213,10 +2384,10 @@ const std::vector<uint8_t>* ChromiumFontBytes(void* typeface)
 {
     const std::lock_guard lock(g_font_mutex);
     const auto font = g_fonts.find(typeface);
-    if (font == g_fonts.end() || font->second.empty()) {
+    if (font == g_fonts.end() || font->second->empty()) {
         return nullptr;
     }
-    return &font->second;
+    return font->second.get();
 }
 
 // Runs before the typeface's own onFilterRec. Returns whether the caller
@@ -2232,12 +2403,12 @@ bool OnChromiumFilterRec(void* self, void* rec)
     // real bold face is given it instead, which is the face Windows was handed
     // and the reason its rec carries no stroke at all.
     if (self != nullptr && chromium_patch::ParityWanted()) {
-        std::vector<uint8_t> font;
+        FontBytes font;
         {
             const std::lock_guard lock(g_font_mutex);
             font = FontBytesLocked(self);
         }
-        if (!font.empty() && bold_fallback::ClearSyntheticBold(rec, font)) {
+        if (!font->empty() && bold_fallback::ClearSyntheticBold(rec, *font)) {
             static std::atomic said{false};
             if (!said.exchange(true)) {
                 Report("synthetic bold replaced with a real bold face");
@@ -2505,6 +2676,56 @@ bool ReplacePathData(void* path, const PathView& v, const std::vector<uint8_t>& 
 
 }  // namespace
 
+// Skia's DirectWrite font manager strips DirectWrite's simulations by asking
+// again upright, except for a font with bitmap strikes, which it lets through
+// (SkFontMgr_win_dw.cpp, FirstMatchingFontWithoutSimulations under
+// SK_WIN_FONTMGR_NO_SIMULATIONS, guarded by an EBDT test). So on Windows such
+// a face is slanted by DirectWrite at about 20 degrees and the rec carries no
+// skew at all, while here Blink hands Skia its own 0.25 skew, which is 14.
+//
+// Where both hold the slant belongs to the face, and the rec is flattened so
+// the matrix does not apply it a second time.
+static bool SimulatesOblique(const skia_abi::Rec& rec, const std::vector<uint8_t>& font,
+                             const uint32_t face_index)
+{
+    static const bool off = EnvDisables("DWC_OBLIQUE_SIM");
+    return !off && rec.pre_skew_x != 0.0f && font_facts::HasEbdt(font, face_index);
+}
+
+// The subpixel position SkScalerContext_DW puts in the matrix before walking a
+// color glyph's paint tree, in em units for the walk and in device pixels for
+// the clip box. All zero when the glyph is not subpixel positioned or the
+// matrix will not invert, which leaves the walk unshifted.
+static void ColorGlyphPhase(const skia_abi::Rec& rec, const skia_abi::Glyph& g, float* phase_x,
+                            float* phase_y, float* sub_x, float* sub_y)
+{
+    *phase_x = 0;
+    *phase_y = 0;
+    *sub_x = 0;
+    *sub_y = 0;
+    if (!rec.IsSubpixel() || !g.packed_id_known) {
+        return;
+    }
+    // SkPackedGlyphID keeps two bits per axis, so SkFixedToScalar of what
+    // getSubXFixed returns is the index over four.
+    const float dx = static_cast<float>(g.SubX()) / 4.0f;
+    const float dy = static_cast<float>(g.SubY()) / 4.0f;
+    if (dx == 0.0f && dy == 0.0f) {
+        return;
+    }
+    if (!rec.DeviceOffsetToEm(dx, dy, phase_x, phase_y)) {
+        return;
+    }
+    *sub_x = dx;
+    *sub_y = dy;
+}
+
+static skia_abi::Rec WithoutSkew(skia_abi::Rec rec)
+{
+    rec.pre_skew_x = 0.0f;
+    return rec;
+}
+
 void OnChromiumPath(void* result, void* context, const void* glyph)
 {
     static const bool enabled = !EnvDisables("DWC_DW_OUTLINE");
@@ -2550,19 +2771,19 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
-    std::vector<uint8_t> font;
+    FontBytes font;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
-    if (font.empty()) {
+    if (font->empty()) {
         return;
     }
-    const std::vector<uint8_t>* use = &font;
+    const std::vector<uint8_t>* use = font.get();
     const void* face_key = typeface;
     uint32_t face_index = 0;
     bool simulate_bold = false;
-    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+    if (const bold_fallback::Face bold = BoldSubstitute(context, *font);
         bold.bytes != nullptr || bold.simulate) {
         simulate_bold = bold.simulate;
         if (bold.bytes != nullptr) {
@@ -2577,16 +2798,31 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     // the outline is asked for, so the path is replaced whole instead. It
     // cannot be rewritten in place across a shape change: the verb sequence
     // and the point count are both the array's own.
-    const bool substituted = use != &font;
+    const bool substituted = use != font.get();
 
-    const windows_path::Decision d =
-        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
+    // This hook applies `remaining` to DirectWrite's points itself, so a skew
+    // left in there would slant an outline the face has already slanted.
+    const bool simulate_oblique = SimulatesOblique(rec, *use, face_index);
+    const skia_abi::Rec flat = simulate_oblique ? WithoutSkew(rec) : rec;
+    int oblique_gasp_ppem = gasp_ppem;
+    int oblique_bitmap_ppem = bitmap_ppem;
+    if (simulate_oblique) {
+        if (!windows_path::ComputeMatrices(flat, &scale_y, &remaining)) {
+            return;
+        }
+        const float flat_gdi_size = std::round(scale_y * 64.0f) / 64.0f;
+        oblique_gasp_ppem = static_cast<int>(std::floor(flat_gdi_size + 0.5f));
+        oblique_bitmap_ppem = static_cast<int>(flat_gdi_size);
+    }
+
+    const windows_path::Decision d = windows_path::Decide(
+        windows_path::WithWindowsHinting(flat), scale_y,
+        font_facts::Describe(*use, oblique_gasp_ppem, oblique_bitmap_ppem, face_index));
 
     static thread_local std::vector<uint8_t> dw_verbs;
     static thread_local std::vector<path_abi::Point> dw_points;
     if (!dwrite_raster::GlyphOutline(face_key, *use, g.GlyphId(), d.text_size_render, &dw_verbs,
-                                     &dw_points, face_index, simulate_bold)) {
+                                     &dw_points, face_index, simulate_bold, simulate_oblique)) {
         return;
     }
     // Both scaler contexts generate at scale.fY and then apply what
@@ -2678,6 +2914,24 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     Replaced(g.GlyphId(), worst, true);
 }
 
+// A color glyph's bounds are measured inside the original generateMetrics, so
+// the subpixel position has to be set before it runs. The rest of the metrics
+// work runs after it, in OnChromiumMetrics.
+void OnChromiumMetricsPre(void* context, const void* glyph)
+{
+    if (!g_patched.load(std::memory_order_acquire) || context == nullptr || glyph == nullptr) {
+        return;
+    }
+    const skia_abi::Glyph g = skia_abi::Glyph::From(glyph);
+    const skia_abi::Rec rec = skia_abi::Rec::From(context);
+    float phase_x = 0;
+    float phase_y = 0;
+    float sub_x = 0;
+    float sub_y = 0;
+    ColorGlyphPhase(rec, g, &phase_x, &phase_y, &sub_x, &sub_y);
+    colr_outline::SetPhase(phase_x, phase_y, sub_x, sub_y);
+}
+
 void OnChromiumMetrics(void* result, void* context, const void* glyph)
 {
     ResolveTypefaceFromContext(context, false);
@@ -2713,23 +2967,23 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
     const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
-    std::vector<uint8_t> font;
+    FontBytes font;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
-    if (font.empty()) {
+    if (font->empty()) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("  metrics: no font bytes for typeface %p", typeface);
         }
         return;
     }
-    const std::vector<uint8_t>* use = &font;
+    const std::vector<uint8_t>* use = font.get();
     const void* face_key = typeface;
     uint32_t face_index = 0;
     bool simulate_bold = false;
-    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+    if (const bold_fallback::Face bold = BoldSubstitute(context, *font);
         bold.bytes != nullptr || bold.simulate) {
         simulate_bold = bold.simulate;
         if (bold.bytes != nullptr) {
@@ -2739,14 +2993,25 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         }
     }
 
-    const windows_path::Decision d =
-        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
-                             font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
+    // With the slant on the face the rec has no skew, so the scale the
+    // decision is made at is the one Windows would have used.
+    const bool simulate_oblique = SimulatesOblique(rec, *use, face_index);
+    const skia_abi::Rec flat = simulate_oblique ? WithoutSkew(rec) : rec;
+    const float use_scale_y = simulate_oblique ? windows_path::DeviceScaleY(flat) : scale_y;
+    const float use_gdi_size = std::round(use_scale_y * 64.0f) / 64.0f;
+    const int use_gasp_ppem =
+        simulate_oblique ? static_cast<int>(std::floor(use_gdi_size + 0.5f)) : gasp_ppem;
+    const int use_bitmap_ppem =
+        simulate_oblique ? static_cast<int>(use_gdi_size) : bitmap_ppem;
+
+    const windows_path::Decision d = windows_path::Decide(
+        windows_path::WithWindowsHinting(flat), use_scale_y,
+        font_facts::Describe(*use, use_gasp_ppem, use_bitmap_ppem, face_index));
 
     float advance = 0;
     float advance_y = 0;
-    if (!dwrite_raster::GlyphAdvance(face_key, *use, g.GlyphId(), rec, d, &advance,
-                                     &advance_y, face_index, simulate_bold)) {
+    if (!dwrite_raster::GlyphAdvance(face_key, *use, g.GlyphId(), flat, d, &advance,
+                                     &advance_y, face_index, simulate_bold, simulate_oblique)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("DirectWrite would not measure glyph %u; advances stay Skia's",
@@ -2771,17 +3036,43 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         skia_abi::Read<uint8_t>(result, skia_abi::kMetricsMaskFormat);
     const auto metrics_bits =
         skia_abi::Read<uint16_t>(result, skia_abi::kMetricsExtraBits);
+    if (static const bool tell_bits = std::getenv("DWC_METRICS_LOG") != nullptr; tell_bits) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+            Report("  box: glyph %u mask=%u bits=%u substituted=%d", g.GlyphId(),
+                   static_cast<unsigned>(metrics_mask), static_cast<unsigned>(metrics_bits),
+                   use != font.get() ? 1 : 0);
+        }
+    }
     // A substituted face is asked for its box too, and it is the box that
     // decides where the mask is drawn.
     if (metrics_mask != skia_abi::kARGB32 &&
-        (metrics_bits == skia_abi::kFontationsPath || use != &font)) {
+        (metrics_bits == skia_abi::kFontationsPath || use != font.get())) {
         int left = 0;
         int top = 0;
         int right = 0;
         int bottom = 0;
-        if (dwrite_raster::GlyphBounds(face_key, *use, g, rec, d, d.rendering_mode,
-                                       d.texture_type, &left, &top, &right, &bottom,
-                                       face_index, simulate_bold)) {
+        const bool got = dwrite_raster::GlyphBounds(face_key, *use, g, flat, d,
+                                                    d.rendering_mode, d.texture_type,
+                                                    &left, &top, &right, &bottom,
+                                                    face_index, simulate_bold, simulate_oblique);
+        static const bool tell = std::getenv("DWC_METRICS_LOG") != nullptr;
+        if (tell) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+                Report("  bounds: glyph %u %s %d,%d,%d,%d mode=%s tex=%s size=%.3f "
+                       "skew=%.4f mask=%u flags=0x%x branch=%s gridfit=%d",
+                       g.GlyphId(), got ? "ok" : "declined", left, top, right, bottom,
+                       windows_path::RenderingModeName(d.rendering_mode),
+                       windows_path::TextureTypeName(d.texture_type),
+                       static_cast<double>(d.text_size_render),
+                       static_cast<double>(rec.pre_skew_x),
+                       static_cast<unsigned>(rec.mask_format),
+                       static_cast<unsigned>(rec.flags), d.branch,
+                       static_cast<int>(d.grid_fit_mode));
+            }
+        }
+        if (got) {
             const float box[4] = {static_cast<float>(left), static_cast<float>(top),
                                   static_cast<float>(right), static_cast<float>(bottom)};
             std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsBounds, box,
@@ -2832,19 +3123,19 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     const int gasp_ppem = static_cast<int>(std::floor(gdi_text_size + 0.5f));
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
-    std::vector<uint8_t> font;
+    FontBytes font;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
-    if (font.empty()) {
+    if (font->empty()) {
         return;
     }
-    const std::vector<uint8_t>* use = &font;
+    const std::vector<uint8_t>* use = font.get();
     const void* face_key = typeface;
     uint32_t face_index = 0;
     bool simulate_bold = false;
-    if (const bold_fallback::Face bold = BoldSubstitute(context, font);
+    if (const bold_fallback::Face bold = BoldSubstitute(context, *font);
         bold.bytes != nullptr || bold.simulate) {
         simulate_bold = bold.simulate;
         if (bold.bytes != nullptr) {
@@ -2854,10 +3145,15 @@ void OnChromiumFontMetrics(void* context, void* metrics)
         }
     }
 
+    const bool simulate_oblique = SimulatesOblique(rec, *use, face_index);
+    const skia_abi::Rec flat = simulate_oblique ? WithoutSkew(rec) : rec;
+    const float use_scale_y = simulate_oblique ? windows_path::DeviceScaleY(flat) : scale_y;
+
     const windows_path::Decision d =
-        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y,
+        windows_path::Decide(windows_path::WithWindowsHinting(flat), use_scale_y,
                              font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index));
-    if (dwrite_raster::FontMetrics(face_key, *use, d, metrics, face_index, simulate_bold)) {
+    if (dwrite_raster::FontMetrics(face_key, *use, d, metrics, face_index, simulate_bold,
+                                   simulate_oblique)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("font metrics now DirectWrite's");
@@ -2904,16 +3200,19 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     // The bytes of the face that will actually be drawn. A substituted bold
     // face answers the gasp and strike questions for itself, so it has to be
     // resolved before the tree is walked and not just before the draw.
-    std::vector<uint8_t> font;
+    FontBytes font;
     if (chromium_patch::ParityWanted()) {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
     }
-    const std::vector<uint8_t>* use = &font;
+    if (font == nullptr) {
+        font = std::make_shared<const std::vector<uint8_t>>();
+    }
+    const std::vector<uint8_t>* use = font.get();
     const void* face_key = typeface;
     uint32_t face_index = 0;
     bool simulate_bold = false;
-    const bold_fallback::Face bold = BoldSubstitute(context, font);
+    const bold_fallback::Face bold = BoldSubstitute(context, *font);
     if (bold.bytes != nullptr || bold.simulate) {
         simulate_bold = bold.simulate;
         if (bold.bytes != nullptr) {
@@ -2939,11 +3238,16 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     // no gasp and no strike.
     const windows_path::FontFacts facts =
         chromium_patch::ParityWanted()
-            ? (use == &font ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
+            ? (use == font.get() ? FactsFor(typeface, gasp_ppem, bitmap_ppem)
                             : font_facts::Describe(*use, gasp_ppem, bitmap_ppem, face_index))
             : windows_path::FontFacts{};
+    // The mask has to be drawn the way its box was measured, so the same
+    // flattening the metrics hook applied is applied here.
+    const bool simulate_oblique = SimulatesOblique(rec, *use, face_index);
+    const skia_abi::Rec flat = simulate_oblique ? WithoutSkew(rec) : rec;
+    const float use_scale_y = simulate_oblique ? windows_path::DeviceScaleY(flat) : scale_y;
     const windows_path::Decision d =
-        windows_path::Decide(windows_path::WithWindowsHinting(rec), scale_y, facts);
+        windows_path::Decide(windows_path::WithWindowsHinting(flat), use_scale_y, facts);
 
     // Enough to see what the tree decides, without a line per glyph forever.
     if (n <= 20 || (n & 0x3ff) == 1) {
@@ -2979,18 +3283,39 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
                facts.has_bitmap_strike ? 1 : 0, facts.has_cbdt ? 1 : 0);
     }
 
+    // A color glyph is declined below and Skia draws it, but its layer
+    // outlines come from the bridge and this is the only place that knows the
+    // face and the size Windows would have asked for them at.
+    if (g.mask_format == skia_abi::kARGB32) {
+        float phase_x = 0;
+        float phase_y = 0;
+        float sub_x = 0;
+        float sub_y = 0;
+        ColorGlyphPhase(rec, g, &phase_x, &phase_y, &sub_x, &sub_y);
+        colr_outline::SetPhase(phase_x, phase_y, sub_x, sub_y);
+        colr_outline::SetSource(face_key, use, face_index, d.text_size_render);
+        if (std::getenv("DWC_COLR_PHASE") != nullptr) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+                Report("  colr glyph %u subx=%d suby=%d size=%.3f", g.GlyphId(), g.SubX(),
+                       g.SubY(), static_cast<double>(d.text_size_render));
+            }
+        }
+    }
+
     const skia_abi::PreBlend preblend = skia_abi::PreBlend::From(context);
     const bool drawn =
-        dwrite_raster::RenderGlyph(face_key, *use, rec, g, preblend, d, image_buffer,
-                                   face_index, simulate_bold);
+        dwrite_raster::RenderGlyph(face_key, *use, flat, g, preblend, d, image_buffer,
+                                   face_index, simulate_bold, simulate_oblique);
     static std::atomic<uint64_t> drawn_count{0};
     static std::atomic<uint64_t> declined_count{0};
     const uint64_t seen =
         drawn ? drawn_count.fetch_add(1, std::memory_order_relaxed) + 1
               : declined_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (seen <= 3 || (seen & 0x3ff) == 1) {
-        Report("%s glyph %u (%ux%u): %llu so far", drawn ? "DirectWrite drew" : "declined",
-               g.GlyphId(), g.width, g.height, static_cast<unsigned long long>(seen));
+        Report("%s glyph %u (%ux%u) mask=%u scaler=%u: %llu so far",
+               drawn ? "DirectWrite drew" : "declined", g.GlyphId(), g.width, g.height,
+               g.mask_format, g.scaler_bits, static_cast<unsigned long long>(seen));
     }
     // A picture of the first few masks, to show the bytes are a glyph and not
     // a misaligned buffer.
@@ -3042,6 +3367,12 @@ __attribute__((constructor)) static void ChromiumPatchInit()
     // Reading a symbol table needs the filesystem, and a build that compiles
     // HarfBuzz in is only reachable through one.
     bold_shaping::InstallAtLoad();
+    // Reads the mapped image to find where the run's weight lives, which the
+    // per-character fallback drops before it asks.
+    bold_weight::InstallAtLoad();
+    colr_outline::InstallAtLoad();
+    weight_style::InstallAtLoad();
+    weight_style::InstallFontconfig();
     // Mapping the bold faces needs the filesystem too, and a renderer forked
     // from here inherits the mappings it can no longer make for itself.
     bold_fallback::MapAtLoad();
