@@ -40,6 +40,11 @@ void ReorderForWindows(const void* pattern, void* sorted);
 // weight reads as the weight its OS/2 table holds.
 float OpenTypeWeight(int fc_weight);
 
+// The fontconfig weight for an OpenType one, the column
+// SkFontConfigInterface_direct.cpp maps a request through. Zero when the
+// weight is not one the table names.
+int FontconfigWeight(int open_type);
+
 // GetFirstMatchingFont's pick between two OpenType weights, for a request of
 // `wanted`. True when `candidate` is the one DirectWrite would answer with.
 // cleartype/src/chromium/bold_fallback.cpp asks the same question of a family

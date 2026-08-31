@@ -21,10 +21,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <strings.h>
 
 #include <dlfcn.h>
 
+#include "dwrite_raster.h"
 #include "family_match.h"
 #include "hb_abi.h"
 #include "parity_gate.h"
@@ -132,11 +134,62 @@ bool HasFamily(const PatternGetStringFn get_string, const void* font, const char
     return false;
 }
 
+// Whether Windows answers an italic request for this family and weight with an
+// upright face. Cached, since the answer is a property of the installed family
+// and the sort asks a handful of times per page.
+int DWriteWantsUpright(const char* family, const int weight)
+{
+    struct Answer
+    {
+        char family[64];
+        int weight;
+        int upright;
+    };
+    static Answer seen[64];
+    static unsigned count = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (seen[i].weight == weight && strcasecmp(seen[i].family, family) == 0) {
+            return seen[i].upright;
+        }
+    }
+    int got_weight = 0;
+    bool got_italic = false;
+    const int upright =
+        dwrite_raster::FamilyMatchFace(family, weight, true, &got_weight, &got_italic)
+            ? (got_italic ? 0 : 1)
+            : -1;
+    if (std::getenv("DWC_FAMILY_MATCH_LOG") != nullptr) {
+        (void)std::fprintf(stderr,
+                           "chromium-patch: family match: dwrite %s at %d italic -> "
+                           "weight %d %s (upright=%d)\n",
+                           family, weight, got_weight,
+                           got_italic ? "italic" : "upright", upright);
+    }
+    if (count < sizeof(seen) / sizeof(seen[0]) &&
+        std::strlen(family) < sizeof(seen[0].family)) {
+        (void)std::snprintf(seen[count].family, sizeof(seen[count].family), "%s", family);
+        seen[count].weight = weight;
+        seen[count].upright = upright;
+        ++count;
+    }
+    return upright;
+}
+
 }  // namespace
 
 namespace family_match {
 
 float OpenTypeWeight(const int fc_weight) { return OpenTypeWeightImpl(fc_weight); }
+
+int FontconfigWeight(const int open_type)
+{
+    for (const WeightPair& pair : kWeights) {
+        if (static_cast<int>(pair.open_type) == open_type) {
+            return static_cast<int>(pair.fc);
+        }
+    }
+    return 0;
+}
 
 bool BeatsForWindows(const float candidate, const float best, const float wanted)
 {
@@ -178,12 +231,21 @@ void ReorderForWindows(const void* pattern, void* sorted)
     }
     const float wanted = OpenTypeWeightImpl(fc_weight);
 
-    // Slant is left to fontconfig. Candidates are held to the slant of the
-    // face it already chose, so an italic request keeps picking among italics
-    // and only the weight within that group is decided here.
     int slant = 0;
     if (get_integer(set->fonts[0], "slant", 0, &slant) != kFcResultMatch) {
         return;
+    }
+    // Which slant to hold candidates to. Usually the one fontconfig already
+    // chose, so an italic request keeps picking among italics. Windows gives
+    // up the slant before the weight at the top of the scale, though, so
+    // GetFirstMatchingFont is asked and its answer decides. Arial at 900
+    // italic is Arial Black there, which has no italic face.
+    int want_slant = slant;
+    if (slant != 0) {
+        if (const int upright = DWriteWantsUpright(family, static_cast<int>(wanted));
+            upright > 0) {
+            want_slant = 0;
+        }
     }
 
     // Whether the family exists at all stays fontconfig's answer. When it
@@ -202,7 +264,7 @@ void ReorderForWindows(const void* pattern, void* sorted)
         int font_weight = 0;
         unsigned char* file = nullptr;
         if (get_integer(font, "slant", 0, &font_slant) != kFcResultMatch ||
-            font_slant != slant ||
+            font_slant != want_slant ||
             get_integer(font, "weight", 0, &font_weight) != kFcResultMatch ||
             get_string(font, "file", 0, &file) != kFcResultMatch ||
             !HasFamily(get_string, font, family)) {

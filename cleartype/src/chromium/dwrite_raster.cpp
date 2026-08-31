@@ -498,6 +498,164 @@ bool FamilyCoverage(const char* family, const unsigned* points, const unsigned c
     return font != nullptr;
 }
 
+// Every family the system collection holds, so a caller that has to state
+// something per family does not have to guess which ones exist.
+bool FamilyNames(std::vector<std::string>* out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontCollection* collection = nullptr;
+    if (FAILED(g_dw.factory5->GetSystemFontCollection(&collection, FALSE)) ||
+        collection == nullptr) {
+        return false;
+    }
+    const UINT32 count = collection->GetFontFamilyCount();
+    for (UINT32 i = 0; i < count; ++i) {
+        IDWriteFontFamily* group = nullptr;
+        if (FAILED(collection->GetFontFamily(i, &group)) || group == nullptr) {
+            continue;
+        }
+        IDWriteLocalizedStrings* names = nullptr;
+        if (SUCCEEDED(group->GetFamilyNames(&names)) && names != nullptr &&
+            names->GetCount() > 0) {
+            UINT32 length = 0;
+            if (SUCCEEDED(names->GetStringLength(0, &length)) && length > 0) {
+                std::u16string wide(length + 1, u'\0');
+                if (SUCCEEDED(names->GetString(0, wide.data(), length + 1))) {
+                    std::string narrow;
+                    for (const char16_t ch : wide) {
+                        if (ch == u'\0') {
+                            break;
+                        }
+                        // The names this is asked about are ASCII; anything
+                        // else is a family no table names.
+                        if (ch > 0x7F) {
+                            narrow.clear();
+                            break;
+                        }
+                        narrow.push_back(static_cast<char>(ch));
+                    }
+                    if (!narrow.empty()) {
+                        out->push_back(std::move(narrow));
+                    }
+                }
+            }
+        }
+        if (names != nullptr) {
+            names->Release();
+        }
+        group->Release();
+    }
+    collection->Release();
+    return !out->empty();
+}
+
+// The weight DirectWrite answers a request for this one with, among the faces
+// of this family. GetFirstMatchingFont is what
+// SkFontStyleSet_DirectWrite::matchStyle calls, so this is the rule itself
+// rather than a restatement of it. Zero when the family is not there.
+// The face GetFirstMatchingFont answers with, weight and slant both. Windows
+// drops the slant before it drops the weight at the top of the scale: Arial at
+// 900 italic is answered by Arial Black, which has no italic face, while 800
+// italic stays on an italic one.
+bool FamilyMatchFace(const char* family, const int weight, const bool italic,
+                     int* out_weight, bool* out_italic)
+{
+    if (family == nullptr) {
+        return false;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return false;
+    }
+    IDWriteFontCollection* collection = nullptr;
+    if (FAILED(g_dw.factory5->GetSystemFontCollection(&collection, FALSE)) ||
+        collection == nullptr) {
+        return false;
+    }
+    std::u16string wide;
+    for (const char* p = family; *p != '\0'; ++p) {
+        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+    }
+    UINT32 index = 0;
+    BOOL exists = FALSE;
+    IDWriteFontFamily* group = nullptr;
+    IDWriteFont* font = nullptr;
+    bool got = false;
+    if (SUCCEEDED(collection->FindFamilyName(wide.c_str(), &index, &exists)) && exists &&
+        SUCCEEDED(collection->GetFontFamily(index, &group)) && group != nullptr &&
+        SUCCEEDED(group->GetFirstMatchingFont(
+            static_cast<DWRITE_FONT_WEIGHT>(weight), DWRITE_FONT_STRETCH_NORMAL,
+            italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, &font)) &&
+        font != nullptr) {
+        if (out_weight != nullptr) {
+            *out_weight = static_cast<int>(font->GetWeight());
+        }
+        if (out_italic != nullptr) {
+            // GetStyle reports the simulated style, so a face that only slants
+            // under an oblique simulation reads as italic. The face underneath
+            // is upright, and that is what has to be matched here.
+            *out_italic = font->GetStyle() != DWRITE_FONT_STYLE_NORMAL &&
+                          (font->GetSimulations() & DWRITE_FONT_SIMULATIONS_OBLIQUE) == 0;
+        }
+        got = true;
+    }
+    if (font != nullptr) {
+        font->Release();
+    }
+    if (group != nullptr) {
+        group->Release();
+    }
+    collection->Release();
+    return got;
+}
+
+int FamilyMatchWeight(const char* family, const int weight)
+{
+    if (family == nullptr) {
+        return 0;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (!EnsureFactory()) {
+        return 0;
+    }
+    IDWriteFontCollection* collection = nullptr;
+    if (FAILED(g_dw.factory5->GetSystemFontCollection(&collection, FALSE)) ||
+        collection == nullptr) {
+        return 0;
+    }
+    std::u16string wide;
+    for (const char* p = family; *p != '\0'; ++p) {
+        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+    }
+    UINT32 index = 0;
+    BOOL exists = FALSE;
+    IDWriteFontFamily* group = nullptr;
+    IDWriteFont* font = nullptr;
+    int picked = 0;
+    if (SUCCEEDED(collection->FindFamilyName(wide.c_str(), &index, &exists)) && exists &&
+        SUCCEEDED(collection->GetFontFamily(index, &group)) && group != nullptr &&
+        SUCCEEDED(group->GetFirstMatchingFont(static_cast<DWRITE_FONT_WEIGHT>(weight),
+                                              DWRITE_FONT_STRETCH_NORMAL,
+                                              DWRITE_FONT_STYLE_NORMAL, &font)) &&
+        font != nullptr) {
+        picked = static_cast<int>(font->GetWeight());
+    }
+    if (font != nullptr) {
+        font->Release();
+    }
+    if (group != nullptr) {
+        group->Release();
+    }
+    collection->Release();
+    return picked;
+}
+
 bool FamilyDirectory(const char* family, char* out, const size_t size)
 {
     if (family == nullptr || out == nullptr || size == 0) {

@@ -85,6 +85,14 @@
     open64;
     openat;
     openat64;
+
+    /* Not FreeType: CEF installs no ui::LinuxUi, so its default font stays at
+       the "serif" generic and system-ui answers Times New Roman where Windows
+       answers Segoe UI. Chromium reads --system-font-family for this, and the
+       browser process is given it here, before it parses argv. Only a host
+       that has libcef.so mapped is touched. See
+       src/chromium/cef_system_font.cpp. */
+    __libc_start_main;
   local:
     *;
 };

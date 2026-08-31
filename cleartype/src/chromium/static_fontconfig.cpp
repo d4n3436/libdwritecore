@@ -26,7 +26,9 @@
 //
 //----------------------------------------------------------------------------
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <cstdarg>
 #include <cstdio>
@@ -52,7 +54,10 @@
 #include "fallback_order.h"
 #include "hb_abi.h"
 #include "../windows_fonts.h"
+#include "fallback_hook.h"
+#include "family_match.h"
 #include "parity_gate.h"
+#include "static_fontconfig.h"
 
 namespace {
 
@@ -138,15 +143,24 @@ Installed Survey(const fallback_order::ScriptRow* rows, const unsigned row_count
 {
     Installed out;
     std::unordered_map<std::string, bool> seen;
+    const auto note = [&seen, &out](const char* name) {
+        if (name == nullptr || seen.count(name) != 0 || !ShipsWithWindows(name)) {
+            return;
+        }
+        seen.emplace(name, true);
+        out.families.emplace_back(name);
+    };
     for (unsigned r = 0; r < row_count; ++r) {
         for (unsigned f = 0; f < rows[r].count; ++f) {
-            const char* name = rows[r].families[f];
-            if (name == nullptr || seen.count(name) != 0 || !ShipsWithWindows(name)) {
-                continue;
-            }
-            seen.emplace(name, true);
-            out.families.emplace_back(name);
+            note(rows[r].families[f]);
         }
+    }
+    // The measured DirectWrite answers too. Yu Gothic UI is named by no script
+    // row, so without this the survey never learns it and the block that ends
+    // in it is dropped for a family it thinks is not installed.
+    for (unsigned i = 0; i < fallback_order::DWriteRowCount(); ++i) {
+        note(fallback_order::DWriteRowFamily(static_cast<int>(i)));
+        note(fallback_order::DWriteRowFront(static_cast<int>(i)));
     }
 
     // One collection lookup per family, each answering every row at once.
@@ -252,6 +266,22 @@ std::vector<std::string> TopoSort(const std::vector<std::string>& nodes,
     }
 }
 
+// Which of the table's families this machine has, and what each covers.
+// Read by the order below and by the per-language blocks, so it is surveyed
+// once.
+const Installed& Surveyed()
+{
+    static const Installed have = [] {
+        unsigned row_count = 0;
+        const fallback_order::ScriptRow* rows = fallback_order::Scripts(&row_count);
+        if (rows == nullptr || row_count == 0) {
+            return Installed{};
+        }
+        return Survey(rows, row_count);
+    }();
+    return have;
+}
+
 const std::vector<std::string>& Order()
 {
     static const std::vector<std::string> order = [] {
@@ -260,7 +290,7 @@ const std::vector<std::string>& Order()
         if (rows == nullptr || row_count == 0) {
             return std::vector<std::string>{};
         }
-        const Installed have = Survey(rows, row_count);
+        const Installed& have = Surveyed();
         if (have.families.empty()) {
             return std::vector<std::string>{};
         }
@@ -285,13 +315,13 @@ const std::vector<std::string>& Order()
                 continue;
             }
             const uint64_t weight = rows[r].last - rows[r].first + 1;
-            for (size_t i = 0; i < row.size(); ++i) {
-                for (size_t j = i + 1; j < row.size(); ++j) {
-                    want(row[i], row[j], kWrittenOrder + weight);
-                }
-            }
+            // Only row[0] can ever answer: FirstAvailableFont takes the first
+            // installed candidate and memoizes it, so the names behind it draw
+            // nothing however much they cover. Ordering them against each other
+            // constrains nothing real, and it is what puts Kana and Han in a
+            // cycle over MS PGothic and Microsoft YaHei.
             for (const std::string& other : have.families) {
-                if (std::find(row.begin(), row.end(), other) != row.end()) {
+                if (other == row[0]) {
                     continue;
                 }
                 const auto seen = have.covers.find(other);
@@ -314,13 +344,341 @@ namespace {
 // The rules to add, as fontconfig's own configuration language. Appended
 // weakly, so a pattern that already names a family keeps it first and only the
 // families behind it are reordered.
+// The languages whose Han script is settled, most specific first. The tag is
+// what fontconfig tests the pattern's lang against and the locale is what
+// HanCandidates resolves; they differ only where a substring has to stay
+// narrow enough not to catch another language.
+struct LangHan
+{
+    const char* tag;
+    const char* locale;
+};
+
+constexpr size_t kLangHanCount = 9;
+const LangHan kLangHan[] = {
+    {"zh-hant", "zh-Hant"}, {"zh-tw", "zh-TW"}, {"zh-hk", "zh-HK"},
+    {"zh-mo", "zh-MO"},     {"zh-hans", "zh-Hans"}, {"zh-cn", "zh-CN"},
+    {"zh-sg", "zh-SG"},     {"ja", "ja"},       {"ko", "ko"},
+};
+
+// The surveyed spelling of a family, or null when this machine has no such
+// family. The pan-Unicode lists are lowercased, as the source keeps them, and
+// the survey is keyed by the script table's own spelling.
+const char* Surveyed(const Installed& have, const char* family)
+{
+    for (const std::string& known : have.families) {
+        if (strcasecmp(known.c_str(), family) == 0) {
+            return known.c_str();
+        }
+    }
+    return nullptr;
+}
+
+// The nine weights CSS names, which are the only ones a page asks for as a
+// keyword or a round number. Anything between them lands on a neighbor and
+// takes that rule.
+constexpr int kCssWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900};
+
+std::string WeightRules()
+{
+    std::vector<std::string> families;
+    if (!dwrite_raster::FamilyNames(&families)) {
+        return {};
+    }
+    std::string out;
+    unsigned ruled = 0;
+    for (const std::string& family : families) {
+        // Only what the configuration offers. The names come from the machine,
+        // so the one character XML reserves is worth checking for rather than
+        // escaping.
+        if (family.find('&') != std::string::npos || !ShipsWithWindows(family.c_str())) {
+            continue;
+        }
+        constexpr size_t kCount = sizeof(kCssWeights) / sizeof(kCssWeights[0]);
+        // What GetFirstMatchingFont answers for each weight, asked once
+        // upright and once italic. The two differ: Arial at 900 upright and
+        // 900 italic are both Arial Black, but 800 italic stays on Arial's own
+        // italic face while 800 upright goes to Arial Black.
+        int upright[kCount] = {};
+        int slanted[kCount] = {};
+        bool kept_slant[kCount] = {};
+        bool varies = false;
+        bool has_italic = false;
+        for (size_t i = 0; i < kCount; ++i) {
+            upright[i] = dwrite_raster::FamilyMatchWeight(family.c_str(), kCssWeights[i]);
+            bool italic = false;
+            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], true,
+                                                &slanted[i], &italic)) {
+                slanted[i] = 0;
+            }
+            kept_slant[i] = italic;
+            varies = varies || upright[i] != upright[0] || slanted[i] != slanted[0];
+            has_italic = has_italic || italic;
+        }
+        // One face answers every weight, so fontconfig reaches it whatever the
+        // request and there is nothing to say.
+        if (!varies) {
+            continue;
+        }
+        for (size_t i = 0; i < kCount; ++i) {
+            const int weight = kCssWeights[i];
+            const int from = family_match::FontconfigWeight(weight);
+            // Upright, which is what the rules said before the slant was asked
+            // about, now held to an upright request.
+            if (upright[i] != 0 && upright[i] != weight) {
+                const int to = family_match::FontconfigWeight(upright[i]);
+                if (to != 0 && from != to) {
+                    char rule[640];
+                    (void)std::snprintf(
+                        rule, sizeof(rule),
+                        "  <match target=\"pattern\">\n"
+                        "    <test name=\"family\"><string>%s</string></test>\n"
+                        "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
+                        "    <test name=\"slant\" compare=\"eq\"><int>0</int></test>\n"
+                        "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
+                        "  </match>\n",
+                        family.c_str(), from, to);
+                    out += rule;
+                    ++ruled;
+                }
+            }
+            // Italic. Only worth saying for a family that has an italic face;
+            // one without is answered upright at every weight and fontconfig
+            // reaches it anyway, and saying so would stop the oblique both
+            // sides simulate.
+            if (!has_italic || slanted[i] == 0) {
+                continue;
+            }
+            const int to = family_match::FontconfigWeight(slanted[i]);
+            if (to == 0 || (from == to && kept_slant[i])) {
+                continue;
+            }
+            char rule[768];
+            (void)std::snprintf(
+                rule, sizeof(rule),
+                "  <match target=\"pattern\">\n"
+                "    <test name=\"family\"><string>%s</string></test>\n"
+                "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
+                "    <test name=\"slant\" compare=\"not_eq\"><int>0</int></test>\n"
+                "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
+                "%s"
+                "  </match>\n",
+                family.c_str(), from, to,
+                kept_slant[i] ? ""
+                              : "    <edit name=\"slant\" mode=\"assign\"><int>0</int></edit>\n");
+            out += rule;
+            ++ruled;
+        }
+    }
+    Say("%u weight rules over %zu families", ruled, families.size());
+    return out;
+}
+
 std::string RulesBlock()
 {
     const std::vector<std::string>& order = Order();
     if (order.empty()) {
         return {};
     }
-    std::string out = "  <match target=\"pattern\">\n";
+    const Installed& have = Surveyed();
+    // The unified-Han family follows the run's language, and the language is on
+    // the pattern as FC_LANG. fontconfig can test it, so the locales that name
+    // a Han script get their own block ahead of the global one; append puts
+    // them in front of it.
+    // Latin, Greek and Cyrillic name one family, and it covers no Han, no
+    // Indic and no symbol block, so nothing else has to come before it. Said
+    // first, it answers those scripts wherever it is reached and stands in
+    // front of nothing else. Without it the pan-Unicode list below, which
+    // opens with Tahoma, answers them instead.
+    // Weakly bound. Binding it strongly does put it in front of the second face
+    // of the run's own family, which is what answers Cyrillic under zh-TW, but
+    // it then wins the sort outright and answers Armenian, Hebrew, Arabic and
+    // the symbol blocks as well, which is far worse than the four cells it
+    // buys.
+    std::string latin;
+    if (have.covers.count("Times New Roman") != 0) {
+        latin = "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
+                "<string>Times New Roman</string></edit>\n";
+    }
+
+    // Windows picks the face within a named family with
+    // GetFirstMatchingFont, and fontconfig picks the nearest weight on its own
+    // scale with the set's order breaking ties, so a family whose faces do not
+    // sit on the requested weight can answer differently. Segoe UI at 500 is
+    // Semibold on Windows and regular here. Asking DirectWrite what it would
+    // answer and writing that weight onto the pattern makes fontconfig's pick
+    // an exact match, which no tie can move. The family list is left alone, so
+    // nothing becomes available that was not.
+    std::string out = WeightRules();
+    // What Windows walks when the script's family does not cover the
+    // character, said after that family so the two are read in that order.
+    std::string pan;
+    {
+        unsigned pan_count = 0;
+        const char* const* list = fallback_order::PanUnicode(false, &pan_count);
+        for (unsigned i = 0; list != nullptr && i < pan_count; ++i) {
+            const char* named = list[i] != nullptr ? Surveyed(have, list[i]) : nullptr;
+            if (named == nullptr) {
+                continue;
+            }
+            pan += "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
+                   "<string>";
+            pan += named;
+            pan += "</string></edit>\n";
+        }
+    }
+    // One block per family, reached by a tag on the language. The order a
+    // pattern carries is settled once per locale, and Windows answers per
+    // character, so the character's family is asked for by name. The hook in
+    // fallback_hook.cpp appends this family's tag to the locale it was given,
+    // and the block puts that family in front of everything else. Stated
+    // before the blocks below, since append keeps what came first.
+    for (size_t i = 0; i < order.size() && i < static_fontconfig::kMaxTaggedFamilies; ++i) {
+        char tag[24];
+        (void)std::snprintf(tag, sizeof(tag), "%s%02zu", static_fontconfig::kFamilyTag, i);
+        out += "  <match target=\"pattern\">\n"
+               "    <test name=\"lang\" compare=\"contains\"><string>";
+        out += tag;
+        out += "</string></test>\n";
+        out += "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
+               "<string>";
+        out += order[i];
+        out += "</string></edit>\n";
+        out += pan;
+        out += "  </match>\n";
+    }
+    // The list on its own, for a character no row names a family for.
+    out += "  <match target=\"pattern\">\n"
+           "    <test name=\"lang\" compare=\"contains\"><string>";
+    out += static_fontconfig::kPanTag;
+    out += "</string></test>\n";
+    out += pan;
+    out += "  </match>\n";
+    // One block per measured IDWriteFontFallback row: the script's own
+    // families, then the pan-Unicode list, then the family DirectWrite
+    // answers with. Windows reaches the last one only after the first two
+    // have missed, so stating them in that order keeps a character the script
+    // or the list does cover with the family it already had.
+    for (unsigned row = 0; row < fallback_order::DWriteRowCount(); ++row) {
+        const char* family = fallback_order::DWriteRowFamily(static_cast<int>(row));
+        const char* named = family != nullptr ? Surveyed(have, family) : nullptr;
+        const char* wanted = fallback_order::DWriteRowFront(static_cast<int>(row));
+        const char* front = wanted != nullptr ? Surveyed(have, wanted) : nullptr;
+        if (named == nullptr && front == nullptr) {
+            continue;           // the survey turned neither up, so nothing to name
+        }
+        const auto edit = [](const char* named_family) {
+            std::string one =
+                "    <edit name=\"family\" mode=\"append\" binding=\"weak\"><string>";
+            one += named_family;
+            one += "</string></edit>\n";
+            return one;
+        };
+        // The script path's family first, then the families the script table
+        // names, then the list, then DirectWrite's own answer, which is the
+        // order Windows reads them in.
+        std::string body;
+        unsigned script_count = 0;
+        const char* const* script = fallback_order::FamiliesFor(
+            fallback_order::DWriteRowFirst(static_cast<int>(row)), &script_count);
+        for (unsigned i = 0; script != nullptr && i < script_count; ++i) {
+            const char* first = script[i] != nullptr ? Surveyed(have, script[i]) : nullptr;
+            if (first != nullptr) {
+                body += edit(first);
+            }
+        }
+        body += pan;
+        if (named != nullptr) {
+            body += edit(named);
+        }
+        const auto block = [&out](const char* tag, const std::string& text) {
+            out += "  <match target=\"pattern\">\n"
+                   "    <test name=\"lang\" compare=\"contains\"><string>";
+            out += tag;
+            out += "</string></test>\n";
+            out += text;
+            out += "  </match>\n";
+        };
+        char tag[32];
+        if (front == nullptr) {
+            (void)std::snprintf(tag, sizeof(tag), "%s%02u",
+                                static_fontconfig::kDWriteTag, row);
+            block(tag, body);
+            continue;
+        }
+        // The front follows the run's language, so the row gets one block per
+        // Han language and one for a run that names none of them. The tag
+        // carries both indices, since the hook replaces the locale with it and
+        // the language would otherwise be gone by the time this is read.
+        for (size_t lang = 0; lang <= kLangHanCount; ++lang) {
+            const bool unsettled = lang == kLangHanCount;
+            unsigned count = 0;
+            const char* const* candidates = fallback_order::HanCandidates(
+                unsettled ? nullptr : kLangHan[lang].locale, &count);
+            const char* first = nullptr;
+            if (candidates != nullptr) {
+                for (unsigned i = 0; i < count && first == nullptr; ++i) {
+                    if (candidates[i] != nullptr && have.covers.count(candidates[i]) != 0) {
+                        first = candidates[i];
+                    }
+                }
+            }
+            if (first == nullptr) {
+                first = front;      // the row's own default, for an unsettled run
+            }
+            (void)std::snprintf(tag, sizeof(tag), "%s%02u%02u",
+                                static_fontconfig::kDWriteHanTag, row,
+                                unsettled ? 99u : static_cast<unsigned>(lang));
+            block(tag, edit(first) + body);
+        }
+    }
+    for (const LangHan& row : kLangHan) {
+        unsigned count = 0;
+        const char* const* candidates =
+            fallback_order::HanCandidates(row.locale, &count);
+        if (candidates == nullptr) {
+            continue;
+        }
+        const char* first = nullptr;
+        for (unsigned i = 0; i < count && first == nullptr; ++i) {
+            if (candidates[i] != nullptr && have.covers.count(candidates[i]) != 0) {
+                first = candidates[i];
+            }
+        }
+        if (first == nullptr) {
+            continue;
+        }
+        out += "  <match target=\"pattern\">\n"
+               "    <test name=\"lang\" compare=\"contains\"><string>";
+        out += row.tag;
+        out += "</string></test>\n";
+        out += latin;
+        out += "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
+               "<string>";
+        out += first;
+        out += "</string></edit>\n";
+        // Then the pan-Unicode list, which is what Windows walks for the
+        // characters that family lacks. Stating it here rather than leaving it
+        // to the global order keeps a CJK page's own fonts from answering
+        // first.
+        unsigned pan_count = 0;
+        const char* const* pan_list = fallback_order::PanUnicode(false, &pan_count);
+        for (unsigned i = 0; pan_list != nullptr && i < pan_count; ++i) {
+            const char* named = pan_list[i] != nullptr ? Surveyed(have, pan_list[i]) : nullptr;
+            if (named == nullptr) {
+                continue;
+            }
+            out += "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
+                   "<string>";
+            out += named;
+            out += "</string></edit>\n";
+        }
+        out += "  </match>\n";
+        Say("lang %s answers Han with %s", row.tag, first);
+    }
+
+    out += "  <match target=\"pattern\">\n";
+    out += latin;
     for (const std::string& family : order) {
         out += "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
                "<string>";
@@ -332,6 +690,19 @@ std::string RulesBlock()
         out += "</string></edit>\n";
     }
     out += "  </match>\n";
+
+    // The bold marker, on its own and last. It names no family, so it applies
+    // to whichever block the tag it was appended to selected, and only the
+    // weight the sort scores against changes. A family with no bold face has
+    // nothing that scores better and keeps the face it already answered with.
+    // FC_WEIGHT_BOLD is 200, which is what IsFontBold compares against, so the
+    // answer also comes back marked bold and Blink leaves it alone.
+    out += "  <match target=\"pattern\">\n"
+           "    <test name=\"lang\" compare=\"contains\"><string>";
+    out += static_fontconfig::kBoldTag;
+    out += "</string></test>\n"
+           "    <edit name=\"weight\" mode=\"assign\"><int>200</int></edit>\n"
+           "  </match>\n";
     return out;
 }
 
@@ -421,6 +792,47 @@ std::string Document()
     return out;
 }
 
+}  // namespace
+
+namespace static_fontconfig {
+
+int TagFor(const char* family)
+{
+    if (family == nullptr) {
+        return -1;
+    }
+    const std::vector<std::string>& order = Order();
+    for (size_t i = 0; i < order.size() && i < kMaxTaggedFamilies; ++i) {
+        if (::strcasecmp(order[i].c_str(), family) == 0) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+int HanLocaleIndex(const char* locale)
+{
+    if (locale == nullptr || *locale == '\0') {
+        return -1;
+    }
+    // Longest first, so zh-hant is not read as a bare zh and zh-tw not as one
+    // of the zh-hans rows.
+    int best = -1;
+    size_t longest = 0;
+    for (size_t i = 0; i < kLangHanCount; ++i) {
+        const size_t len = ::strlen(kLangHan[i].locale);
+        if (len > longest && ::strncasecmp(locale, kLangHan[i].locale, len) == 0) {
+            longest = len;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+}  // namespace static_fontconfig
+
+namespace {
+
 // The document in an unnamed file, so nothing is written to disk. Built once.
 int ServeConfig()
 {
@@ -435,7 +847,19 @@ int ServeConfig()
             document = Document();
             g_building = false;
             if (!document.empty()) {
-                Say("serving %zu bytes for %s", document.size(), ConfigPath().c_str());
+                Say("pid %d serving %zu bytes for %s", getpid(), document.size(),
+                    ConfigPath().c_str());
+                // The order exists now, so the tags the hook names families by
+                // can be answered.
+                fallback_hook::Install();
+                // The order is worked out from what this machine has, so the
+                // only way to read it back is from the process that built it.
+                if (const char* to = std::getenv("DWC_STATIC_FC_DUMP"); to != nullptr) {
+                    if (FILE* f = std::fopen(to, "we"); f != nullptr) {
+                        (void)std::fwrite(document.data(), 1, document.size(), f);
+                        (void)std::fclose(f);
+                    }
+                }
             }
         }
     }

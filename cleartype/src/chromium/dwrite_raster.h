@@ -23,6 +23,7 @@
 #include "path_abi.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace dwrite_raster {
@@ -53,6 +54,19 @@ bool FamilyCoverage(const char* family, const unsigned* points, unsigned count,
 // Written to `out` with a terminator, no trailing separator. False when the
 // collection has no such family or the face is not backed by a local file.
 bool FamilyDirectory(const char* family, char* out, size_t size);
+
+// Every family the system collection holds, ASCII-named ones only.
+bool FamilyNames(std::vector<std::string>* out);
+
+// The face GetFirstMatchingFont answers with, weight and slant both. False
+// when the family is not in the collection.
+bool FamilyMatchFace(const char* family, int weight, bool italic,
+                     int* out_weight, bool* out_italic);
+
+// The weight DirectWrite answers a request for `weight` with, among this
+// family's faces, which is what decides the face on Windows. Zero when the
+// family is not installed.
+int FamilyMatchWeight(const char* family, int weight);
 
 // Whether a factory could be built. Called lazily, after the fork, in the
 // process that will actually rasterize.

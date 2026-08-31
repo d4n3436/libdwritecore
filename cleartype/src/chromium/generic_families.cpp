@@ -135,6 +135,22 @@ constexpr Substitution kSubstitutions[] = {
      {"webkit.webprefs.fonts.serif.Hant"}},
 };
 
+// A value no resource in the bundle can carry, added as a resource of its own.
+// A Chromium build's Courier New and NSimsun ride in the Devanagari families,
+// which CEF's locale pack leaves out, so on CEF there is nothing to rewrite.
+struct Minted
+{
+    const char* windows;
+    const char* prefs[kMaxPrefsPerValue];
+};
+
+constexpr Minted kMinted[] = {
+    {",Courier New",
+     {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
+      "webkit.webprefs.fonts.fixed.Grek"}},
+    {",NSimsun", {"webkit.webprefs.fonts.fixed.Hans"}},
+};
+
 // Which resource carries each per-script list, learned while patching.
 struct Learned
 {
@@ -154,6 +170,9 @@ unsigned g_learned_count = 0;
 constexpr uint32_t kFileFormatV5 = 5;
 constexpr size_t kHeaderLengthV5 = 12;
 constexpr size_t kEntrySize = 6;
+// Then one four-byte alias per alias count, a uint16 id and a uint16 index
+// into the table above.
+constexpr size_t kAliasSize = 4;
 
 uint16_t ReadU16(const unsigned char* at)
 {
@@ -167,6 +186,134 @@ uint32_t ReadU32(const unsigned char* at)
     uint32_t v = 0;
     std::memcpy(&v, at, sizeof(v));
     return v;
+}
+
+void WriteU16(unsigned char* at, const uint16_t v)
+{
+    std::memcpy(at, &v, sizeof(v));
+}
+
+void WriteU32(unsigned char* at, const uint32_t v)
+{
+    std::memcpy(at, &v, sizeof(v));
+}
+
+bool AlreadyLearned(const char* pref)
+{
+    for (unsigned i = 0; i < g_learned_count; ++i) {
+        if (std::strcmp(g_learned[i].pref, pref) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// How much shorter a substituted value is than the one it replaced, so the
+// bundle can be laid out again without the padding.
+struct Shrunk
+{
+    size_t entry;
+    uint32_t size;
+};
+
+constexpr unsigned kShrunkMax = sizeof(kSubstitutions) / sizeof(kSubstitutions[0]);
+
+// Appends a resource for every minted value the bundle carries none of, and
+// lays the whole bundle out again to make room. The ids are above every one
+// the bundle holds, so both tables stay sorted and no alias index moves; the
+// substituted values give back more than the longer table costs.
+void Mint(unsigned char* bytes, const size_t length, const size_t count,
+          const size_t aliases, const Shrunk* shrunk, const unsigned shrunk_count)
+{
+    const Minted* wanted[sizeof(kMinted) / sizeof(kMinted[0])];
+    unsigned want = 0;
+    for (const Minted& m : kMinted) {
+        if (m.prefs[0] != nullptr && !AlreadyLearned(m.prefs[0])) {
+            wanted[want++] = &m;
+        }
+    }
+    if (want == 0) {
+        return;
+    }
+
+    unsigned char* const table = bytes + kHeaderLengthV5;
+    const size_t grown = kHeaderLengthV5 + (count + 1 + want) * kEntrySize +
+                         aliases * kAliasSize;
+    size_t total = grown;
+    uint16_t highest = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned char* entry = table + i * kEntrySize;
+        highest = ReadU16(entry) > highest ? ReadU16(entry) : highest;
+        uint32_t size = ReadU32(entry + kEntrySize + 2) - ReadU32(entry + 2);
+        for (unsigned j = 0; j < shrunk_count; ++j) {
+            if (shrunk[j].entry == i) {
+                size = shrunk[j].size;
+            }
+        }
+        total += size;
+    }
+    for (size_t i = 0; i < aliases; ++i) {
+        const unsigned char* alias = table + (count + 1) * kEntrySize + i * kAliasSize;
+        highest = ReadU16(alias) > highest ? ReadU16(alias) : highest;
+    }
+    for (unsigned i = 0; i < want; ++i) {
+        total += std::strlen(wanted[i]->windows);
+    }
+    if (total > length || highest > 0xFFFF - want) {
+        return;
+    }
+
+    // Built beside the mapping, since the data moves both ways: the table
+    // grows and the values shrink.
+    auto* built = static_cast<unsigned char*>(std::malloc(total));
+    if (built == nullptr) {
+        return;
+    }
+    std::memcpy(built, bytes, kHeaderLengthV5);
+    WriteU16(built + 8, static_cast<uint16_t>(count + want));
+    unsigned char* out = built + kHeaderLengthV5;
+    uint32_t at = static_cast<uint32_t>(grown);
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned char* entry = table + i * kEntrySize;
+        const uint32_t from = ReadU32(entry + 2);
+        uint32_t size = ReadU32(entry + kEntrySize + 2) - from;
+        for (unsigned j = 0; j < shrunk_count; ++j) {
+            if (shrunk[j].entry == i) {
+                size = shrunk[j].size;
+            }
+        }
+        WriteU16(out + i * kEntrySize, ReadU16(entry));
+        WriteU32(out + i * kEntrySize + 2, at);
+        std::memcpy(built + at, bytes + from, size);
+        at += size;
+    }
+    for (unsigned i = 0; i < want; ++i) {
+        const size_t size = std::strlen(wanted[i]->windows);
+        const auto id = static_cast<uint16_t>(highest + 1 + i);
+        WriteU16(out + (count + i) * kEntrySize, id);
+        WriteU32(out + (count + i) * kEntrySize + 2, at);
+        std::memcpy(built + at, wanted[i]->windows, size);
+        at += static_cast<uint32_t>(size);
+        for (const char* pref : wanted[i]->prefs) {
+            if (pref != nullptr && g_learned_count < kLearnedMax) {
+                g_learned[g_learned_count++] = {pref, id};
+            }
+        }
+        if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
+            (void)std::fprintf(stderr,
+                               "chromium-patch: generic families: resource %u "
+                               "minted as %s (%s)\n",
+                               id, wanted[i]->windows, wanted[i]->prefs[0]);
+        }
+    }
+    // The sentinel keeps its id and holds the end of the data.
+    WriteU16(out + (count + want) * kEntrySize, ReadU16(table + count * kEntrySize));
+    WriteU32(out + (count + want) * kEntrySize + 2, at);
+    std::memcpy(out + (count + 1 + want) * kEntrySize,
+                table + (count + 1) * kEntrySize, aliases * kAliasSize);
+
+    std::memcpy(bytes, built, total);
+    std::free(built);
 }
 
 }  // namespace
@@ -183,10 +330,13 @@ unsigned PatchBundle(void* base, const size_t length)
         return 0;
     }
     const size_t count = ReadU16(bytes + 8);
-    if (length < kHeaderLengthV5 + (count + 1) * kEntrySize) {
+    const size_t aliases = ReadU16(bytes + 10);
+    if (length < kHeaderLengthV5 + (count + 1) * kEntrySize + aliases * kAliasSize) {
         return 0;
     }
 
+    Shrunk shrunk[kShrunkMax];
+    unsigned shrunk_count = 0;
     unsigned patched = 0;
     for (size_t i = 0; i < count; ++i) {
         const unsigned char* entry = bytes + kHeaderLengthV5 + i * kEntrySize;
@@ -214,6 +364,9 @@ unsigned PatchBundle(void* base, const size_t length)
             // FontList::FirstAvailableOrFirst splits on commas and keeps the
             // non-empty pieces, so trailing commas name nothing.
             std::memset(bytes + start + wanted, ',', size - wanted);
+            if (shrunk_count < kShrunkMax) {
+                shrunk[shrunk_count++] = {i, static_cast<uint32_t>(wanted)};
+            }
             if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
                 (void)std::fprintf(stderr,
                                    "chromium-patch: generic families: resource "
@@ -229,6 +382,9 @@ unsigned PatchBundle(void* base, const size_t length)
             ++patched;
             break;
         }
+    }
+    if (patched > 0) {
+        Mint(bytes, length, count, aliases, shrunk, shrunk_count);
     }
     return patched;
 }
@@ -276,13 +432,13 @@ constexpr const char* kAnchorPref = "webkit.webprefs.fonts.fantasy.Zyyy";
 constexpr const char* kPrefPrefix = "webkit.webprefs.fonts.";
 constexpr size_t kRowSize = 16;   // const char* then int, padded
 
-struct Executable
+struct Image
 {
     const unsigned char* begin;
     const unsigned char* end;
 };
 
-Executable g_exe{};
+Image g_image{};
 
 // The segments that can hold strings and tables, and separately the code. A
 // string search stays out of the code, which costs more than the browser's
@@ -312,12 +468,43 @@ bool InRelro(const void* p)
     return g_relro.begin != nullptr && at >= g_relro.begin && at < g_relro.end;
 }
 
-int NoteExecutable(dl_phdr_info* info, size_t, void* data)
+// Whether this module's read-only data holds the anchor pref, which is what
+// says it is the one that compiled kFontDefaults. Electron compiles it into
+// the executable; CEF compiles it into libcef.so and leaves the executable a
+// loader with nothing in it.
+bool HoldsTable(const dl_phdr_info* info)
 {
-    if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
+    // This library writes the anchor down too, so its own image never counts.
+    static const uintptr_t self = [] {
+        Dl_info me{};
+        return dladdr(reinterpret_cast<const void*>(kAnchorPref), &me) != 0
+                   ? reinterpret_cast<uintptr_t>(me.dli_fbase)
+                   : 0;
+    }();
+    if (self != 0 && info->dlpi_addr == self) {
+        return false;
+    }
+    const size_t length = std::strlen(kAnchorPref) + 1;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& header = info->dlpi_phdr[i];
+        if (header.p_type != PT_LOAD || (header.p_flags & PF_X) != 0) {
+            continue;
+        }
+        const auto* from = reinterpret_cast<const unsigned char*>(info->dlpi_addr +
+                                                                 header.p_vaddr);
+        if (::memmem(from, header.p_filesz, kAnchorPref, length) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int NoteImage(dl_phdr_info* info, size_t, void* data)
+{
+    if (!HoldsTable(info)) {
         return 0;
     }
-    auto* image = static_cast<Executable*>(data);
+    auto* image = static_cast<Image*>(data);
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         const ElfW(Phdr)& header = info->dlpi_phdr[i];
         if (header.p_type != PT_LOAD && header.p_type != PT_GNU_RELRO) {
@@ -351,7 +538,7 @@ int NoteExecutable(dl_phdr_info* info, size_t, void* data)
 // below runs from inside mmap.
 __attribute__((constructor)) void NoteImageAtLoad()
 {
-    dl_iterate_phdr(NoteExecutable, &g_exe);
+    dl_iterate_phdr(NoteImage, &g_image);
 }
 
 const unsigned char* FindBytes(const unsigned char* from, const unsigned char* to,
@@ -365,10 +552,23 @@ const unsigned char* FindBytes(const unsigned char* from, const unsigned char* t
     return found;
 }
 
-const unsigned char* FindInData(const void* what, const size_t length)
+// The first occurrence at or after `from`, which is null for the first call
+// and one past the last hit to walk the rest. CEF's image holds the anchor
+// twice and its pointer many times, so the first hit is not always the row.
+const unsigned char* FindInData(const void* what, const size_t length,
+                                const unsigned char* from = nullptr)
 {
     for (unsigned i = 0; i < g_data_count; ++i) {
-        if (const unsigned char* at = FindBytes(g_data[i].begin, g_data[i].end,
+        const unsigned char* begin = g_data[i].begin;
+        if (from != nullptr) {
+            if (from >= g_data[i].end) {
+                continue;
+            }
+            if (from > begin) {
+                begin = from;
+            }
+        }
+        if (const unsigned char* at = FindBytes(begin, g_data[i].end,
                                                 what, length)) {
             return at;
         }
@@ -376,10 +576,10 @@ const unsigned char* FindInData(const void* what, const size_t length)
     return nullptr;
 }
 
-bool InExecutable(const void* p)
+bool InImage(const void* p)
 {
     const auto* at = static_cast<const unsigned char*>(p);
-    return at >= g_exe.begin && at < g_exe.end;
+    return at >= g_image.begin && at < g_image.end;
 }
 
 // The lea that loads a bound of the table, as the loop in
@@ -529,12 +729,12 @@ void MoveLoopEnd(const unsigned char* end)
 // Whether a row holds a pointer to a pref name.
 bool IsRow(const unsigned char* at)
 {
-    if (!InRelro(at) || !InExecutable(at + kRowSize - 1)) {
+    if (!InRelro(at) || !InImage(at + kRowSize - 1)) {
         return false;
     }
     const char* name = nullptr;
     std::memcpy(&name, at, sizeof(name));
-    if (!InExecutable(name) ||
+    if (!InImage(name) ||
         std::strncmp(name, kPrefPrefix, std::strlen(kPrefPrefix)) != 0) {
         return false;
     }
@@ -585,29 +785,46 @@ void Note(const char* what, const char* which)
 // reads the table is pointed at that.
 void PatchFontDefaults()
 {
-    if (g_exe.begin == nullptr || !IsBrowserProcess()) {
+    if (g_image.begin == nullptr || !IsBrowserProcess()) {
         return;
     }
 
-    const unsigned char* anchor = FindInData(kAnchorPref, std::strlen(kAnchorPref) + 1);
-    if (anchor == nullptr) {
+    // Searched once. The image is up to a gigabyte and a half on CEF, and this
+    // runs again for every resource pack the browser maps.
+    static const unsigned char* first = nullptr;
+    static const unsigned char* end = nullptr;
+    static bool searched = false;
+    if (!searched) {
+        searched = true;
+        const size_t length = std::strlen(kAnchorPref) + 1;
+        for (const unsigned char* anchor = FindInData(kAnchorPref, length);
+             anchor != nullptr && first == nullptr;
+             anchor = FindInData(kAnchorPref, length, anchor + 1)) {
+            for (const unsigned char* row = FindInData(&anchor, sizeof(anchor));
+                 row != nullptr;
+                 row = FindInData(&anchor, sizeof(anchor), row + 1)) {
+                // A row of kFontDefaults, not a bare pointer in some other
+                // table.
+                if (!IsRow(row) || !IsRow(row - kRowSize) ||
+                    !IsRow(row + kRowSize)) {
+                    continue;
+                }
+                first = row;
+                while (IsRow(first - kRowSize)) {
+                    first -= kRowSize;
+                }
+                end = row;
+                while (IsRow(end + kRowSize)) {
+                    end += kRowSize;
+                }
+                end += kRowSize;
+                break;
+            }
+        }
+    }
+    if (first == nullptr) {
         return;
     }
-    const unsigned char* row = FindInData(&anchor, sizeof(anchor));
-    // A row of kFontDefaults, not a bare pointer in some other table.
-    if (row == nullptr || !IsRow(row) || !IsRow(row - kRowSize) ||
-        !IsRow(row + kRowSize)) {
-        return;
-    }
-    const unsigned char* first = row;
-    while (IsRow(first - kRowSize)) {
-        first -= kRowSize;
-    }
-    const unsigned char* last = row;
-    while (IsRow(last + kRowSize)) {
-        last += kRowSize;
-    }
-    const unsigned char* end = last + kRowSize;
 
     // The copy, kept for the process's life since the loop reads it on every
     // WebPreferences the browser builds. Filled from the compiled array once,
@@ -620,7 +837,7 @@ void PatchFontDefaults()
         if (compiled == 0 || compiled > kTableBytes) {
             return;
         }
-        table = MapBeside(g_exe.end);
+        table = MapBeside(g_image.end);
         if (table == nullptr) {
             return;
         }
