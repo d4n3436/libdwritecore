@@ -245,6 +245,11 @@ bool HasCbdt(const std::vector<uint8_t>& font, const uint32_t face_index)
     return FindTable(font, Tag('C', 'B', 'D', 'T'), face_index).data != nullptr;
 }
 
+bool HasEbdt(const std::vector<uint8_t>& font, const uint32_t face_index)
+{
+    return FindTable(font, Tag('E', 'B', 'D', 'T'), face_index).data != nullptr;
+}
+
 windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gasp_ppem,
                                  const int bitmap_ppem, const uint32_t face_index)
 {

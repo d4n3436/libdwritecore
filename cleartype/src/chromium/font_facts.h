@@ -36,6 +36,11 @@ bool HasBitmapStrike(const std::vector<uint8_t>& font, const GaspRange& range,
                      uint32_t face_index = 0);
 bool HasCbdt(const std::vector<uint8_t>& font, uint32_t face_index = 0);
 
+// Whether the font carries monochrome bitmap strikes. Skia's DirectWrite font
+// manager tests exactly this table and no other, and it is what decides
+// whether a simulated face survives; see SimulatesOblique.
+bool HasEbdt(const std::vector<uint8_t>& font, uint32_t face_index = 0);
+
 // Everything the Windows decision tree wants to know about this font, at the
 // size it is about to be rendered. SkScalerContext_DW rounds gdiTextSize for
 // the gasp lookup and truncates it for the bitmap strike, so both arrive.

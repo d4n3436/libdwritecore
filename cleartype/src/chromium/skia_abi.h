@@ -22,6 +22,7 @@
 #ifndef CHROMIUM_SKIA_ABI_H_INCLUDED
 #define CHROMIUM_SKIA_ABI_H_INCLUDED
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -52,6 +53,10 @@ constexpr size_t kRecPost2x2 = 16;      // float[2][2]
 constexpr size_t kRecFrameWidth = 32;   // float
 constexpr size_t kRecLumBits = 44;      // uint32_t
 constexpr size_t kRecDeviceGamma = 48;  // uint8_t, 2.6 fixed point
+// fReservedAlign2, the other padding byte, holding the mark for a rec Skia
+// built with SkFont::setupForAsPaths.
+constexpr size_t kRecReservedPaths = 49;  // uint8_t
+constexpr uint8_t kAsPathsMark = 0xAD;
 constexpr size_t kRecContrast = 50;     // uint8_t, 0.8 fixed point
 // fReservedAlign, a padding byte Skia declares const, initializes to zero and
 // then only ever passes to sk_ignore_unused_variable. Nothing reads it, so a
@@ -75,6 +80,8 @@ enum Flags : uint16_t
     kFrameAndFill = 0x0001,
     kEmbolden = 0x0008,
     kEmbeddedBitmapText = 0x0004,
+    kSubpixelPositioning = 0x0010,
+    kForceAutohinting = 0x0020,
     kLCD_Vertical = 0x0200,
     kLCD_BGROrder = 0x0400,
     kGenA8FromLCD = 0x0800,
@@ -232,13 +239,46 @@ struct Rec
     uint8_t contrast = 0;
     uint8_t mask_format = 0;
     uint16_t flags = 0;
+    bool as_paths = false;
 
     unsigned GetHinting() const
     {
         return (flags & kHintingMask) >> kHintingShift;
     }
     bool IsLinearMetrics() const { return (flags & kLinearMetrics) != 0; }
+    bool IsSubpixel() const { return (flags & kSubpixelPositioning) != 0; }
+
+    // SkScalerContextRec::getSingleMatrix without its translation, which is
+    // always zero. Skia builds it as SkFontPriv::MakeTextMatrix, a scale by
+    // (size * preScaleX, size) post-skewed by preSkewX, post-concatenated with
+    // post2x2. Row major.
+    void SingleMatrix2x2(float m[4]) const
+    {
+        const float a = text_size * pre_scale_x;
+        const float b = text_size;
+        const float l[4] = {a, pre_skew_x * b, 0.0f, b};
+        m[0] = post2x2[0][0] * l[0] + post2x2[0][1] * l[2];
+        m[1] = post2x2[0][0] * l[1] + post2x2[0][1] * l[3];
+        m[2] = post2x2[1][0] * l[0] + post2x2[1][1] * l[2];
+        m[3] = post2x2[1][0] * l[1] + post2x2[1][1] * l[3];
+    }
+
+    // A device offset carried back into the em space the color glyph's paint
+    // tree is walked in. False when the matrix will not invert.
+    bool DeviceOffsetToEm(const float dx, const float dy, float* out_x, float* out_y) const
+    {
+        float m[4];
+        SingleMatrix2x2(m);
+        const float det = m[0] * m[3] - m[1] * m[2];
+        if (det == 0.0f || !std::isfinite(det)) {
+            return false;
+        }
+        *out_x = (m[3] * dx - m[1] * dy) / det;
+        *out_y = (m[0] * dy - m[2] * dx) / det;
+        return true;
+    }
     bool WantsEmbeddedBitmaps() const { return (flags & kEmbeddedBitmapText) != 0; }
+    bool AsPaths() const { return as_paths; }
 
     // SkScalerContextRec's own fixed-point conversions.
     float DeviceGamma() const { return static_cast<float>(device_gamma) / (1 << 6); }
@@ -260,6 +300,7 @@ struct Rec
         r.contrast = Read<uint8_t>(rec, kRecContrast);
         r.mask_format = Read<uint8_t>(rec, kRecMaskFormat);
         r.flags = Read<uint16_t>(rec, kRecFlags);
+        r.as_paths = Read<uint8_t>(rec, kRecReservedPaths) == kAsPathsMark;
         return r;
     }
 };

@@ -128,7 +128,8 @@ class Mapping
 
 // One symbol table and the strings it names its symbols from.
 void ReadTable(const Mapping& file, const Elf64_Shdr& symbols, const Elf64_Shdr& strings,
-               const uintptr_t bias, const char* prefix, const size_t prefix_len, Table* out)
+               const uintptr_t bias, const char* prefix, const size_t prefix_len, Table* out,
+               const bool functions_only = true)
 {
     if (symbols.sh_entsize != sizeof(Elf64_Sym) || symbols.sh_size == 0) {
         return;
@@ -140,7 +141,8 @@ void ReadTable(const Mapping& file, const Elf64_Shdr& symbols, const Elf64_Shdr&
         return;
     }
     for (size_t i = 0; i < count; ++i) {
-        if (ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC || sym[i].st_value == 0 ||
+        if ((functions_only && ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC) ||
+            sym[i].st_value == 0 ||
             sym[i].st_shndx == SHN_UNDEF || sym[i].st_name >= strings.sh_size) {
             continue;
         }
@@ -154,7 +156,8 @@ void ReadTable(const Mapping& file, const Elf64_Shdr& symbols, const Elf64_Shdr&
     }
 }
 
-void ReadImage(const Image& image, const char* prefix, const size_t prefix_len, Table* out)
+void ReadImage(const Image& image, const char* prefix, const size_t prefix_len, Table* out,
+               const bool functions_only = true)
 {
     const Mapping file(image.path);
     const auto* header = file.At<Elf64_Ehdr>(0);
@@ -175,7 +178,7 @@ void ReadImage(const Image& image, const char* prefix, const size_t prefix_len, 
                 continue;
             }
             ReadTable(file, sections[i], sections[sections[i].sh_link], image.bias, prefix,
-                      prefix_len, out);
+                      prefix_len, out, functions_only);
         }
     }
 }
@@ -196,6 +199,37 @@ Table Collect(const char* prefix, const bool main_only)
         ReadImage(image, prefix, prefix_len, &out);
     }
     return out;
+}
+
+// Skia's Fontations typeface, which every Chromium carries and which names the
+// library Blink was linked into.
+constexpr const char* kSkiaWitness = "_ZTV21SkTypeface_Fontations";
+
+// The same scan over the library that holds Blink, for a build whose
+// executable is only a launcher. CEF is that shape: cefsimple names no
+// HarfBuzz at all and libcef.so names all of it.
+Table CollectFromBlinkLibrary(const char* prefix, std::string* which)
+{
+    std::vector<Image> images;
+    dl_iterate_phdr(&Note, &images);
+    const size_t prefix_len = std::strlen(prefix);
+    for (const Image& image : images) {
+        if (image.main) {
+            continue;
+        }
+        Table skia;
+        ReadImage(image, kSkiaWitness, std::strlen(kSkiaWitness), &skia, false);
+        if (skia.empty()) {
+            continue;           // not the library Blink is in
+        }
+        Table out;
+        ReadImage(image, prefix, prefix_len, &out);
+        if (!out.empty() && which != nullptr) {
+            *which = image.path;
+        }
+        return out;
+    }
+    return {};
 }
 
 }  // namespace
@@ -351,6 +385,23 @@ void ResolveAtLoad()
         return;
     }
 
+    // A launcher executable names no HarfBuzz because Blink is not in it. The
+    // library carrying Skia is the one Blink shapes through, and taking any
+    // other would patch a copy Blink never calls, which is what the rule above
+    // exists to prevent.
+    std::string library;
+    if (Table found = CollectFromBlinkLibrary("hb_", &library);
+        found.count(kWitness) != 0) {
+        Symbols() = std::move(found);
+        g_where = Linkage::kInImage;
+        char line[512];
+        (void)std::snprintf(line, sizeof(line),
+                            "HarfBuzz is compiled into %s and its symbol table names it, "
+                            "so hb_shape is replaced where it stands", library.c_str());
+        Say(line);
+        return;
+    }
+
     g_where = Linkage::kAbsent;
     Say("HarfBuzz is compiled into the binary and stripped of its names, so "
         "shaping cannot be reached; a bold fallback run keeps the regular "
@@ -360,6 +411,85 @@ void ResolveAtLoad()
 bool ExecutableImports(const char* symbol)
 {
     return ImageImports(symbol);
+}
+
+unsigned RedirectCallsTo(void* target, void* to)
+{
+    Dl_info info = {};
+    if (target == nullptr || to == nullptr || dladdr(target, &info) == 0) {
+        return 0;
+    }
+    struct Span
+    {
+        uintptr_t base;
+        const unsigned char* begin;
+        size_t size;
+        bool found;
+    };
+    Span span = {reinterpret_cast<uintptr_t>(info.dli_fbase), nullptr, 0, false};
+    dl_iterate_phdr(
+        [](dl_phdr_info* image, size_t, void* out) {
+            auto* want = static_cast<Span*>(out);
+            if (image->dlpi_addr != want->base) {
+                return 0;
+            }
+            for (int i = 0; i < image->dlpi_phnum; ++i) {
+                const ElfW(Phdr)& h = image->dlpi_phdr[i];
+                if (h.p_type != PT_LOAD || (h.p_flags & PF_X) == 0) {
+                    continue;
+                }
+                want->begin =
+                    reinterpret_cast<const unsigned char*>(image->dlpi_addr + h.p_vaddr);
+                want->size = h.p_memsz;
+                want->found = true;
+                return 1;
+            }
+            return 1;
+        },
+        &span);
+    if (!span.found || span.begin == nullptr || span.size < 5) {
+        return 0;
+    }
+    unsigned moved = 0;
+    const auto want = reinterpret_cast<uintptr_t>(target);
+    for (size_t i = 0; i + 5 <= span.size; ++i) {
+        if (span.begin[i] != 0xE8) {
+            continue;
+        }
+        int32_t rel = 0;
+        std::memcpy(&rel, span.begin + i + 1, sizeof(rel));
+        const auto after = reinterpret_cast<uintptr_t>(span.begin + i + 5);
+        if (after + static_cast<uintptr_t>(static_cast<intptr_t>(rel)) != want) {
+            continue;
+        }
+        // The new displacement has to reach, and this library is not
+        // guaranteed to be mapped within reach of the one being patched.
+        const auto dest = reinterpret_cast<uintptr_t>(to);
+        const intptr_t moved_rel = static_cast<intptr_t>(dest) - static_cast<intptr_t>(after);
+        if (moved_rel > INT32_MAX || moved_rel < INT32_MIN) {
+            continue;
+        }
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) {
+            continue;
+        }
+        auto* at = const_cast<unsigned char*>(span.begin + i + 1);
+        const auto start = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
+        const uintptr_t last = (reinterpret_cast<uintptr_t>(at) + sizeof(rel) - 1) &
+                               ~static_cast<uintptr_t>(page - 1);
+        const size_t len = last - start + static_cast<size_t>(page);
+        auto* base = reinterpret_cast<void*>(start);
+        if (mprotect(base, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            continue;
+        }
+        const auto write = static_cast<int32_t>(moved_rel);
+        std::memcpy(at, &write, sizeof(write));
+        (void)mprotect(base, len, PROT_READ | PROT_EXEC);
+        __builtin___clear_cache(reinterpret_cast<char*>(at),
+                                reinterpret_cast<char*>(at + sizeof(write)));
+        ++moved;
+    }
+    return moved;
 }
 
 Linkage Where()

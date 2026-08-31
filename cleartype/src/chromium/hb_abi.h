@@ -137,6 +137,14 @@ std::unordered_map<std::string, void*> SymbolsWithPrefix(const char* prefix);
 // it needs is already here.
 bool ExecutableImports(const char* symbol);
 
+// Point every direct call to `target` at `to`, inside the image `target` lives
+// in, and report how many were rewritten. For a build that inlined
+// hb_shape_full there is nothing left to call past a replaced hb_shape, so the
+// function is left standing and its callers are moved instead. Only the plain
+// five-byte E8 form is rewritten, which is what a call to a function in the
+// same image compiles to.
+unsigned RedirectCallsTo(void* target, void* to);
+
 }  // namespace hb_abi
 
 #endif  // CHROMIUM_HB_ABI_H_INCLUDED
