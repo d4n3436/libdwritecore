@@ -96,14 +96,117 @@ if [ -z "$WIDTH" ] || [ "${#LABELS[@]}" -ne 2 ] || [ "${#PAGES[@]}" -eq 0 ]; the
     exit 2
 fi
 
+# A side left running across a rebuild answers every request and measures the
+# build it started with, so the sweep reads as a change that did nothing or as
+# a regression that is not there. Checked from the process holding the port,
+# which is the only way to name the right process: `pgrep -f firefox` also
+# matches this script.
+#
+# Two tells. The mapped file being gone is what a rebuild over a live mapping
+# leaves behind, and it survives the path still looking correct. A different
+# inode at the same path is the same thing when the build wrote a new file.
+# Neither can see the guest, which has no shim of its own to compare; a guest
+# that has drifted shows up as the wedge warn_if_wedged reports instead.
+check_side_shim() {
+    local host="$1" port="$2" label="$3" pid line path mapped now
+    case "$host" in
+        127.0.0.1|localhost|::1) ;;
+        *) return 0 ;;
+    esac
+    pid="$(ss -ltnp 2>/dev/null | awk -v p=":$port\$" '$4 ~ p {print $NF}' \
+           | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+    [ -n "$pid" ] || return 0
+    line="$(grep -m1 libcleartype "/proc/$pid/maps" 2>/dev/null)" || return 0
+    [ -n "$line" ] || return 0
+    case "$line" in
+        *"(deleted)"*)
+            echo "side $label on port $port maps a libcleartype.so that has been rebuilt since it started, so this sweep would measure the old build; restart that side" >&2
+            return 1 ;;
+    esac
+    path="$(printf '%s' "$line" | sed -n 's|^[^/]*\(/.*\)$|\1|p')"
+    mapped="$(printf '%s' "$line" | awk '{print $5}')"
+    now="$(stat -c %i "$path" 2>/dev/null)" || return 0
+    if [ -n "$now" ] && [ -n "$mapped" ] && [ "$now" != "$mapped" ]; then
+        echo "side $label on port $port maps inode $mapped of $path but that path is inode $now now, so this sweep would measure the old build; restart that side" >&2
+        return 1
+    fi
+    return 0
+}
+
+STALE=0
+for i in 0 1; do
+    for port in ${PORTS[$i]//,/ }; do
+        check_side_shim "${HOSTS[$i]}" "$port" "${LABELS[$i]}" || STALE=1
+    done
+done
+[ "$STALE" = 0 ] || exit 2
+
 printf '%-38s %8s  %10s  %8s\n' page scrollY identical "max diff"
 printf '%-38s %8s  %10s  %8s\n' "-------------------------------------" ------- ---------- --------
 
 STARTED=$(date +%s)
 WORST=0
+EXACT=0
 FAILED=0
 CELLS=0
 STRIKES=0
+
+# The longest run of consecutive cells that came out unrecognizable, and where
+# it started and ended in plan order.
+#
+# A cell that captured fine and then compared at a third of its pixels is not a
+# font difference. Nothing about a font makes consecutive *filenames* fail
+# together, so a long run of them in plan order is one side wedging and
+# recovering, which the two-strikes rule below cannot see because every capture
+# succeeded. Seen on css-writing-modes as 75 cells reading 29% identical, where
+# a rerun of the same plan on the same browsers read them all exact: 625 of 765
+# against 724 of 765.
+BAD_FLOOR=50
+BAD_RUN=0; BAD_FROM=0
+LONGEST_BAD=0; LONGEST_FROM=0; LONGEST_TO=0
+BAD_TOTAL=0
+
+note_divergence() {
+    local pct="$1" n="$2" whole
+    whole="${pct%%.*}"
+    if [ -n "$pct" ] && [ "$pct" != "?" ] && [ "${whole:-100}" -lt "$BAD_FLOOR" ]; then
+        BAD_TOTAL=$((BAD_TOTAL + 1))
+        [ "$BAD_RUN" -eq 0 ] && BAD_FROM="$n"
+        BAD_RUN=$((BAD_RUN + 1))
+        if [ "$BAD_RUN" -gt "$LONGEST_BAD" ]; then
+            LONGEST_BAD="$BAD_RUN"; LONGEST_FROM="$BAD_FROM"; LONGEST_TO="$n"
+        fi
+    else
+        BAD_RUN=0
+    fi
+}
+
+# Printed with the totals.
+#
+# Two shapes, both of which have cost a day. A long run of unrecognizable cells
+# with the rest of the sweep fine is one side wedging partway through and
+# recovering. A sweep where nothing at all matches is nearly always a browser
+# that was already wedged when it started, since a change to glyph handling
+# moves some pixels on some pages, not every pixel on every page. The second
+# one cannot be told from a real regression inside a single run, which is the
+# trap: the fix is to restart both sides and run it again, not to go read the
+# diff. The shim check above will not catch either, because a wedged browser
+# maps exactly the right file.
+warn_if_wedged() {
+    # Most of them have to be unrecognizable as well, not merely inexact. A
+    # plan of probe pages that are all a little bit off is the ordinary state
+    # of an open front, and it has no exact cell either; a wedged browser
+    # leaves the pages unreadable.
+    if [ "$EXACT" = 0 ] && [ "$CELLS" -ge 3 ] && [ $((BAD_TOTAL * 2)) -gt "$CELLS" ]; then
+        printf 'warning: not one of %d cells matched and %d of them came out below %d%% identical. That is more often a browser that was already wedged than a real change, and a restart of both sides costs less than reading the diff. Re-run before believing this.\n' \
+               "$CELLS" "$BAD_TOTAL" "$BAD_FLOOR" >&2
+        return 0
+    fi
+    [ "$LONGEST_BAD" -ge 10 ] || return 0
+    [ "$EXACT" -gt "$LONGEST_BAD" ] || return 0
+    printf 'warning: cells %d-%d came out unrecognizable, %d in a row, and the rest of the sweep did not. That is one side wedging rather than a difference. Re-run the plan before trusting this number.\n' \
+           "$LONGEST_FROM" "$LONGEST_TO" "$LONGEST_BAD" >&2
+}
 
 # Both drivers have a direct route. Each side sweeps the whole plan over one
 # connection, in one process, and cells are compared here as soon as both sides
@@ -203,6 +306,8 @@ if [ "$DIRECT" = 1 ]; then
         printf '%-38s %8s  %9s%%  %8s\n' "${ALL_PATHS[$((n-1))]}" \
                "${ALL_SCROLLS[$((n-1))]}" "${pct:-?}" "${max:-0}"
         if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+        [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
+        note_divergence "${pct:-}" "$n"
         if [ -n "$CLUSTERS" ]; then
             printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
         fi
@@ -210,9 +315,11 @@ if [ "$DIRECT" = 1 ]; then
     wait "${SWEEPERS[@]}" 2>/dev/null
     [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
-    printf '\n%d cells in %ds, worst channel difference %d%s\n' \
+    printf '\n%d of %d identical\n' "$EXACT" "$CELLS"
+    printf '%d cells in %ds, worst channel difference %d%s\n' \
            "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
            "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
+    warn_if_wedged
     exit "$((FAILED > 0))"
 fi
 
@@ -221,7 +328,7 @@ fi
 # comparison runs there in the background, and its line is printed just before
 # the next one's. The table arrives in order and a cell at a time, and a sweep
 # costs the captures plus one comparison instead of the sum of the two.
-PENDING=""; P_PATH=""; P_SCROLL=""; P_DIR=""
+PENDING=""; P_PATH=""; P_SCROLL=""; P_DIR=""; P_N=0
 
 report() {
     [ -n "$PENDING" ] || return 0
@@ -232,6 +339,8 @@ report() {
     max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
     printf '%-38s %8s  %9s%%  %8s\n' "$P_PATH" "$P_SCROLL" "${pct:-?}" "${max:-0}"
     if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+    [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
+    note_divergence "${pct:-}" "$P_N"
     if [ -n "$CLUSTERS" ]; then
         printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
     fi
@@ -288,13 +397,15 @@ for entry in "${PAGES[@]}"; do
                 "$cell/${LABELS[0]}_marked.png" "$cell/${LABELS[0]}_clean.png" \
                 "$cell/${LABELS[1]}_marked.png" "$cell/${LABELS[1]}_clean.png" \
                 $CLUSTERS >"$cell/out" 2>&1 &
-        PENDING=$!; P_PATH="$path"; P_SCROLL="$scroll"; P_DIR="$cell"
+        PENDING=$!; P_PATH="$path"; P_SCROLL="$scroll"; P_DIR="$cell"; P_N="$CELLS"
     done
 done
 report
 [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
-printf '\n%d cells in %ds, worst channel difference %d%s\n' \
+printf '\n%d of %d identical\n' "$EXACT" "$CELLS"
+printf '%d cells in %ds, worst channel difference %d%s\n' \
        "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
        "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
+warn_if_wedged
 [ "$FAILED" -eq 0 ]

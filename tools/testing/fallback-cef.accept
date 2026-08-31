@@ -1,0 +1,26 @@
+# Cells where the two Windows references disagree with each other, so there is
+# no single answer to match. Passed to font_census.py alongside
+# fallback.accept, and only on a CEF run, so the same cells stay flagged if
+# they ever appear on an Electron pair.
+#
+# A Windows Electron (Chromium 150) and a Windows CEF (Chromium 144) on the
+# same machine, same fonts and the same DWriteCore shim answer these three
+# differently:
+#
+#   U+1CFA  Electron: Nirmala UI       CEF: Sans Serif Collection
+#   U+A70D  Electron: Segoe UI         CEF: Sans Serif Collection
+#   U+A832  Electron: Nirmala UI       CEF: Sans Serif Collection
+#
+# DWriteCore has no opinion on any of the three: dwrite_fallback_probe reports
+# no mapped font for all of them under every language. The divergence is in
+# Chromium's own path for a character its fallback returns nothing for.
+# Chromium 150 lands on the script-appropriate family, which is what the Linux
+# side answers; Chromium 144 lands on Sans Serif Collection, the pan-Unicode
+# variable font.
+#
+# Matching CEF would mean answering Sans Serif Collection for three codepoints
+# gated on the embedder's Chromium version, and regressing the Electron pair
+# that currently matches.
+U+1CFA
+U+A70D
+U+A832

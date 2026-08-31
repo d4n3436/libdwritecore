@@ -1,0 +1,52 @@
+# Cells where the two sides differ and Windows is the one that is wrong, so
+# matching it would be a regression. Passed to font_census.py with --accept.
+#
+# Arabic presentation forms A that neither Arial nor Times New Roman carries.
+# Windows finds no fallback and draws the primary font's .notdef box; the run
+# measures each font's own glyph-0 advance. Linux falls back to Courier New,
+# which has real glyphs for these, and renders the ligature. Matching Windows
+# would replace readable text with a tofu box.
+#
+# The four codepoints below are the ones the census stride samples; the whole
+# U+FB50-FDFF range behaves this way wherever the generic's family lacks the
+# character.
+U+FC9C|-|sans-serif
+U+FC9C|-|serif
+U+FCAC|-|sans-serif
+U+FCAC|-|serif
+U+FCCC|-|sans-serif
+U+FCCC|-|serif
+U+FCDC|-|sans-serif
+U+FCDC|-|serif
+
+# The same four codepoints under each language config. Windows keeps whichever
+# family the locale resolved to and draws its .notdef, so the family it names
+# changes with the language while the answer stays a box.
+U+FC9C|ja|sans-serif
+U+FCAC|ja|sans-serif
+U+FCCC|ja|sans-serif
+U+FCDC|ja|sans-serif
+U+FC9C|zh-CN|sans-serif
+U+FCAC|zh-CN|sans-serif
+U+FCCC|zh-CN|sans-serif
+U+FCDC|zh-CN|sans-serif
+U+FC9C|zh-TW|sans-serif
+U+FCAC|zh-TW|sans-serif
+U+FCCC|zh-TW|sans-serif
+U+FCDC|zh-TW|sans-serif
+U+FC9C|ko|sans-serif
+U+FCAC|ko|sans-serif
+U+FCCC|ko|sans-serif
+U+FCDC|ko|sans-serif
+U+FC9C|ar|sans-serif
+U+FCAC|ar|sans-serif
+U+FCCC|ar|sans-serif
+U+FCDC|ar|sans-serif
+U+FC9C|th|sans-serif
+U+FCAC|th|sans-serif
+U+FCCC|th|sans-serif
+U+FCDC|th|sans-serif
+U+FC9C|hi|sans-serif
+U+FCAC|hi|sans-serif
+U+FCCC|hi|sans-serif
+U+FCDC|hi|sans-serif

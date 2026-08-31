@@ -40,6 +40,7 @@ def main():
     try:
         vp.converge_inner_size(browser, args.width, args.height, vp.SETUP_TIMEOUT)
         vp.hide_scrollbars(browser)
+        vp.pin_color_scheme(browser)
 
         with open(args.cells, encoding="utf-8") as handle:
             for line in handle:

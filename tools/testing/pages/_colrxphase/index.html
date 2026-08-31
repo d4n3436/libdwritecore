@@ -1,0 +1,17 @@
+<!doctype html><meta charset=utf-8>
+<title>COLR x-phase</title>
+<style>
+  body { margin: 0; background: #fff; font-family: sans-serif; }
+  /* One glyph per row, each at a stated fractional x. Absolute positioning is
+     what makes the origin fractional; padding is rounded away by layout. */
+  span { position: absolute; font-size: 48px; }
+</style>
+<body><script>
+  let h = "";
+  const phases = [0, .0625, .125, .1875, .25, .3125, .375, .4375,
+                  .5, .5625, .625, .6875, .75, .8125, .875, .9375];
+  phases.forEach((p, i) => {
+    h += '<span style="left:' + (20 + p) + 'px; top:' + (i * 62) + 'px">\u{1F600}</span>';
+  });
+  document.body.innerHTML = h;
+</script>

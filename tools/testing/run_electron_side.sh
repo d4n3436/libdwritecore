@@ -41,6 +41,13 @@ case "${1:-}" in
         if [ -f "$PIDFILE" ]; then
             # The whole session, since Electron forks helper processes.
             kill -- "-$(cat "$PIDFILE")" 2>/dev/null || kill "$(cat "$PIDFILE")" 2>/dev/null
+            # kill only asks. A start that follows would find the port still
+            # held and refuse, so wait for the process group to go.
+            stopping="$(cat "$PIDFILE")"
+            for _ in $(seq 1 100); do
+                kill -0 "$stopping" 2>/dev/null || break
+                sleep 0.1
+            done
             rm -f "$PIDFILE"
         fi
         exit 0

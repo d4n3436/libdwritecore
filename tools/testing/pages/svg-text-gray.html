@@ -5,7 +5,7 @@
   Firefox draws page text and canvas text through consumers that read the
   system ClearType values, and SVG text through the blob rasterizer, which is
   reached before gfxVars deliver them and answers with DWriteSettings' own
-  initialisers instead - gamma 2.2 where everything else gets 1.8. Nothing else
+  initializers instead - gamma 2.2 where everything else gets 1.8. Nothing else
   in a corpus of saved pages goes down that path.
 
   One inline <svg> per page. Two on a page and Firefox stops blob-rasterizing

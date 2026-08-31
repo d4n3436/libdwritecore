@@ -3,7 +3,7 @@
 Enumerate font decisions on two browsers and diff them, layer by layer.
 
     tools/testing/font_census.py <mode> <sideA> <sideB>
-                                 [--full] [--accept FILE]
+                                 [--full] [--accept FILE]...
 
 A side is `[driver:]host:port`, the driver being `cdp` for Chromium and
 Electron or `marionette` for Firefox, and DevTools when none is named. Firefox
@@ -35,6 +35,9 @@ session is one table row.
             pairs, Indic consonant-vowel and conjunct clusters, Thai stacking,
             emoji sequences, and every printable ASCII pair for the core Latin
             families, whose widths carry the kerning.
+            Sound on a Firefox pair: the face is asked for by name through
+            InspectorUtils.getUsedFontFaces, not inferred from an advance and
+            ink box, which Firefox snaps.
   raster    every fallback-census codepoint drawn in a fixed grid and
             screenshotted on both sides, compared cell by cell. The one layer
             that needs pixels; everything the other modes cleared that still
@@ -43,7 +46,10 @@ session is one table row.
 
 --full widens fallback and raster to every language the generics mode knows.
 --accept names a file of cell keys (one per line, # comments) to report as
-accepted rather than diverging; the exit status counts only the rest.
+accepted rather than diverging; the exit status counts only the rest. It may
+be given more than once, so a build whose own reference is the odd one out
+adds its file beside the shared one instead of copying it, and the cells it
+accepts stay flagged on every other build.
 
 Both browsers must reach the same font set and hold the same window size for
 raster mode.
@@ -59,6 +65,8 @@ import io
 import json
 import os
 import sys
+import threading
+import time
 import unicodedata
 
 import marionette
@@ -97,7 +105,25 @@ ALL_WEIGHTS = [100, 200, 300, 400, 500, 600, 700, 800, 900]
 KERNED = ["Arial", "Times New Roman", "Segoe UI", "Calibri", "Georgia",
           "Verdana", "Tahoma"]
 
-METRIC_SIZES = [12, 13, 16, 21, 24, 32]
+# Whole sizes alone hide a whole class: anything that rounds a size only shows
+# where the size has a fraction to lose. A UA stylesheet reaches these
+# constantly, since h5 is 0.83em, h6 0.67em and small/sub/sup are `smaller`.
+METRIC_SIZES = [11, 12, 12.5, 13, 13.28, 13.33, 14.4, 16, 16.6, 17.28,
+                18, 19.2, 20.8, 21, 24, 25.8064, 26.6, 28.8, 32, 33.12,
+                36.8, 40, 48,
+                # Above 256 Skia stops drawing from a mask and generates at a
+                # canonical 64 px path strike that the draw scales, which is a
+                # regime nothing below the threshold exercises.
+                200, 260, 400]
+
+# The weights a family is actually asked for on a page, plus the two that
+# Windows maps differently inside a family.
+METRIC_WEIGHTS = [300, 400, 500, 600, 700]
+
+# Whether the face is asked for upright or slanted. A family with no italic
+# face gets a synthetic oblique, and which faces exist differs by family, so
+# this reaches both the selection and the synthesis.
+METRIC_STYLES = ["normal", "italic"]
 
 # A face reports its name in the browser's own language, so the same file
 # answers under two names on the two machines. Keyed lowercase.
@@ -133,15 +159,48 @@ def renderable(limit):
     return out
 
 
+# Set from --lang: the content languages a run is restricted to, or None for
+# all of them.
+kOnlyLangs = None
+
+
+# Set from --configs: (index, count), or None for the whole list.
+kShard = None
+
+# Set from --family: the families to sweep, or None for all of them.
+kOnlyFamilies = None
+
+
+def keep_family(name):
+    return kOnlyFamilies is None or name in kOnlyFamilies
+
+
+def shard(rows):
+    """Every nth row, for splitting one run across several browser pairs.
+
+    Applied after any filter so it composes with --lang and --family.
+    """
+    if kShard is None:
+        return rows
+    index, count = kShard
+    return rows[index::count]
+
+
+def keep_lang(lang):
+    return kOnlyLangs is None or (lang or "-") in kOnlyLangs
+
+
 def fallback_configs(full):
     if full:
-        return [(lang, gen) for lang, _ in LANGS for gen in
+        rows = [(lang, gen) for lang, _ in LANGS for gen in
                 ("sans-serif", "serif", "monospace")]
-    # The Han disambiguation set, plus the three generics with no language.
-    return [("", "sans-serif"), ("", "serif"), ("", "monospace"),
-            ("ja", "sans-serif"), ("zh-CN", "sans-serif"),
-            ("zh-TW", "sans-serif"), ("ko", "sans-serif"),
-            ("ar", "sans-serif"), ("th", "sans-serif"), ("hi", "sans-serif")]
+    else:
+        # The Han disambiguation set, plus the three generics with no language.
+        rows = [("", "sans-serif"), ("", "serif"), ("", "monospace"),
+                ("ja", "sans-serif"), ("zh-CN", "sans-serif"),
+                ("zh-TW", "sans-serif"), ("ko", "sans-serif"),
+                ("ar", "sans-serif"), ("th", "sans-serif"), ("hi", "sans-serif")]
+    return shard([row for row in rows if keep_lang(row[0])])
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +260,27 @@ class CdpSide:
         vp.await_condition(self.browser, vp.PAGE_LOADED, 30,
                            "the page never finished loading")
         vp.hide_scrollbars(self.browser)
+        if kViewport is not None:
+            # Raster mode compares screenshots, so the two sides have to hold
+            # the same viewport. Where the app decides its own window size,
+            # as Electron's does, they already do and this stays off.
+            self.browser.call("Emulation.setDeviceMetricsOverride",
+                              {"width": kViewport[0], "height": kViewport[1],
+                               "deviceScaleFactor": 1, "mobile": False})
         self.browser.call("DOM.enable")
         self.browser.call("CSS.enable")
+        self.warm()
+
+    def warm(self):
+        """Draw once before anything is measured.
+
+        A build whose Skia is compiled in finds its rasterizer from a live
+        scaler context, so the first glyphs of a fresh browser are drawn by
+        Skia and measure a pixel narrower. Every cell after that is the
+        rasterizer under test; this makes the first one so too.
+        """
+        self.browser.script(WARM, [])
+        self.settle()
 
     def build(self, spec):
         self.browser.script(BUILD, [json.dumps(spec)])
@@ -303,6 +381,9 @@ def run_cells(sides, cells):
     for side in sides:
         spec = [("c%d" % i,) + tuple(c[1:]) for i, c in enumerate(cells)]
         side.build(spec)
+        # The face a node was drawn with is only reported once it has been
+        # drawn; asking earlier answers with no faces at all.
+        side.settle()
         answers.append(side.fonts_of(len(cells)))
     out = {}
     for i, cell in enumerate(cells):
@@ -332,6 +413,21 @@ def mode_families(sides, full):
     return run_cells(sides, cells), len(cells)
 
 
+WARM = """
+const host = document.createElement('div');
+host.style.cssText = 'position:absolute;left:0;top:0;font:16px sans-serif';
+// One run per script the corpus reaches, so every rasterizer the shim
+// installs has been through a scaler context before a cell is measured.
+host.textContent = 'Aa1 \u00c4\u00e9 \u0416 \u03b1 \u0627 \u05d0 \u0905 ' +
+                   '\u0e01 \u4e00 \u3042 \uac00 \u2603 \u2500';
+document.body.appendChild(host);
+const ctx = document.createElement('canvas').getContext('2d');
+ctx.font = '16px sans-serif';
+ctx.measureText(host.textContent);
+host.remove();
+return '';
+"""
+
 FINGERPRINT = """
 const [cps, lang, generic] = JSON.parse(arguments[0]);
 const host = document.createElement('div');
@@ -350,27 +446,39 @@ for (const cp of cps) {
            Math.round(m.actualBoundingBoxAscent * 2) / 2,
            Math.round(m.actualBoundingBoxDescent * 2) / 2,
            Math.round(m.actualBoundingBoxLeft * 2) / 2,
-           Math.round(m.actualBoundingBoxRight * 2) / 2);
+           Math.round(m.actualBoundingBoxRight * 2) / 2,
+           // The face's own ascent and descent, not the glyph's. Two faces
+           // that happen to draw one glyph into the same box still differ
+           // here, which is how a fullwidth form drawn by the wrong CJK font
+           // is caught without a screenshot.
+           Math.round(m.fontBoundingBoxAscent * 2) / 2,
+           Math.round(m.fontBoundingBoxDescent * 2) / 2);
 }
 host.remove();
 return JSON.stringify(out);
 """
 
 
+# Values per codepoint that FINGERPRINT pushes.
+kFingerprintWidth = 7
+
+
 def fingerprints(side, cps, lang, generic):
     """One measurement tuple per codepoint, taken wholly in the page.
 
-    The canvas cannot say which face it used, but two different faces
-    almost never agree on advance and ink box at once, so the tuple stands
-    in for the face and the names are fetched afterwards for the few
-    codepoints whose tuples disagree.
+    The canvas cannot say which face it used, so the tuple stands in for it
+    and the names are fetched afterwards for the codepoints that disagree.
+    Glyph advance and ink box alone are not enough: Microsoft Tai Le and
+    Microsoft YaHei draw U+FF06 into the same box, so the face's own
+    ascent and descent are measured too.
     """
     out = []
     for start in range(0, len(cps), 20000):
         chunk = cps[start:start + 20000]
         row = json.loads(side.evaluate(
             FINGERPRINT, [json.dumps([chunk, lang, generic])]))
-        out.extend(tuple(row[i:i + 5]) for i in range(0, len(row), 5))
+        out.extend(tuple(row[i:i + kFingerprintWidth])
+                   for i in range(0, len(row), kFingerprintWidth))
     return out
 
 
@@ -383,46 +491,99 @@ def face_names(answer):
     return {f if isinstance(f, str) else f[0] for f in answer}
 
 
+# Nodes per build. One build carries the whole batch, so the only reason to
+# split is the page a large batch would otherwise become. Naming is round-trip
+# bound and not layout bound, so a bigger batch is a straight win: measured
+# over a 143,177 codepoint config, 500 costs 17.1s on Linux and 22.9s on the
+# guest, and 4000 costs 11.2s and 13.4s. It flattens past 4000.
+kNamesPerBuild = 4000
+
+
+def both_sides(work, sides, *args):
+    """Run `work(side, *args)` on both sides at once and return the two answers.
+
+    Each side is its own socket to its own browser, so nothing is shared and
+    the only ordering that matters is that both finish. A failure is re-raised
+    from the calling thread rather than swallowed, so a browser that died still
+    stops the run.
+    """
+    out = [None, None]
+    error = [None, None]
+
+    def run(i):
+        try:
+            out[i] = work(sides[i], *args)
+        except BaseException as exc:                 # noqa: BLE001
+            error[i] = exc
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for exc in error:
+        if exc is not None:
+            raise exc
+    return out[0], out[1]
+
+
 def name_faces(side, cps, lang, generic):
-    spec = [("c%d" % i, generic, lang, 400, "normal", chr(cp))
-            for i, cp in enumerate(cps)]
-    side.build(spec)
-    answers = side.fonts_of(len(spec))
-    return {cp: ",".join(sorted(face_names(a))) or "(nothing)"
-            for cp, a in zip(cps, answers)}
+    out = {}
+    for at in range(0, len(cps), kNamesPerBuild):
+        batch = cps[at:at + kNamesPerBuild]
+        spec = [("c%d" % i, generic, lang, 400, "normal", chr(cp))
+                for i, cp in enumerate(batch)]
+        side.build(spec)
+        side.settle()
+        answers = side.fonts_of(len(spec))
+        for cp, a in zip(batch, answers):
+            out[cp] = ",".join(sorted(face_names(a))) or "(nothing)"
+    return out
 
 
-# How many of a config's differing codepoints get their faces named. Naming
-# costs a round trip per codepoint, so the default keeps a full run cheap.
-# Raise it through the environment to see which faces the cells hold.
-kNamedPerConfig = int(os.environ.get("DWC_CENSUS_NAMED", "60"))
+# How many of a config's differing codepoints get their faces named. One build
+# carries a batch of them, so naming every cell costs a handful of round trips
+# per config. Lower it through the environment for a faster count-only run.
+kNamedPerConfig = int(os.environ.get("DWC_CENSUS_NAMED", "0")) or None
+
+# The viewport both sides are pinned to, for a browser whose window size the
+# two platforms do not agree on. None leaves each side as it starts.
+kViewport = None
 
 
 def mode_fallback(sides, full):
+    # A Chromium renderer caches the fallback family under the character
+    # alone, so the first language to ask answers for every language after
+    # it. Nothing in DevTools opens a fresh renderer on Electron, so the
+    # browser has to be restarted between languages, which is what --lang is
+    # for.
+    if any(side.driver == "cdp" for side in sides) and len(fallback_configs(full)) > 1:
+        print("  note: one browser answers every language from the first one's "
+              "cache; run --lang once per language, restarting between them, "
+              "for a reading that means anything", file=sys.stderr)
     # Fallback is decided in ranges, so a stride catches a range-level
     # divergence at a fraction of the cost; --full walks every codepoint.
     cps = renderable(0x30000) if full else renderable(0x10000)[::16]
     total = 0
     out = {}
     for lang, generic in fallback_configs(full):
-        fa = fingerprints(sides[0], cps, lang, generic)
-        fb = fingerprints(sides[1], cps, lang, generic)
-        differ = [cp for cp, a, b in zip(cps, fa, fb) if a != b]
+        # The face is asked for by name rather than inferred from a canvas
+        # measurement. Advance and ink box do not identify a face: Microsoft
+        # Tai Le and Microsoft YaHei draw U+FF06 into the same box with the
+        # same font box, so a stride of measurements called that cell equal
+        # while the two sides were using different fonts. Naming all 3387
+        # costs under a second, since one build carries 500 nodes.
+        # The two sides share nothing, so asking them in turn costs their sum
+        # while asking them at once costs the slower one. On a guest that is
+        # about 1.2x slower than the host, that is most of the run.
+        na, nb = both_sides(name_faces, sides, cps, lang, generic)
+        differ = [cp for cp in cps if na[cp] != nb[cp]]
         total += len(cps)
-        # Every differing codepoint is counted; only the first few are named,
-        # since naming one costs a build and a face query per side. A cell the
-        # names were not fetched for still reports, as the count it is.
-        named = differ[:kNamedPerConfig]
-        na = name_faces(sides[0], named, lang, generic)
-        nb = name_faces(sides[1], named, lang, generic)
         for cp in differ:
-            key = "U+%04X|%s|%s" % (cp, lang or "-", generic)
-            out[key] = ((na[cp], nb[cp]) if cp in na
-                        else ("(not named)", "(not named)"))
-        print("  fallback %s/%s: %d codepoints, %d differ%s"
-              % (lang or "-", generic, len(cps), len(differ),
-                 "" if len(differ) <= kNamedPerConfig
-                 else ", %d named" % kNamedPerConfig), file=sys.stderr)
+            out["U+%04X|%s|%s" % (cp, lang or "-", generic)] = (na[cp], nb[cp])
+        print("  fallback %s/%s: %d codepoints, %d differ"
+              % (lang or "-", generic, len(cps), len(differ)),
+              file=sys.stderr)
     return out, total
 
 
@@ -430,13 +591,23 @@ MEASURE = """
 const [configs, text] = JSON.parse(arguments[0]);
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
+const canary = '13px monospace';
 const out = [];
-for (const [fam, size, weight] of configs) {
-  ctx.font = weight + ' ' + size + 'px ' + fam;
-  const row = [];
+for (const [fam, size, weight, style] of configs) {
+  // A font shorthand the parser rejects leaves ctx.font as it was, so every
+  // cell after a bad one would silently measure its neighbor and the census
+  // would call that clean. Setting a canary first makes a rejected string
+  // show up as a 0 in the row instead.
+  ctx.font = canary;
+  ctx.font = style + ' ' + weight + ' ' + size + 'px ' + fam;
+  const row = [ctx.font === canary ? 0 : 1];
   const box = ctx.measureText(text);
+  // Left and right as well as the advance: a shear, a stroke or a side
+  // bearing moves ink sideways without moving the advance at all, and the
+  // vertical pair cannot see any of it.
   row.push(box.fontBoundingBoxAscent, box.fontBoundingBoxDescent,
            box.actualBoundingBoxAscent, box.actualBoundingBoxDescent,
+           box.actualBoundingBoxLeft, box.actualBoundingBoxRight,
            box.width);
   for (const ch of text) row.push(ctx.measureText(ch).width);
   out.push(row);
@@ -448,21 +619,26 @@ ASCII = "".join(chr(c) for c in range(0x21, 0x7F))
 
 
 def mode_metrics(sides, full):
-    configs = [['"%s"' % fam, size, weight]
-               for fam in FAMILIES for size in METRIC_SIZES
-               for weight in (400, 700)]
+    configs = shard([['"%s"' % fam, size, weight, style]
+                     for fam in FAMILIES if keep_family(fam) for size in METRIC_SIZES
+                     for weight in METRIC_WEIGHTS for style in METRIC_STYLES])
+    if not configs:
+        sys.exit("no families left to measure; check --family")
     rows = []
     for side in sides:
         rows.append(json.loads(side.evaluate(
             MEASURE, [json.dumps([configs, ASCII])])))
-    labels = ["boxAscent", "boxDescent", "inkAscent", "inkDescent", "width"] \
-        + list(ASCII)
+    labels = ["applied", "boxAscent", "boxDescent", "inkAscent", "inkDescent",
+              "inkLeft", "inkRight", "width"] + list(ASCII)
     out = {}
     for c, (ra, rb) in enumerate(zip(rows[0], rows[1])):
-        fam, size, weight = configs[c]
+        fam, size, weight, style = configs[c]
         for v, (va, vb) in enumerate(zip(ra, rb)):
             if abs(va - vb) > 0.01:
-                out["%s|%d|%d|%s" % (fam.strip('"'), size, weight, labels[v])] = \
+                # %s on the size, since %d collapsed 13.28 and 13.33 onto one
+                # key and only the last of them was ever reported.
+                out["%s|%s|%d|%s|%s" %
+                    (fam.strip('"'), size, weight, style, labels[v])] = \
                     (round(va, 3), round(vb, 3))
     return out, len(configs) * len(labels)
 
@@ -494,7 +670,8 @@ def shape_sequences():
         for a in ASCII:
             for b in ASCII:
                 seqs.append(("", '"%s"' % fam, a + b))
-    return seqs
+    seqs = [row for row in seqs if keep_family(row[1].strip('"'))]
+    return shard(seqs)
 
 
 SHAPE = """
@@ -590,8 +767,21 @@ def mode_raster(sides, full):
                 x = (i % cols) * cell_w
                 cell = diff[y:y + cell_h, x:x + cell_w]
                 if cell.size and cell.max() > 0:
+                    # Color glyphs come from a different renderer on each
+                    # side, Fontations against DirectWrite's paint tree, and
+                    # they differ by edge coverage that no rasterizer setting
+                    # reaches. Saying which cells those are keeps them from
+                    # being read as a monochrome raster defect.
+                    # Saturated fill, not edge fringes. ClearType gives every
+                    # glyph colored edges, so a spread test alone calls all
+                    # text color; a color glyph instead has many pixels that
+                    # are both far from gray and bright.
+                    box = a[y:y + cell_h, x:x + cell_w]
+                    spread = box.max(axis=2) - box.min(axis=2)
+                    lit = ((spread > 60) & (box.max(axis=2) > 128)).sum()
+                    kind = "color" if lit > box.shape[0] * box.shape[1] * 0.02 else "mono"
                     out["U+%04X|%s|%s|%d" % (cp, lang or "-", generic, size)] = \
-                        ("%d px differ" % int((cell > 0).sum()),
+                        ("%d px differ (%s)" % (int((cell > 0).sum()), kind),
                          "max %d" % int(cell.max()))
             total += len(chunk)
         print("  raster %s/%s: %d codepoints" % (lang or "-", generic, total),
@@ -609,6 +799,14 @@ MODES = {
 }
 
 
+def elapsed(seconds):
+    """A duration in the largest unit that keeps it readable."""
+    if seconds < 60:
+        return "%.1fs" % seconds
+    minutes, rest = divmod(int(round(seconds)), 60)
+    return "%dm %02ds" % (minutes, rest)
+
+
 def describe(answer):
     """One side's answer as a line: a face tuple, or whatever else a mode put
     there. Firefox names faces without a glyph count, so a name stands alone
@@ -618,6 +816,20 @@ def describe(answer):
     return ", ".join(f if isinstance(f, str) else "%s(%d)" % f for f in answer)
 
 
+def is_accepted(key, accepted):
+    """Whether a cell key is covered by the accept file.
+
+    An accept entry may name fewer fields than the cell key carries. raster
+    keys end in the pixel size, so `U+FC9C|-|sans-serif` covers every size of
+    that cell, while an entry that names the size stays exact. Without this
+    the Arabic presentation forms read as seven fresh divergences on every
+    raster run, since the file was written against the fallback key shape.
+    """
+    if key in accepted:
+        return True
+    return any(key.startswith(entry + "|") for entry in accepted)
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("mode", choices=sorted(MODES) + ["all"])
@@ -625,18 +837,42 @@ def main():
     ap.add_argument("b", metavar="sideB")
     ap.add_argument("--full", action="store_true",
                     help="widen fallback and raster to every language")
-    ap.add_argument("--accept", default=None,
-                    help="file of cell keys to report as accepted")
+    ap.add_argument("--lang", default=None,
+                    help="restrict fallback and raster to these content "
+                         "languages, comma separated, '-' for no language. "
+                         "One language per browser is the only way to read "
+                         "this layer, since a Linux renderer answers a "
+                         "character from whichever language asked first.")
+    ap.add_argument("--family", action="append", default=None, metavar="NAME",
+                    help="restrict metrics and shape to these families, exact "
+                         "names from FAMILIES, repeatable. A whole metrics pass "
+                         "is 7540 configs, so an A/B that only needs a few "
+                         "families is minutes cheaper per sample")
+    ap.add_argument("--configs", default=None, metavar="I/N",
+                    help="take every Nth fallback or raster config, starting at "
+                         "I (0-based), so one run can be split across several "
+                         "browser pairs. Composes with --lang.")
+    ap.add_argument("--viewport", default=None, metavar="WxH",
+                    help="pin both sides to this viewport, for raster mode on a "
+                         "browser whose window size the platforms disagree on")
+    ap.add_argument("--accept", action="append", default=None,
+                    help="file of cell keys to report as accepted; repeatable, "
+                         "so a build with its own accepted cells adds a file "
+                         "instead of copying the shared one")
     args = ap.parse_args()
 
     accepted = set()
-    if args.accept:
-        with open(args.accept, encoding="utf-8") as handle:
+    for path in args.accept or []:
+        with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     accepted.add(line)
 
+    # Read before the sides are opened, since each applies it as it connects.
+    if args.viewport:
+        w, _, h = args.viewport.partition("x")
+        globals()["kViewport"] = (int(w), int(h))
     sides = [open_side(args.a), open_side(args.b)]
     if sides[0].driver != sides[1].driver:
         for side in sides:
@@ -644,22 +880,42 @@ def main():
         sys.exit("both sides must be the same browser; %s answers over %s and "
                  "%s over %s" % (args.a, sides[0].driver, args.b,
                                  sides[1].driver))
+    if args.lang is not None:
+        globals()["kOnlyLangs"] = set(args.lang.split(","))
+    if args.configs is not None:
+        index, _, count = args.configs.partition("/")
+        if not count or not index.isdigit() or not count.isdigit() or int(count) == 0:
+            sys.exit("--configs takes I/N, both numbers, N above zero")
+        if int(index) >= int(count):
+            sys.exit("--configs index %s is not below %s" % (index, count))
+        globals()["kShard"] = (int(index), int(count))
+    if args.family:
+        unknown = [f for f in args.family if f not in FAMILIES]
+        if unknown:
+            sys.exit("--family does not know %s" % ", ".join(unknown))
+        globals()["kOnlyFamilies"] = set(args.family)
     names = sorted(MODES) if args.mode == "all" else [args.mode]
     failing = 0
     try:
+        started = time.monotonic()
         for name in names:
+            began = time.monotonic()
             diverging, total = MODES[name](sides, args.full)
-            known = sum(1 for k in diverging if k in accepted)
+            took = time.monotonic() - began
+            known = sum(1 for k in diverging if is_accepted(k, accepted))
             new = len(diverging) - known
             failing += new
             print("== %s: %d of %d cells match on linux / windows "
-                  "(%d diverge, %d accepted)"
-                  % (name, total - len(diverging), total, len(diverging), known))
+                  "(%d diverge, %d accepted) in %s"
+                  % (name, total - len(diverging), total, len(diverging), known,
+                     elapsed(took)))
             for key in sorted(diverging):
-                mark = "accepted " if key in accepted else ""
+                mark = "accepted " if is_accepted(key, accepted) else ""
                 a, b = diverging[key]
                 print("  %s%-44s A: %-34s B: %s"
                       % (mark, key, describe(a), describe(b)))
+        if len(names) > 1:
+            print("== %d modes in %s" % (len(names), elapsed(time.monotonic() - started)))
     finally:
         for side in sides:
             side.close()
