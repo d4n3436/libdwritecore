@@ -374,14 +374,141 @@ const char* Surveyed(const Installed& have, const char* family)
     return nullptr;
 }
 
-// The weights CSS names plus 1000, the top of the scale, which are the ones a
-// page asks for as a keyword or a round number. Anything between them lands on
-// a neighbor and takes that rule.
-constexpr int kCssWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
-
 // DWRITE_FONT_STYLE values, which dwrite_raster.h takes as plain ints.
 constexpr int kStyleOblique = 1;
 constexpr int kStyleItalic = 2;
+
+// One rule per run of requested weights that answers with the same face, so a
+// page asking for a weight no face carries lands where Windows puts it. The
+// nine CSS weights are only the ones a keyword reaches; 550 between Regular
+// and Bold is as reachable, and without a rule it falls to fontconfig's own
+// nearest-weight logic, which picks the lighter face where Windows picks Bold.
+//
+// `style` is the DWRITE_FONT_STYLE the request carries and `slant` the
+// fontconfig value that stands for it. The face weights of the whole family
+// are only candidate boundaries: a slanted request is answered from the
+// slanted faces alone, so runs that answer alike are merged and the extra
+// boundaries cost nothing.
+std::string WeightRanges(const std::string& family, const int style, const int slant)
+{
+    // Each boundary is searched for. The face weights say where the answer
+    // can change, but a slanted request is answered from a different set of
+    // faces and a simulated entry moves the boundary again, so an interval is
+    // split until both ends answer alike.
+    struct Answer
+    {
+        int weight;
+        bool italic;
+        bool ok;
+
+        bool operator==(const Answer& other) const = default;
+    };
+    std::map<int, Answer> asked;
+    const auto ask = [&](const int weight) {
+        if (const auto found = asked.find(weight); found != asked.end()) {
+            return found->second;
+        }
+        Answer a{};
+        a.ok = dwrite_raster::FamilyMatchFace(family.c_str(), weight, style, &a.weight,
+                                              &a.italic) &&
+               a.weight != 0;
+        asked.emplace(weight, a);
+        return a;
+    };
+
+    struct Run
+    {
+        int lo;
+        int hi;
+        int weight;
+        bool italic;
+    };
+    std::vector<Run> runs;
+    const auto add = [&runs](const int lo, const int hi, const Answer& a) {
+        if (!runs.empty() && runs.back().weight == a.weight &&
+            runs.back().italic == a.italic && runs.back().hi + 1 == lo) {
+            runs.back().hi = hi;
+        } else {
+            runs.push_back({lo, hi, a.weight, a.italic});
+        }
+    };
+    // An explicit stack, walked low to high so the runs come out in order.
+    std::vector<std::pair<int, int>> todo{{1, 1000}};
+    while (!todo.empty()) {
+        const auto [lo, hi] = todo.back();
+        todo.pop_back();
+        const Answer a = ask(lo);
+        const Answer b = ask(hi);
+        if (!a.ok || !b.ok) {
+            return {};
+        }
+        if (a == b) {
+            add(lo, hi, a);
+            continue;
+        }
+        if (hi - lo == 1) {
+            add(lo, lo, a);
+            add(hi, hi, b);
+            continue;
+        }
+        const int mid = lo + (hi - lo) / 2;
+        todo.emplace_back(mid + 1, hi);
+        todo.emplace_back(lo, mid);
+    }
+    if (runs.empty()) {
+        return {};
+    }
+
+    // The rules are written on the fontconfig scale, which is coarse: a
+    // hundred OpenType steps between Bold and Extrabold are five of its own,
+    // so two runs can round to the same bound. Ranges that share a bound are
+    // worse than coarse, since fontconfig applies each edit as it goes and a
+    // later test reads the weight an earlier rule already assigned. The runs
+    // are projected onto the fontconfig scale instead, one value at a time
+    // through the same map Skia converts a request with, which makes them
+    // disjoint and keeps every value answering for the request that produced
+    // it.
+    constexpr int kMaxFcWeight = 215;
+    std::string out;
+    int start = 0;
+    for (int v = 0; v <= kMaxFcWeight; ++v) {
+        const auto at = [&runs](const int fc) {
+            const int ot = static_cast<int>(family_match::OpenTypeWeight(fc) + 0.5f);
+            for (const Run& run : runs) {
+                if (ot >= run.lo && ot <= run.hi) {
+                    return &run;
+                }
+            }
+            return static_cast<const Run*>(nullptr);
+        };
+        const Run* here = at(v);
+        const Run* next = v < kMaxFcWeight ? at(v + 1) : nullptr;
+        if (here != nullptr && next == here) {
+            continue;
+        }
+        if (here != nullptr) {
+            char rule[832];
+            (void)std::snprintf(
+                rule, sizeof(rule),
+                "  <match target=\"pattern\">\n"
+                "    <test name=\"family\"><string>%s</string></test>\n"
+                "    <test name=\"weight\" compare=\"more_eq\"><int>%d</int></test>\n"
+                "    <test name=\"weight\" compare=\"less_eq\"><int>%d</int></test>\n"
+                "    <test name=\"slant\" compare=\"eq\"><int>%d</int></test>\n"
+                "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
+                "%s"
+                "  </match>\n",
+                family.c_str(), start, v, slant,
+                family_match::FontconfigWeightNear(here->weight),
+                slant != 0 && !here->italic
+                    ? "    <edit name=\"slant\" mode=\"assign\"><int>0</int></edit>\n"
+                    : "");
+            out += rule;
+        }
+        start = v + 1;
+    }
+    return out;
+}
 
 std::string WeightRules()
 {
@@ -392,125 +519,22 @@ std::string WeightRules()
     std::string out;
     unsigned ruled = 0;
     for (const std::string& family : families) {
-        // Only what the configuration offers. The names come from the machine,
-        // so the one character XML reserves is worth checking for rather than
-        // escaping.
+        // Only what the configuration offers. The names come from the host,
+        // so a name carrying the one character XML reserves is skipped.
         if (family.find('&') != std::string::npos || !ShipsWithWindows(family.c_str())) {
             continue;
         }
-        constexpr size_t kCount = sizeof(kCssWeights) / sizeof(kCssWeights[0]);
-        // What GetFirstMatchingFont answers for each weight, asked upright,
-        // italic and oblique. The three differ: Arial at 900 upright and 900
-        // italic are both Arial Black, 800 italic stays on Arial's own italic
-        // face while 800 upright goes to Arial Black, and an oblique request
-        // is answered by a simulated entry over the upright face even where a
-        // real italic exists.
-        int upright[kCount] = {};
-        int slanted[kCount] = {};
-        bool kept_slant[kCount] = {};
-        int obliqued[kCount] = {};
-        bool kept_oblique[kCount] = {};
-        bool varies = false;
-        bool has_italic = false;
-        for (size_t i = 0; i < kCount; ++i) {
-            upright[i] = dwrite_raster::FamilyMatchWeight(family.c_str(), kCssWeights[i]);
-            bool italic = false;
-            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], kStyleItalic,
-                                                &slanted[i], &italic)) {
-                slanted[i] = 0;
+        // Upright, italic and oblique each answer from their own faces, and
+        // an oblique request is answered by a simulated entry where an italic
+        // one keeps a real italic face.
+        for (const auto& [style, slant] : {std::pair{0, 0}, std::pair{kStyleItalic, 100},
+                                           std::pair{kStyleOblique, 110}}) {
+            if (std::string ranges = WeightRanges(family, style, slant); !ranges.empty()) {
+                out += ranges;
+                ++ruled;
+            } else {
+                Say("%s slant %d: no weight ranges", family.c_str(), slant);
             }
-            kept_slant[i] = italic;
-            bool oblique = false;
-            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], kStyleOblique,
-                                                &obliqued[i], &oblique)) {
-                obliqued[i] = 0;
-            }
-            kept_oblique[i] = oblique;
-            varies = varies || upright[i] != upright[0] || slanted[i] != slanted[0];
-            has_italic = has_italic || italic;
-        }
-        // Oblique, said for any family with an italic face; without the rule
-        // fontconfig answers a slant 110 request with that italic face, while
-        // the simulated entry GetFirstMatchingFont answers with sends
-        // SkFontMgr_win_dw.cpp's strip-and-retry loop to the upright face.
-        // Independent of `varies`, since it matters even where one weight
-        // answers everything.
-        for (size_t i = 0; i < kCount; ++i) {
-            if (!has_italic || obliqued[i] == 0 || kept_oblique[i]) {
-                continue;
-            }
-            const int from = family_match::FontconfigWeight(kCssWeights[i]);
-            const int to = family_match::FontconfigWeight(obliqued[i]);
-            if (from == 0 || to == 0) {
-                continue;
-            }
-            char rule[640];
-            (void)std::snprintf(
-                rule, sizeof(rule),
-                "  <match target=\"pattern\">\n"
-                "    <test name=\"family\"><string>%s</string></test>\n"
-                "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
-                "    <test name=\"slant\" compare=\"eq\"><int>110</int></test>\n"
-                "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
-                "    <edit name=\"slant\" mode=\"assign\"><int>0</int></edit>\n"
-                "  </match>\n",
-                family.c_str(), from, to);
-            out += rule;
-            ++ruled;
-        }
-        // One face answers every weight, so fontconfig reaches it whatever the
-        // request and there is nothing to say.
-        if (!varies) {
-            continue;
-        }
-        for (size_t i = 0; i < kCount; ++i) {
-            const int weight = kCssWeights[i];
-            const int from = family_match::FontconfigWeight(weight);
-            // Upright, which is what the rules said before the slant was asked
-            // about, now held to an upright request.
-            if (upright[i] != 0 && upright[i] != weight) {
-                const int to = family_match::FontconfigWeight(upright[i]);
-                if (to != 0 && from != to) {
-                    char rule[640];
-                    (void)std::snprintf(
-                        rule, sizeof(rule),
-                        "  <match target=\"pattern\">\n"
-                        "    <test name=\"family\"><string>%s</string></test>\n"
-                        "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
-                        "    <test name=\"slant\" compare=\"eq\"><int>0</int></test>\n"
-                        "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
-                        "  </match>\n",
-                        family.c_str(), from, to);
-                    out += rule;
-                    ++ruled;
-                }
-            }
-            // Italic. Only worth saying for a family that has an italic face;
-            // one without is answered upright at every weight and fontconfig
-            // reaches it anyway, and saying so would stop the oblique both
-            // sides simulate.
-            if (!has_italic || slanted[i] == 0) {
-                continue;
-            }
-            const int to = family_match::FontconfigWeight(slanted[i]);
-            if (to == 0 || (from == to && kept_slant[i])) {
-                continue;
-            }
-            char rule[768];
-            (void)std::snprintf(
-                rule, sizeof(rule),
-                "  <match target=\"pattern\">\n"
-                "    <test name=\"family\"><string>%s</string></test>\n"
-                "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
-                "    <test name=\"slant\" compare=\"eq\"><int>100</int></test>\n"
-                "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
-                "%s"
-                "  </match>\n",
-                family.c_str(), from, to,
-                kept_slant[i] ? ""
-                              : "    <edit name=\"slant\" mode=\"assign\"><int>0</int></edit>\n");
-            out += rule;
-            ++ruled;
         }
     }
     Say("%u weight rules over %zu families", ruled, families.size());

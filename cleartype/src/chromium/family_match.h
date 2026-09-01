@@ -45,6 +45,11 @@ float OpenTypeWeight(int fc_weight);
 // weight is not one the table names.
 int FontconfigWeight(int open_type);
 
+// The fontconfig weight for any OpenType weight, interpolating between the
+// pairs the exact map holds. map_ranges runs this direction too, so a request
+// at a weight no face carries still lands where fontconfig would put it.
+int FontconfigWeightNear(int open_type);
+
 // GetFirstMatchingFont's pick between two OpenType weights, for a request of
 // `wanted`. True when `candidate` is the one DirectWrite would answer with.
 // cleartype/src/chromium/bold_fallback.cpp asks the same question of a family

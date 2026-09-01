@@ -64,6 +64,7 @@
 #include "weight_style.h"
 #include "dwrite_raster.h"
 #include "render_params.h"
+#include "system_fonts.h"
 #include "parity_gate.h"
 #include "windows_path.h"
 
@@ -2145,6 +2146,28 @@ void ScanLoadedImages()
     ModuleList list;
     dl_iterate_phdr(CollectModule, &list);
 
+    // The system font keywords are resolved during style, which is this
+    // process. The code that answers them lives beside Fontations, which is
+    // the executable itself on a static build and a shared library on CEF.
+    {
+        const LoadedModule* carrying = nullptr;
+        const LoadedModule* executable = nullptr;
+        for (unsigned i = 0; i < list.count; ++i) {
+            const LoadedModule& m = list.mods[i];
+            if (m.name == nullptr || m.name[0] == '\0') {
+                executable = &m;
+            }
+            if (carrying == nullptr &&
+                CarriesAnchor(m.base, m.phdr, m.phnum, kFontationsAnchor)) {
+                carrying = &m;
+            }
+        }
+        if (const LoadedModule* m = carrying != nullptr ? carrying : executable;
+            m != nullptr) {
+            system_fonts::ApplyToImage(m->base, m->phdr, m->phnum);
+        }
+    }
+
     // Out of the callback, since dl_iterate_phdr holds the loader's list lock
     // and the open()/mmap() below must not run under it.
     //
@@ -2450,13 +2473,48 @@ void HoldTypeface(void* typeface)
     }
 }
 
+// Distinguishes candidate copies cheaply; equality is decided by comparing
+// the bytes, so a collision here costs one compare and nothing else.
+uint64_t QuickHash(const std::vector<uint8_t>& bytes)
+{
+    uint64_t h = 1469598103934665603ull ^ bytes.size();
+    const size_t head = std::min<size_t>(bytes.size(), 4096);
+    for (size_t i = 0; i < head; ++i) {
+        h = (h ^ bytes[i]) * 1099511628211ull;
+    }
+    for (size_t i = 4096; i + 8 <= bytes.size(); i += 4096) {
+        uint64_t word = 0;
+        std::memcpy(&word, bytes.data() + i, sizeof(word));
+        h = (h ^ word) * 1099511628211ull;
+    }
+    return h;
+}
+
+// One byte vector per distinct file content. Typefaces churn with Blink's
+// font cache while the files behind them repeat, so a copy per typeface
+// grows without bound over a long session. The vectors are never freed,
+// which is what keeps the pointers ChromiumFontBytes hands out valid, and
+// what makes a vector's address identify its content for every cache
+// downstream.
+FontBytes SharedByContentLocked(std::vector<uint8_t>&& raw)
+{
+    static std::unordered_map<uint64_t, std::vector<FontBytes>> by_content;
+    auto& bucket = by_content[QuickHash(raw)];
+    for (const FontBytes& have : bucket) {
+        if (*have == raw) {
+            return have;
+        }
+    }
+    bucket.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(raw)));
+    return bucket.back();
+}
+
 FontBytes FontBytesLocked(void* typeface)
 {
     auto font = g_fonts.find(typeface);
     if (font == g_fonts.end()) {
         HoldTypeface(typeface);
-        auto bytes = std::make_shared<std::vector<uint8_t>>(
-            typeface_bridge::ReadFontFile(typeface));
+        FontBytes bytes = SharedByContentLocked(typeface_bridge::ReadFontFile(typeface));
         if (bytes->empty()) {
             Report("typeface %p: no font (its onGetTableTags/onGetTableData could not be "
                    "identified, or the tables would not read)", typeface);

@@ -283,4 +283,149 @@ chromium_path_thunk:
     .cfi_endproc
 .size chromium_path_thunk, . - chromium_path_thunk
 
+// The family answer is spliced into the middle of ConvertFontFamily, where
+// the compiler had straight-line code and therefore kept values in registers
+// a call is free to destroy. Everything the SysV ABI lets a callee clobber is
+// saved here, so the code after the splice finds its registers as it left
+// them; only rax changes, which is where the answer goes.
+//
+// The keyword arrives in r11d, chosen because the splice has to load it
+// before the call and rdi is still live at that point.
+//
+// Entry RSP is 16n at the splice, so the call that reaches this leaves 16n+8.
+// The eight pushes keep that parity and the pad restores alignment for the
+// handler call.
+
+.globl chromium_system_family_thunk
+.hidden chromium_system_family_thunk
+.type chromium_system_family_thunk, @function
+chromium_system_family_thunk:
+    .cfi_startproc
+    push %rdi
+    .cfi_adjust_cfa_offset 8
+    push %rsi
+    .cfi_adjust_cfa_offset 8
+    push %rcx
+    .cfi_adjust_cfa_offset 8
+    push %rdx
+    .cfi_adjust_cfa_offset 8
+    push %r8
+    .cfi_adjust_cfa_offset 8
+    push %r9
+    .cfi_adjust_cfa_offset 8
+    push %r10
+    .cfi_adjust_cfa_offset 8
+    push %r11
+    .cfi_adjust_cfa_offset 8
+    // The vector registers are caller-saved too, and the code around the
+    // splice zeroes and stores through them.
+    sub $168, %rsp
+    .cfi_adjust_cfa_offset 168
+    movups %xmm0, 0(%rsp)
+    movups %xmm1, 16(%rsp)
+    movups %xmm2, 32(%rsp)
+    movups %xmm3, 48(%rsp)
+    movups %xmm4, 64(%rsp)
+    movups %xmm5, 80(%rsp)
+    movups %xmm6, 96(%rsp)
+    movups %xmm7, 112(%rsp)
+    mov %r11d, %edi
+    call DwcSystemFamilyString@PLT
+    movups 0(%rsp), %xmm0
+    movups 16(%rsp), %xmm1
+    movups 32(%rsp), %xmm2
+    movups 48(%rsp), %xmm3
+    movups 64(%rsp), %xmm4
+    movups 80(%rsp), %xmm5
+    movups 96(%rsp), %xmm6
+    movups 112(%rsp), %xmm7
+    add $168, %rsp
+    .cfi_adjust_cfa_offset -168
+    pop %r11
+    .cfi_adjust_cfa_offset -8
+    pop %r10
+    .cfi_adjust_cfa_offset -8
+    pop %r9
+    .cfi_adjust_cfa_offset -8
+    pop %r8
+    .cfi_adjust_cfa_offset -8
+    pop %rdx
+    .cfi_adjust_cfa_offset -8
+    pop %rcx
+    .cfi_adjust_cfa_offset -8
+    pop %rsi
+    .cfi_adjust_cfa_offset -8
+    pop %rdi
+    .cfi_adjust_cfa_offset -8
+    ret
+    .cfi_endproc
+.size chromium_system_family_thunk, .-chromium_system_family_thunk
+
+
+
+// The size answer is spliced the same way, but into code that was about to
+// call DefaultFontSize, so the value and the document are already in rdi and
+// rsi and xmm0 carries the result out. xmm0 is therefore the one register not
+// put back.
+.text
+.globl chromium_system_size_thunk
+.hidden chromium_system_size_thunk
+.type chromium_system_size_thunk, @function
+chromium_system_size_thunk:
+    .cfi_startproc
+    push %rdi
+    .cfi_adjust_cfa_offset 8
+    push %rsi
+    .cfi_adjust_cfa_offset 8
+    push %rcx
+    .cfi_adjust_cfa_offset 8
+    push %rdx
+    .cfi_adjust_cfa_offset 8
+    push %r8
+    .cfi_adjust_cfa_offset 8
+    push %r9
+    .cfi_adjust_cfa_offset 8
+    push %r10
+    .cfi_adjust_cfa_offset 8
+    push %r11
+    .cfi_adjust_cfa_offset 8
+    sub $120, %rsp
+    .cfi_adjust_cfa_offset 120
+    movups %xmm1, 0(%rsp)
+    movups %xmm2, 16(%rsp)
+    movups %xmm3, 32(%rsp)
+    movups %xmm4, 48(%rsp)
+    movups %xmm5, 64(%rsp)
+    movups %xmm6, 80(%rsp)
+    movups %xmm7, 96(%rsp)
+    call DwcSystemFontSize@PLT
+    movups 0(%rsp), %xmm1
+    movups 16(%rsp), %xmm2
+    movups 32(%rsp), %xmm3
+    movups 48(%rsp), %xmm4
+    movups 64(%rsp), %xmm5
+    movups 80(%rsp), %xmm6
+    movups 96(%rsp), %xmm7
+    add $120, %rsp
+    .cfi_adjust_cfa_offset -120
+    pop %r11
+    .cfi_adjust_cfa_offset -8
+    pop %r10
+    .cfi_adjust_cfa_offset -8
+    pop %r9
+    .cfi_adjust_cfa_offset -8
+    pop %r8
+    .cfi_adjust_cfa_offset -8
+    pop %rdx
+    .cfi_adjust_cfa_offset -8
+    pop %rcx
+    .cfi_adjust_cfa_offset -8
+    pop %rsi
+    .cfi_adjust_cfa_offset -8
+    pop %rdi
+    .cfi_adjust_cfa_offset -8
+    ret
+    .cfi_endproc
+.size chromium_system_size_thunk, .-chromium_system_size_thunk
+
 .section .note.GNU-stack,"",@progbits

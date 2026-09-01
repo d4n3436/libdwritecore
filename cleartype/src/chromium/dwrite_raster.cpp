@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -194,10 +195,15 @@ bool EnsureFactory()
 }
 
 // What identifies one font face: the bytes it was built from, which face of a
-// collection it is, and which simulations DirectWrite is applying to it.
+// collection it is, the design-space position it is instantiated at, and
+// which simulations DirectWrite is applying to it. Every caller's bytes live
+// in a cache that keeps one immortal vector per file, so the vector's address
+// stands for its content, and typefaces that churn over the same file share
+// one face instead of each pinning a copy inside DirectWrite.
 struct FaceKey
 {
-    const void* typeface;
+    const void* bytes;
+    uint64_t coords;
     uint32_t face_index;
     bool simulate_bold;
     bool simulate_oblique;
@@ -209,12 +215,33 @@ struct KeyHash
 {
     size_t operator()(const FaceKey& k) const
     {
-        return std::hash<const void*>{}(k.typeface) ^
+        return std::hash<const void*>{}(k.bytes) ^
+               std::hash<uint64_t>{}(k.coords) ^
                (std::hash<uint32_t>{}(k.face_index) << 1) ^
                (static_cast<size_t>(k.simulate_bold) << 2) ^
                (static_cast<size_t>(k.simulate_oblique) << 3);
     }
 };
+
+// The design-space position a face would be built at, folded to a key
+// component. Zero when the typeface carries no coordinates, which is every
+// non-variable font.
+uint64_t CoordsHashFor(const void* typeface)
+{
+    const std::vector<VariationCoord>* coords = ChromiumVariationCoords(typeface);
+    if (coords == nullptr || coords->empty()) {
+        return 0;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (const VariationCoord& c : *coords) {
+        uint64_t word = c.axis;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &c.value, sizeof(bits));
+        word = word << 32 | bits;
+        h = (h ^ word) * 1099511628211ull;
+    }
+    return h != 0 ? h : 1;
+}
 
 // The face at the typeface's own design-space position. A variable font's
 // clone carries its coordinates on the SkTypeface, not in the tables, so a
@@ -281,7 +308,8 @@ FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
     // other face of a collection, whose bytes are the whole file and therefore
     // the same for all of them.
     static std::unordered_map<FaceKey, std::unique_ptr<FaceSlot>, KeyHash> faces;
-    const FaceKey key{typeface, face_index, simulate_bold, simulate_oblique};
+    const FaceKey key{bytes.data(), CoordsHashFor(typeface), face_index, simulate_bold,
+                      simulate_oblique};
     const std::lock_guard lock(g_faces_mutex);
     if (!EnsureFactory()) {
         return nullptr;

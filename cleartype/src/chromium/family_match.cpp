@@ -196,6 +196,25 @@ int FontconfigWeight(const int open_type)
     return 0;
 }
 
+int FontconfigWeightNear(const int open_type)
+{
+    const auto value = static_cast<float>(open_type);
+    if (value <= kWeights[0].open_type) {
+        return static_cast<int>(kWeights[0].fc);
+    }
+    constexpr int last = static_cast<int>(sizeof(kWeights) / sizeof(kWeights[0])) - 1;
+    for (int i = 0; i < last; ++i) {
+        if (value <= kWeights[i + 1].open_type) {
+            const WeightPair& lo = kWeights[i];
+            const WeightPair& hi = kWeights[i + 1];
+            const float fc = lo.fc + (value - lo.open_type) * (hi.fc - lo.fc) /
+                                         (hi.open_type - lo.open_type);
+            return static_cast<int>(fc + 0.5f);
+        }
+    }
+    return static_cast<int>(kWeights[last].fc);
+}
+
 bool BeatsForWindows(const float candidate, const float best, const float wanted)
 {
     return BeatsImpl(candidate, best, wanted);
