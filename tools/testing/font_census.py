@@ -99,7 +99,10 @@ FAMILIES = [
     "SimSun", "NSimSun", "Microsoft JhengHei", "MingLiU", "Leelawadee UI",
     "Segoe UI Emoji", "Segoe UI Symbol", "Cambria Math",
 ]
-ALL_WEIGHTS = [100, 200, 300, 400, 500, 600, 700, 800, 900]
+# 1000 is the top of the CSS scale and takes its own path: DirectWrite answers
+# it with the heaviest face, and slanted requests there land on simulated
+# entries that Skia strips back to upright.
+ALL_WEIGHTS = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 
 # The Latin families whose kerning the shape mode sweeps pair by pair.
 KERNED = ["Arial", "Times New Roman", "Segoe UI", "Calibri", "Georgia",
@@ -116,9 +119,10 @@ METRIC_SIZES = [11, 12, 12.5, 13, 13.28, 13.33, 14.4, 16, 16.6, 17.28,
                 # regime nothing below the threshold exercises.
                 200, 260, 400]
 
-# The weights a family is actually asked for on a page, plus the two that
-# Windows maps differently inside a family.
-METRIC_WEIGHTS = [300, 400, 500, 600, 700]
+# The weights a family is actually asked for on a page, plus the ones that
+# Windows maps differently inside a family. 900 and 1000 reach the heaviest
+# face and the synthetic-bold decision over it.
+METRIC_WEIGHTS = [300, 400, 500, 600, 700, 900, 1000]
 
 # Whether the face is asked for upright or slanted. A family with no italic
 # face gets a synthetic oblique, and which faces exist differs by family, so
@@ -286,15 +290,35 @@ class CdpSide:
         self.browser.script(BUILD, [json.dumps(spec)])
 
     def fonts_of(self, count):
-        """The faces behind elements c0..c<count-1>, canonically named."""
+        """The faces behind elements c0..c<count-1>, canonically named.
+
+        A node id goes stale when the document changes between the query and
+        the per-node reads, and the walk is only consistent against one
+        document, so a stale id restarts the whole walk.
+        """
+        for attempt in range(3):
+            try:
+                return self._fonts_walk(count)
+            except RuntimeError as e:
+                if "Could not find node" not in str(e) or attempt == 2:
+                    raise
+                time.sleep(0.5)
+        return None
+
+    def _fonts_walk(self, count):
         doc = self.browser.call("DOM.getDocument", {"depth": -1})
         root = doc["root"]["nodeId"]
+        # One querySelectorAll instead of a querySelector per cell. The nodes
+        # come back in document order, which is the order build() wrote them.
+        nodes = self.browser.call("DOM.querySelectorAll",
+                                  {"nodeId": root, "selector": "[id^=c]"})
+        ids = nodes["nodeIds"]
+        if len(ids) != count:
+            sys.exit("expected %d cells, the document has %d" % (count, len(ids)))
         out = []
         for i in range(count):
-            node = self.browser.call("DOM.querySelector",
-                                     {"nodeId": root, "selector": "#c%d" % i})
             fonts = self.browser.call("CSS.getPlatformFontsForNode",
-                                      {"nodeId": node["nodeId"]})
+                                      {"nodeId": ids[i]})
             out.append(tuple(sorted(
                 (CANONICAL.get(f["familyName"].lower(), f["familyName"]),
                  f["glyphCount"]) for f in fonts["fonts"])))
@@ -302,6 +326,9 @@ class CdpSide:
 
     def evaluate(self, body, args=()):
         return self.browser.script(body, args)
+
+    def evaluate_async(self, body):
+        return self.browser.script_async(body)
 
     def settle(self):
         self.browser.script_async(PAINTED)
@@ -349,6 +376,9 @@ class MarionetteSide:
     def evaluate(self, body, args=()):
         return self.m.script(body, list(args))
 
+    def evaluate_async(self, body):
+        return self.m.script_async(body)
+
     def settle(self):
         self.m.script_async(PAINTED)
 
@@ -377,14 +407,16 @@ def open_side(endpoint):
 
 def run_cells(sides, cells):
     """One element per cell on each side, and the faces each side used."""
-    answers = []
-    for side in sides:
-        spec = [("c%d" % i,) + tuple(c[1:]) for i, c in enumerate(cells)]
+    spec = [("c%d" % i,) + tuple(c[1:]) for i, c in enumerate(cells)]
+
+    def one(side):
         side.build(spec)
         # The face a node was drawn with is only reported once it has been
         # drawn; asking earlier answers with no faces at all.
         side.settle()
-        answers.append(side.fonts_of(len(cells)))
+        return side.fonts_of(len(cells))
+
+    answers = list(both_sides(one, sides))
     out = {}
     for i, cell in enumerate(cells):
         if answers[0][i] != answers[1][i]:
@@ -407,7 +439,10 @@ def mode_families(sides, full):
     cells = []
     for fam in FAMILIES:
         for weight in ALL_WEIGHTS:
-            for slant in ("normal", "italic"):
+            # An oblique angle past 20deg is a distinct slant to the matcher:
+            # italic keeps a real italic face where oblique goes to a
+            # simulated entry over the upright one.
+            for slant in ("normal", "italic", "oblique 45deg"):
                 key = "%s|%d|%s" % (fam, weight, slant)
                 cells.append((key, '"%s"' % fam, "", weight, slant, "Wiki 09"))
     return run_cells(sides, cells), len(cells)
@@ -497,6 +532,15 @@ def face_names(answer):
 # over a 143,177 codepoint config, 500 costs 17.1s on Linux and 22.9s on the
 # guest, and 4000 costs 11.2s and 13.4s. It flattens past 4000.
 kNamesPerBuild = 4000
+
+# Configs per metrics evaluate. Each one is about 95 measureText
+# calls, so this is roughly 48000 per round trip.
+kConfigsPerBatch = 500
+
+# The worker path is threads deep, so a batch can be larger; and
+# the sample that has to agree before it is used at all.
+kConfigsPerWorkerBatch = 4000
+kWorkerProbe = 40
 
 
 def both_sides(work, sides, *args):
@@ -617,6 +661,93 @@ return JSON.stringify(out);
 
 ASCII = "".join(chr(c) for c in range(0x21, 0x7F))
 
+# measureText is nearly the whole cost of a metrics pass, and it runs inside
+# the page, so threads are the lever: a renderer measures on one thread per
+# worker. Past four the curve flattens, since configs are family-major and
+# threads start sharing a face. DWC_METRIC_WORKERS=0 measures on the main
+# thread.
+kMetricWorkers = int(os.environ.get("DWC_METRIC_WORKERS", "4"))
+
+# The same measurement as MEASURE, against an OffscreenCanvas because a worker
+# has no document. Kept beside it: a divergence between the two would be
+# reported as a divergence between the two browsers, so they must stay the
+# same measurement.
+MEASURE_WORKER = """
+self.onmessage = (e) => {
+  const [configs, text] = e.data;
+  const ctx = new OffscreenCanvas(8, 8).getContext('2d');
+  const canary = '13px monospace';
+  const out = [];
+  for (const [fam, size, weight, style] of configs) {
+    ctx.font = canary;
+    ctx.font = style + ' ' + weight + ' ' + size + 'px ' + fam;
+    const row = [ctx.font === canary ? 0 : 1];
+    const box = ctx.measureText(text);
+    row.push(box.fontBoundingBoxAscent, box.fontBoundingBoxDescent,
+             box.actualBoundingBoxAscent, box.actualBoundingBoxDescent,
+             box.actualBoundingBoxLeft, box.actualBoundingBoxRight, box.width);
+    for (const ch of text) row.push(ctx.measureText(ch).width);
+    out.push(row);
+  }
+  self.postMessage(out);
+};
+"""
+
+# The payload is inlined rather than passed, since an async script gets its
+# arguments taken by the completion callback on both drivers.
+MEASURE_FANOUT = """
+const done = arguments[arguments.length - 1];
+const [configs, text, nWorkers, src] = JSON.parse(__PAYLOAD__);
+let url;
+try {
+  url = URL.createObjectURL(new Blob([src], {type: 'text/javascript'}));
+} catch (err) { done(JSON.stringify([false, String(err)])); }
+const share = Math.ceil(configs.length / nWorkers);
+const parts = [];
+for (let i = 0; i < nWorkers; i++) {
+  const part = configs.slice(i * share, (i + 1) * share);
+  if (part.length) parts.push(part);
+}
+Promise.all(parts.map(part => new Promise((res, rej) => {
+  const w = new Worker(url);
+  w.onmessage = (e) => { w.terminate(); res(e.data); };
+  w.onerror = (e) => { w.terminate(); rej(new Error(e.message || 'worker failed')); };
+  w.postMessage([part, text]);
+}))).then(chunks => {
+  const out = [];
+  for (const c of chunks) for (const r of c) out.push(r);
+  URL.revokeObjectURL(url);
+  done(JSON.stringify([true, out]));
+}).catch(err => done(JSON.stringify([false, String(err)])));
+"""
+
+
+def measure_main(side, batch):
+    return json.loads(side.evaluate(MEASURE, [json.dumps([batch, ASCII])]))
+
+
+def measure_workers(side, batch):
+    """The same rows, measured across kMetricWorkers threads. None on refusal."""
+    payload = json.dumps([batch, ASCII, kMetricWorkers, MEASURE_WORKER])
+    ok, got = json.loads(side.evaluate_async(
+        MEASURE_FANOUT.replace("__PAYLOAD__", json.dumps(payload))))
+    return got if ok else None
+
+
+def workers_agree(side, batch):
+    """Whether this browser's workers measure what its main thread measures.
+
+    A worker that resolved a family differently, or a blob: worker a policy
+    refused, would be reported as a divergence between the two browsers. The
+    fast path is only taken where a sample proves it is the same measurement.
+    """
+    try:
+        got = measure_workers(side, batch)
+    except Exception:                                # noqa: BLE001
+        return False
+    return got is not None and got == measure_main(side, batch)
+
+
 
 def mode_metrics(sides, full):
     configs = shard([['"%s"' % fam, size, weight, style]
@@ -624,10 +755,26 @@ def mode_metrics(sides, full):
                      for weight in METRIC_WEIGHTS for style in METRIC_STYLES])
     if not configs:
         sys.exit("no families left to measure; check --family")
-    rows = []
-    for side in sides:
-        rows.append(json.loads(side.evaluate(
-            MEASURE, [json.dumps([configs, ASCII])])))
+    # In batches, because one evaluate over every config is a single
+    # synchronous script: 7540 configs is about 716000 measureText calls, which
+    # outruns the socket timeout and leaves the renderer still running it, so
+    # the browser is wedged for every run after. A batch also gives the run
+    # something to print.
+    def measure(side):
+        fast = (kMetricWorkers >= 2 and
+                workers_agree(side, configs[:kWorkerProbe]))
+        if kMetricWorkers >= 2 and not fast:
+            print("  %s: workers declined, measuring on the main thread"
+                  % side.name, file=sys.stderr)
+        got = []
+        step = kConfigsPerWorkerBatch if fast else kConfigsPerBatch
+        for at in range(0, len(configs), step):
+            batch = configs[at:at + step]
+            rows = measure_workers(side, batch) if fast else None
+            got.extend(rows if rows is not None else measure_main(side, batch))
+        return got
+
+    rows = list(both_sides(measure, sides))
     labels = ["applied", "boxAscent", "boxDescent", "inkAscent", "inkDescent",
               "inkLeft", "inkRight", "width"] + list(ASCII)
     out = {}
@@ -693,9 +840,8 @@ def mode_shape(sides, full):
     # Canvas ignores the element language, so what lang would pick is pinned
     # by naming the family outright above.
     payload = json.dumps([[fam, text] for _, fam, text in seqs])
-    widths = []
-    for side in sides:
-        widths.append(json.loads(side.evaluate(SHAPE, [payload])))
+    widths = list(both_sides(
+        lambda side: json.loads(side.evaluate(SHAPE, [payload])), sides))
     out = {}
     for i, (lang, fam, text) in enumerate(seqs):
         if abs(widths[0][i] - widths[1][i]) > 0.01:
@@ -735,10 +881,16 @@ def mode_raster(sides, full):
     from PIL import Image
 
     cps = renderable(0x30000) if full else renderable(0x10000)[::16]
+    # The quick run keeps to the no-language set. A --lang or --full run
+    # takes the per-language rows through keep_lang, the same way fallback
+    # does, so a per-language census rasterizes the language it names.
     configs = [("", "sans-serif", 16)]
+    if full or kOnlyLangs is not None:
+        configs += [(lang, "sans-serif", 16) for lang in
+                    ("ja", "zh-CN", "zh-TW", "ko", "ar", "th", "hi")]
     if full:
-        configs += [("ja", "sans-serif", 16), ("zh-CN", "sans-serif", 16),
-                    ("", "serif", 16), ("", "monospace", 16)]
+        configs += [("", "serif", 16), ("", "monospace", 16)]
+    configs = [row for row in configs if keep_lang(row[0])]
     cols, cell_w, cell_h = 40, 44, 36
     rows_per_page = 1080 // cell_h
     per_page = cols * rows_per_page
@@ -748,15 +900,15 @@ def mode_raster(sides, full):
     for lang, generic, size in configs:
         for start in range(0, len(cps), per_page):
             chunk = cps[start:start + per_page]
-            grids = []
-            for side in sides:
-                side.evaluate(GRID, [json.dumps(
-                    [[chr(cp) for cp in chunk], lang, generic, size])])
+            drawn = json.dumps([[chr(cp) for cp in chunk], lang, generic, size])
+
+            def paint(side):
+                side.evaluate(GRID, [drawn])
                 side.settle()
-                png = side.shot()
-                grids.append(np.asarray(
-                    Image.open(io.BytesIO(png)).convert("RGB")).astype(np.int16))
-            a, b = grids
+                return np.asarray(Image.open(io.BytesIO(side.shot()))
+                                  .convert("RGB")).astype(np.int16)
+
+            a, b = both_sides(paint, sides)
             if a.shape != b.shape:
                 out["page@%d|%s|%s" % (start, lang or "-", generic)] = \
                     ("shape %s" % (a.shape,), "shape %s" % (b.shape,))

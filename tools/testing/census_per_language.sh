@@ -22,7 +22,7 @@
 set -u
 
 RESTART=""; RESTART_B=""; SIDE_A=""; SIDE_B=""
-MODE=fallback; OUT=""; ACCEPT=""
+MODE=fallback; OUT=""; ACCEPT=""; VIEWPORT=""
 LANGS="- ja zh-CN zh-TW ko ar th hi"
 
 while [ $# -gt 0 ]; do
@@ -35,6 +35,9 @@ while [ $# -gt 0 ]; do
         --out)        OUT="$2"; shift 2 ;;
         --langs)      LANGS="$2"; shift 2 ;;
         --accept)     ACCEPT="$ACCEPT $2"; shift 2 ;;
+        # Raster compares screenshots, so sides whose windows differ in size
+        # need the layout viewport pinned; see font_census.py --viewport.
+        --viewport)   VIEWPORT="$2"; shift 2 ;;
         *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -77,6 +80,7 @@ for lang in $LANGS; do
 
     set -- "$MODE" "$SIDE_A" "$SIDE_B" --lang "$lang"
     for file in $ACCEPT; do set -- "$@" --accept "$file"; done
+    [ -n "$VIEWPORT" ] && set -- "$@" --viewport "$VIEWPORT"
     out=$(timeout 900 python3 "$HERE/font_census.py" "$@" 2>&1)
     [ -n "$OUT" ] && printf '%s\n' "$out" > "$OUT/$MODE-$lang.txt"
 

@@ -8,23 +8,14 @@ alongside `paths.py` and the one the build itself calls (`make_impl.py`).
 | Tool                                     | What it answers                                                                                                                                                                    | Needs                                                     |
 |------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
 | `verify_vtable.py`                       | Does the factory vtable in the binary match the headers? Reads the real vtable, which `vtable_test.cpp` cannot.                                                                    | Nothing                                                   |
-| `vmetrics.py`                            | What do a font's own vertical metric tables say: `hhea`, OS/2 `sTypo`, `usWin`, and the `USE_TYPO_METRICS` bit?                                                                    | FreeType                                                  |
-| `glyph_digest.c` + `run_glyph_digest.sh` | Which glyph, at which size and subpixel phase, rasterizes differently with and without the shim, or between two builds of it?                                                      | FreeType, a C compiler                                    |
 | `save_page.py`                           | Turns a live URL into a directory that renders the same twice, offline.                                                                                                            | beautifulsoup4                                            |
 | `gen_stress_page.py`                     | Emits a text rendering stress page: background x text color x font x size x weight and slant x script, every cell labeled.                                                         | Nothing                                                   |
 | `capture_viewport.py` + `.sh`            | Puts one browser at an exact inner size, scroll offset and marked viewport origin, and photographs it.                                                                             | Firefox with Marionette; ImageMagick or libvirt           |
 | `compare_viewport.py`                    | How far apart are two of those captures? Crops both to the marker and diffs.                                                                                                       | Pillow, NumPy                                             |
 | `compare_pages.sh`                       | Runs a whole page set past both browsers and tabulates it, a percentage and a worst-channel figure per cell.                                                                       | both browsers, plus what `capture_viewport.sh` needs      |
-| `score_blend.py`                         | The same, for one pair of screenshots on one line, so a parameter can be swept.                                                                                                    | Pillow, NumPy                                             |
-| `tune_blend.sh`                          | Which WebRender blend values match Windows? Renders the reference page once per candidate and scores each.                                                                         | Xvfb, Firefox, ImageMagick                                |
+| `charpos.py`                            | Are the glyphs in the same places? Per-character Range rects from both browsers, diffed, which separates advances and metrics from rasterization.                                  | both browsers                                             |
 | `run_parity_firefox.sh`                  | Starts a browser with the parity fontconfig and the parity prefs, locally under Xvfb or in a guest. `--no-shim` and `--no-prefs` give the control runs.                            | Xvfb, Firefox, python-xlib; libvirt for the guest half    |
-| `linebox_sweep.py`                       | What line box and baseline does Firefox compute, per family and size? `--advances` gives cumulative width per character, so diffing two names the glyph whose advance diverged.    | Firefox with Marionette                                   |
-| `font_metrics.py`                        | What does the layout engine believe a font's metrics are? Canvas `TextMetrics` mapped back to `gfxFont::Metrics` — the only view onto `SanitizeMetrics`' underline-offset rewrite. | Marionette                                                |
-| `used_fonts.py`                          | Which font faces actually drew each text node? Separates *different font* from *same font, different pixels*; only the second is anything the shim can touch.                      | Firefox with Marionette and `-remote-allow-system-access` |
-| `system_fonts.py`                        | What did this browser resolve the ten CSS system fonts to: family, size, weight? `--against` prints only what two browsers disagree about.                                         | Firefox with Marionette                                   |
 | `readprefs_marionette.py`                | What are a running Firefox's *effective* pref values? StaticPrefs are compiled into libxul and appear in no text file.                                                             | Firefox with Marionette                                   |
-| `gen_webfont_stress.py`                  | Synthesizes N distinct web fonts across M pages, rewriting the name table so a sanitizer cannot collapse them into one.                                                            | `fonttools`                                               |
-| `stress_webfonts.py`                     | Drives a browser through those pages and reads the shim's census, to see whether what it keeps converges or grows.                                                                 | Marionette                                                |
 | `stress_leaks.sh` + `stress_leaks_ft.c`  | Every FreeType-side stress mode under valgrind at two scales; the scale comparison separates a leak from a cache.                                                                  | valgrind                                                  |
 | `minwm.py`                               | Makes a bare X server usable for capture: maps windows and grants resize requests.                                                                                                 | Xvfb, python-xlib                                         |
 | `vmexec.py`                              | Runs a command inside a libvirt guest through the QEMU guest agent.                                                                                                                | libvirt, a guest with qemu-guest-agent                    |
@@ -71,15 +62,14 @@ Four things have to be true before the numbers mean anything:
   unset and `GDK_BACKEND=x11`, or a browser started from inside a Wayland
   session connects to that session instead of the X display being photographed.
 
-## Narrowing a difference down to one line box
+## Narrowing a difference down to one character
 
 A page comparison that comes back bad is usually not bad everywhere. Work down:
 
     compare_viewport.py ... --bands 24        # is this a layout offset or pixels?
     compare_viewport.py ... --rows 0,820      # judge the part above an offset
-    linebox_sweep.py <host> <port> --families "A,B" --sizes 8-32 > side.json
-    linebox_sweep.py --compare a.json b.json -v
-    linebox_sweep.py <host> <port> --probe <url> <scrollY> x,y --depth 5 --children
+    charpos.py <sideA> <sideB> --page <path> --prefixes <urlA> <urlB>
+    charpos.py <sideA> <sideB> --family F --size N --style S --weight W
 
 `--bands` reports, per horizontal band, the vertical shift that aligns it best.
 A band whose best shift is zero disagrees about pixels; one that jumps to 100%
@@ -88,33 +78,11 @@ where the best shift changes is the only place worth looking. `--rows` then
 measures the part above it, which is the part where rasterization can still be
 judged.
 
-`--probe` says what is at a viewport point on each machine: the element, its
-font, its line-height and its rect. `--depth` walks up the ancestors, because a
-height that disagrees is contributed by one box and inherited by every box
-above it. `--children` lists the last element's children with their rects and
-its own padding and margins, which separates "a child is taller" from "the
-parent's own box is taller".
+`charpos.py` reads every character's Range rect on both sides and diffs them,
+which separates metrics from raster in one shot: characters that differ moved,
+and a page whose characters all agree diverges in rasterization alone. The
+second form styles one probe string instead of loading a page, which answers a
+single family, weight and slant combination directly.
 
-One check to run before blaming the shim: repeat the probe with `LD_PRELOAD`
-unset. If the number is the same without it, the difference is not the shim's.
-
-## Narrowing a difference down to one glyph
-
-A whole-page number says how much disagrees, never what. `run_glyph_digest.sh`
-answers the second question without a browser or a second machine: it renders a
-string at a list of sizes and all four subpixel phases, hashes every bitmap, and
-diffs the run with the shim against the run without it. Every line that changed
-names the glyph, the size and the phase.
-
-    tools/testing/run_glyph_digest.sh                        # fontconfig picks the font
-    SIZES="13 13.33 14" tools/testing/run_glyph_digest.sh /path/to/font.ttf
-    SHIM=/other/build/libcleartype.so tools/testing/run_glyph_digest.sh
-
-The last form is the regression check: an empty diff means a change to the shim
-left every path it was not meant to touch alone.
-
-A difference that survives that is not the rasterizer's: this build and the
-Windows `DWriteCore.dll` produce the same texture bytes, sheared runs included.
-What is left between two screenshots is the gamma-correct, contrast-enhanced
-blend the compositor applies, which `tune_blend.sh` and `score_blend.py` are
-for.
+One check to run before blaming the shim: repeat with `LD_PRELOAD` unset. If
+the number is the same without it, the difference is not the shim's.

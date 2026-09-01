@@ -118,7 +118,9 @@ const decoded = Array.from(document.images)
 // document.images, so there is nothing to await for it. Its first painted
 // frame can land after a two-frame settle, which reads as a blank patch on
 // whichever side is busier. Frames are counted until three in a row arrive
-// less than 12 ms apart, which is the compositor having caught up.
+// within a vsync interval of each other, which is the compositor having
+// caught up. A 60 Hz tick is 16.7 ms, so the bound has to sit above that; a
+// side still rastering skips frames and shows 33 ms and up.
 //
 // The deadline is measured from the moment this starts. A frame timestamp is
 // never ahead of performance.now(), so comparing the two against each other
@@ -131,7 +133,7 @@ Promise.all(decoded).then(() => {
   let settled = false;
   const finish = () => { if (!settled) { settled = true; done(1); } };
   const tick = (now) => {
-    quiet = (now - last) < 12 ? quiet + 1 : 0;
+    quiet = (now - last) < 22 ? quiet + 1 : 0;
     last = now;
     if (quiet >= 3 || performance.now() - start > 400) { finish(); return; }
     requestAnimationFrame(tick);
@@ -475,6 +477,7 @@ def converge_inner_size(browser, want_w, want_h, deadline):
     end = time.time() + deadline
     agreed = 0
     forced = False
+    misses = 0
     while agreed < 4:
         iw, ih, ow, oh = browser.script(INNER)
         if (iw, ih) == (want_w, want_h):
@@ -484,6 +487,19 @@ def converge_inner_size(browser, want_w, want_h, deadline):
         if time.time() > end:
             sys.exit("window never held %dx%d inner (last %dx%d)"
                      % (want_w, want_h, iw, ih))
+        # A resize call that is accepted but never lands, which is what a
+        # window without a cooperating manager does, forces the layout
+        # viewport the same way a refused one does.
+        misses += 1
+        if misses > 6 and not forced and hasattr(browser, "call"):
+            browser.call("Emulation.setDeviceMetricsOverride",
+                         {"width": want_w, "height": want_h,
+                          "deviceScaleFactor": 1, "mobile": False})
+            forced = True
+            continue
+        if forced:
+            time.sleep(POLL)
+            continue
         if browser.set_window_rect(want_w + max(ow - iw, 0),
                                    want_h + max(oh - ih, 0)) is False:
             # An app that sizes its own window answers False. Electron's does
@@ -597,14 +613,28 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
     # sits, and whatever is under it renders hovered until the pointer is
     # moved again, so the park is per page.
     park_pointer(browser)
-    browser.script_async(PAINTED)
+    # The frame heuristics above cannot prove that everything painted: a
+    # background image decodes with nothing to await and its first frame can
+    # land after any fixed number of quiet ones. Two consecutive captures
+    # with the same bytes can. The wait between tries is the paint settle
+    # itself, and a page that never stabilizes keeps its newest frame once
+    # the window closes, which is what a single capture did anyway.
     # optimizeForSpeed trades PNG size for encode time. Lossless either way,
     # and the encode is the whole cost of a busy frame without it.
-    shot = browser.call("Page.captureScreenshot",
-                        {"format": "png", "fromSurface": True,
-                         "optimizeForSpeed": True})
+    stable_end = time.time() + 5.0
+    data = None
+    while True:
+        browser.script_async(PAINTED)
+        shot = browser.call("Page.captureScreenshot",
+                            {"format": "png", "fromSurface": True,
+                             "optimizeForSpeed": True})
+        fresh = base64.b64decode(shot["data"])
+        if fresh == data or time.time() > stable_end:
+            data = fresh
+            break
+        data = fresh
     with open(out_png, "wb") as handle:
-        handle.write(base64.b64decode(shot["data"]))
+        handle.write(data)
 
 
 def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT,

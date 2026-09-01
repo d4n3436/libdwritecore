@@ -39,5 +39,18 @@ app.whenReady().then(() => {
   // corner. A plain size change is not clamped.
   win.setContentSize(W, H);
   win.loadURL(process.env.DWC_URL || 'about:blank');
+  // A renderer that dies, which a long webfont sweep can OOM, leaves the
+  // DevTools page target stale: /json still answers but every WebSocket to
+  // the dead target closes on connect, and Electron implements neither
+  // Target.createTarget nor /json/new, so nothing outside this process can
+  // bring a page back. Reloading revives the target in place.
+  win.webContents.on('render-process-gone', (event, details) => {
+    console.error('renderer gone (' + details.reason + '), reloading');
+    setTimeout(() => { if (!win.isDestroyed()) win.webContents.reload(); }, 500);
+  });
+  win.webContents.on('unresponsive', () => {
+    console.error('renderer unresponsive, reloading');
+    win.webContents.forcefullyCrashRenderer();
+  });
 });
 app.on('window-all-closed', () => app.quit());

@@ -34,6 +34,11 @@
 # warning. Start the extra instances with run_electron_side.sh under their
 # own DWC_ELECTRON_STATE.
 #
+# When any cell differs, a summary after the totals groups the differing
+# clusters whose bounding boxes nearly coincide across cells, since many
+# cells sharing one box is a single defect. --clusters N additionally
+# prints up to N clusters under each differing cell as it lands.
+#
 # --css puts the same extra rule sheet on both sides, which is how one
 # suspected cause is priced. `font-kerning: none` says what the two sides'
 # kerning is worth; `font-weight: 400` says what their bold is.
@@ -192,6 +197,12 @@ note_divergence() {
 # trap: the fix is to restart both sides and run it again, not to go read the
 # diff. The shim check above will not catch either, because a wedged browser
 # maps exactly the right file.
+summarize_clusters() {
+    [ -s "$SHOTS/clusters.tsv" ] || return 0
+    echo
+    python3 "$HERE/compare_viewport.py" --aggregate "$SHOTS/clusters.tsv"
+}
+
 warn_if_wedged() {
     # Most of them have to be unrecognizable as well, not merely inexact. A
     # plan of probe pages that are all a little bit off is the ordinary state
@@ -299,6 +310,8 @@ if [ "$DIRECT" = 1 ]; then
             continue
         fi
         python3 "$HERE/compare_viewport.py" "$WIDTH" "$HEIGHT" "$a" "$b" \
+                --cluster-log "$SHOTS/clusters.tsv" \
+                --cluster-tag "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
                 $CLUSTERS >"$cell/out" 2>&1
         out="$(cat "$cell/out")"
         pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
@@ -319,6 +332,7 @@ if [ "$DIRECT" = 1 ]; then
     printf '%d cells in %ds, worst channel difference %d%s\n' \
            "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
            "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
+    summarize_clusters
     warn_if_wedged
     exit "$((FAILED > 0))"
 fi
@@ -396,6 +410,7 @@ for entry in "${PAGES[@]}"; do
         python3 "$HERE/compare_viewport.py" "$WIDTH" "$HEIGHT" \
                 "$cell/${LABELS[0]}_marked.png" "$cell/${LABELS[0]}_clean.png" \
                 "$cell/${LABELS[1]}_marked.png" "$cell/${LABELS[1]}_clean.png" \
+                --cluster-log "$SHOTS/clusters.tsv" --cluster-tag "$path $scroll" \
                 $CLUSTERS >"$cell/out" 2>&1 &
         PENDING=$!; P_PATH="$path"; P_SCROLL="$scroll"; P_DIR="$cell"; P_N="$CELLS"
     done
@@ -407,5 +422,6 @@ printf '\n%d of %d identical\n' "$EXACT" "$CELLS"
 printf '%d cells in %ds, worst channel difference %d%s\n' \
        "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
        "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
+summarize_clusters
 warn_if_wedged
 [ "$FAILED" -eq 0 ]

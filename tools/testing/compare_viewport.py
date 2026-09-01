@@ -4,10 +4,12 @@ Compare two screenshots taken by capture_viewport.sh, whatever page they show.
 
     tools/testing/compare_viewport.py <width> <height> \
         <a_marked.png> <a_clean.png> <b_marked.png> <b_clean.png> \
-        [--diff out.png] [--bands N] [--rows LO,HI] [--clusters N]
+        [--diff out.png] [--bands N] [--rows LO,HI] [--clusters N] \
+        [--cluster-log FILE] [--cluster-tag TAG]
     tools/testing/compare_viewport.py <width> <height> <a.png> <b.png> [...]
     tools/testing/compare_viewport.py --marker <shot.png>
     tools/testing/compare_viewport.py --fonts <font-dir>
+    tools/testing/compare_viewport.py --aggregate <cluster-log>
 
 Whole-screen shots do not line up: different window chrome, different window
 position, different screen. So this does not diff them directly. Each marked
@@ -49,8 +51,15 @@ offset. Differing pixels are grouped into runs of adjacent rows, which is how
 lines of text separate, and each run is reported with its bounding box, its
 pixel count and its worst channel. A run a few rows tall and a few hundred
 columns wide is one line of text; one that is two pixels tall and four wide is
-a single antialiased edge and is not worth chasing. Feed the row numbers back
-to linebox_sweep.py --probe to find out which element it is.
+a single antialiased edge and is not worth chasing. charpos.py --page walks
+the same page's characters to say whether the content in that box moved.
+
+--cluster-log appends every cluster of an inexact comparison to FILE, one line
+per cluster, tagged with --cluster-tag, and unlike the printed table it is
+never truncated. --aggregate reads such a file back and groups the clusters
+whose bounding boxes nearly coincide, counting the cells that share each box.
+Across a sweep, many cells sharing one box is a single defect; scattered
+one-off boxes are noise.
 
 --bands answers the question that always comes next: is this a layout
 difference or a rasterization one? It splits the viewport into horizontal bands
@@ -163,14 +172,16 @@ def bands(a, b, height, count=12, limit=3):
               % (lo, hi, best[0], 100 * best[1], 100 * flat, note))
 
 
-def clusters(per_pixel, limit=12, gap=2):
-    """The differing pixels, grouped into runs of adjacent rows."""
+def cluster_runs(per_pixel, gap=2):
+    """The differing pixels, grouped into runs of adjacent rows.
+
+    Each entry is (pixels, first row, last row, first col, last col, worst
+    channel), largest first.
+    """
     rows = np.nonzero(per_pixel.max(axis=1))[0].tolist()
-    if not rows:
-        return
-    runs = [[rows[0], rows[0]]]
-    for r in rows[1:]:
-        if r - runs[-1][1] <= gap:
+    runs = []
+    for r in rows:
+        if runs and r - runs[-1][1] <= gap:
             runs[-1][1] = r
         else:
             runs.append([r, r])
@@ -181,12 +192,74 @@ def clusters(per_pixel, limit=12, gap=2):
         scored.append((int((band > 0).sum()), lo, hi,
                        int(cols.min()), int(cols.max()), int(band.max())))
     scored.sort(reverse=True)
+    return scored
+
+
+def clusters(scored, limit=12):
+    if not scored:
+        return
     print("%d cluster(s), largest first:" % len(scored))
     for n, lo, hi, c0, c1, worst in scored[:limit]:
         print("   rows %4d..%-4d cols %4d..%-4d  %6d px  max %3d"
               % (lo, hi, c0, c1, n, worst))
     if len(scored) > limit:
         print("   ... %d more" % (len(scored) - limit))
+
+
+def log_clusters(path, tag, scored):
+    with open(path, "a") as handle:
+        for n, lo, hi, c0, c1, worst in scored:
+            handle.write("%d\t%d\t%d\t%d\t%d\t%d\t%s\n"
+                         % (lo, hi, c0, c1, n, worst, tag))
+
+
+def aggregate_clusters(path, tolerance=8, limit=10):
+    """Group a cluster log by bounding box, counted in cells.
+
+    A cluster joins a family when every edge of its box is within tolerance
+    of the family's envelope, so the same disagreement drifting a little
+    from cell to cell still lands in one family. The ranges printed are the
+    exact extremes of the members.
+    """
+    families = []
+    with open(path) as handle:
+        for line in handle:
+            lo, hi, c0, c1, px, worst, tag = line.rstrip("\n").split("\t", 6)
+            box = [int(v) for v in (lo, hi, c0, c1)]
+            px, worst = int(px), int(worst)
+            for fam in families:
+                if all(pair[0] - tolerance <= v <= pair[1] + tolerance
+                       for v, pair in zip(box, fam["edges"])):
+                    break
+            else:
+                fam = {"cells": set(), "edges": [[v, v] for v in box],
+                       "px_min": px, "px_max": px, "worst": worst,
+                       "example": tag}
+                families.append(fam)
+            fam["cells"].add(tag)
+            for v, pair in zip(box, fam["edges"]):
+                pair[0] = min(pair[0], v)
+                pair[1] = max(pair[1], v)
+            fam["px_min"] = min(fam["px_min"], px)
+            fam["px_max"] = max(fam["px_max"], px)
+            fam["worst"] = max(fam["worst"], worst)
+    if not families:
+        return 0
+    families.sort(key=lambda f: (len(f["cells"]), f["px_max"]), reverse=True)
+    print("%d cluster famil%s across the differing cells, most shared first:"
+          % (len(families), "y" if len(families) == 1 else "ies"))
+    for fam in families[:limit]:
+        rows, cols = (fam["edges"][0][0], fam["edges"][1][1]), \
+                     (fam["edges"][2][0], fam["edges"][3][1])
+        px = ("%d px" % fam["px_max"] if fam["px_min"] == fam["px_max"]
+              else "%d..%d px" % (fam["px_min"], fam["px_max"]))
+        print("  %3d cell%s  rows %4d..%-4d cols %4d..%-4d  %-14s max %3d  e.g. %s"
+              % (len(fam["cells"]), " " if len(fam["cells"]) == 1 else "s",
+                 rows[0], rows[1], cols[0], cols[1], px,
+                 fam["worst"], fam["example"]))
+    if len(families) > limit:
+        print("  ... %d more" % (len(families) - limit))
+    return 0
 
 
 def font_identity(root):
@@ -240,6 +313,8 @@ def read_font_version(path):
 
 def main():
     args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--aggregate":
+        return aggregate_clusters(args[1])
     if len(args) == 2 and args[0] == "--fonts":
         font_identity(args[1])
         return 0
@@ -271,6 +346,15 @@ def main():
             cluster_count = int(args[i + 1])
             del args[i + 1]
         del args[i]
+    cluster_log = cluster_tag = None
+    if "--cluster-log" in args:
+        i = args.index("--cluster-log")
+        cluster_log = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    if "--cluster-tag" in args:
+        i = args.index("--cluster-tag")
+        cluster_tag = args[i + 1]
+        args = args[:i] + args[i + 2:]
     if "--diff" in args:
         i = args.index("--diff")
         diff_path = args[i + 1]
@@ -319,8 +403,12 @@ def main():
               [(i, int(c)) for i, c in enumerate(hist) if c][:12])
         if want_bands:
             bands(a, b, h, band_count)
-        if want_clusters:
-            clusters(per_pixel, cluster_count)
+        if want_clusters or cluster_log:
+            scored = cluster_runs(per_pixel)
+            if want_clusters:
+                clusters(scored, cluster_count)
+            if cluster_log:
+                log_clusters(cluster_log, cluster_tag or "-", scored)
         if diff_path:
             Image.fromarray((per_pixel * 8).clip(0, 255).astype(np.uint8)).save(diff_path)
             print("wrote", diff_path)

@@ -5,6 +5,10 @@
 //       tools/testing/dwrite_oblique_probe.cpp -Iinclude \
 //       -Lbuild -ldwritecore -Wl,-rpath,build
 //   /tmp/oblique_probe "MS Gothic" "Impact"
+//   /tmp/oblique_probe --matrix "Arial" "Segoe UI"
+//
+// --matrix prints GetFirstMatchingFont's answer per weight and style instead,
+// which is the whole selection rule the fontconfig weight rules mirror.
 //
 // Blink asks Skia for an italic face. Where the family has none, Skia on
 // Windows gets back whatever DWriteCore matched: a face marked
@@ -41,10 +45,48 @@ std::u16string Wide(const char* s)
     return out;
 }
 
+// What GetFirstMatchingFont answers per weight and style, which is the whole
+// selection rule: SkFontMgr_win_dw.cpp's strip-and-retry loop then sends a
+// simulated answer back to the upright face. Weight 1000 is the top of the
+// CSS scale and lands on the heaviest face.
+void Matrix(IDWriteFontFamily* family, const char* name)
+{
+    constexpr int kWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900, 950, 1000};
+    constexpr DWRITE_FONT_STYLE kStyles[] = {DWRITE_FONT_STYLE_NORMAL,
+                                             DWRITE_FONT_STYLE_ITALIC,
+                                             DWRITE_FONT_STYLE_OBLIQUE};
+    for (const int weight : kWeights) {
+        std::printf("%-16s %4d:", name, weight);
+        for (const DWRITE_FONT_STYLE style : kStyles) {
+            IDWriteFont* font = nullptr;
+            if (FAILED(family->GetFirstMatchingFont(static_cast<DWRITE_FONT_WEIGHT>(weight),
+                                                    DWRITE_FONT_STRETCH_NORMAL, style,
+                                                    &font)) ||
+                font == nullptr) {
+                std::printf("  %s -> ?", StyleName(style));
+                continue;
+            }
+            const DWRITE_FONT_SIMULATIONS sims = font->GetSimulations();
+            std::printf("  %s -> %d %s%s%s", StyleName(style),
+                        static_cast<int>(font->GetWeight()), StyleName(font->GetStyle()),
+                        (sims & DWRITE_FONT_SIMULATIONS_BOLD) != 0 ? " simBOLD" : "",
+                        (sims & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0 ? " simOBL" : "");
+            font->Release();
+        }
+        std::printf("\n");
+    }
+}
+
 }  // namespace
 
-int main(const int argc, char** argv)
+int main(int argc, char** argv)
 {
+    bool matrix = false;
+    if (argc > 1 && std::strcmp(argv[1], "--matrix") == 0) {
+        matrix = true;
+        --argc;
+        ++argv;
+    }
     IUnknown* unk = nullptr;
     if (FAILED(DWriteCoreCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
                                        DWRITE_UUIDOF(IDWriteFactory3), &unk)) ||
@@ -95,6 +137,11 @@ int main(const int argc, char** argv)
         }
         IDWriteFontFamily* family = nullptr;
         if (FAILED(collection->GetFontFamily(index, &family)) || family == nullptr) {
+            continue;
+        }
+        if (matrix) {
+            Matrix(family, argv[i]);
+            family->Release();
             continue;
         }
         IDWriteFont* font = nullptr;
