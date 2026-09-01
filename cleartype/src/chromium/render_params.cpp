@@ -19,11 +19,13 @@
 
 namespace render_params {
 
-void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
+void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
+                        const bool plain_fontations)
 {
     auto* bytes = static_cast<unsigned char*>(rec);
     auto mask_format = skia_abi::Read<uint8_t>(bytes, skia_abi::kRecMaskFormat);
     auto flags = skia_abi::Read<uint16_t>(bytes, skia_abi::kRecFlags);
+    const uint8_t arrived_mask = mask_format;
 
     // kGenA8FromLCD says the surface cannot show subpixel text at all, and
     // Windows does not override it either. MakeRecAndEffects also sets it for
@@ -47,15 +49,39 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
             skia_abi::kHintingNone &&
         (flags_before_filter & skia_abi::kEmbeddedBitmapText) == 0;
 
-    if (mask_format == skia_abi::kA8 && !surface_refused_lcd && !as_paths) {
+    // Windows quantizes an LCD request past SK_MAX_SIZE_FOR_LCDTEXT (48) back
+    // to A8 and fills it from an averaged ClearType texture
+    // (too_big_for_lcd, SkScalerContext.cpp). MakeRecAndEffects tests the
+    // post-2x2 area when the device matrix carried one, which an identity
+    // post-2x2 says it did not.
+    const auto text_size = skia_abi::Read<float>(bytes, skia_abi::kRecTextSize);
+    const auto p00 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2);
+    const auto p01 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2 + 4);
+    const auto p10 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2 + 8);
+    const auto p11 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2 + 12);
+    constexpr float kMaxSizeForLcd = 48.0f;
+    const bool post_identity = p00 == 1.0f && p11 == 1.0f && p01 == 0.0f && p10 == 0.0f;
+    const bool too_big_for_lcd =
+        post_identity ? text_size > kMaxSizeForLcd
+                      : (p00 * p11 - p10 * p01) * text_size * text_size >
+                            kMaxSizeForLcd * kMaxSizeForLcd;
+
+    if (mask_format == skia_abi::kA8 && !surface_refused_lcd && !as_paths &&
+        too_big_for_lcd) {
+        if (!plain_fontations) {
+            flags |= static_cast<uint16_t>(skia_abi::kGenA8FromLCD);
+        }
+    } else if (mask_format == skia_abi::kA8 && !surface_refused_lcd && !as_paths) {
         mask_format = skia_abi::kLCD16;
         flags &= static_cast<uint16_t>(~skia_abi::kLCD_BGROrder);
         flags &= static_cast<uint16_t>(~skia_abi::kLCD_Vertical);
         flags &= static_cast<uint16_t>(~skia_abi::kGenA8FromLCD);
-    } else if (surface_refused_lcd) {
+    } else if (surface_refused_lcd && !plain_fontations) {
         // SkTypeface_Fontations::onFilterRec clears this flag on every rec.
         // DWriteFontTypeface leaves it alone, so Windows still fills the A8
-        // mask from a ClearType texture and averages it.
+        // mask from a ClearType texture and averages it. A typeface Windows
+        // renders through Fontations keeps the flag cleared there too, so the
+        // big-text A8 comes straight from the path on both sides.
         flags |= static_cast<uint16_t>(skia_abi::kGenA8FromLCD);
     }
 
@@ -63,8 +89,17 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
     // from this field and Windows never does. The live rec says none, and
     // windows_path::WithWindowsHinting restores the Windows value where the
     // grid fit mode is chosen.
+    // A typeface Windows itself renders through Fontations keeps SkFont's
+    // default hinting instead, which font_platform_data_win.cc's CreateSkFont
+    // never changes, and under which the Fontations scaler autohints and
+    // rounds advances. An as-paths strike arrives at hinting none from
+    // setupForAsPaths on both platforms and stays there.
     flags &= static_cast<uint16_t>(~skia_abi::kHintingMask);
-    flags |= static_cast<uint16_t>(skia_abi::kHintingNone << skia_abi::kHintingShift);
+    if (plain_fontations && !as_paths) {
+        flags |= static_cast<uint16_t>(skia_abi::kHintingNormal << skia_abi::kHintingShift);
+    } else {
+        flags |= static_cast<uint16_t>(skia_abi::kHintingNone << skia_abi::kHintingShift);
+    }
 
     flags |= skia_abi::kSubpixelPositioning;
 
@@ -73,7 +108,11 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
     flags &= static_cast<uint16_t>(~skia_abi::kLinearMetrics);
 
     flags &= static_cast<uint16_t>(~skia_abi::kForceAutohinting);
-    flags &= static_cast<uint16_t>(~skia_abi::kEmbeddedBitmapText);
+    // Windows keeps a web font's embedded bitmaps, so a stood-aside typeface
+    // keeps the flag as it arrived.
+    if (!plain_fontations) {
+        flags &= static_cast<uint16_t>(~skia_abi::kEmbeddedBitmapText);
+    }
 
     // skia/BUILD.gn gives Linux SK_GAMMA_EXPONENT=1.2 and SK_GAMMA_CONTRAST=0.2
     // against Windows' SK_GAMMA_SRGB and 1.0. A contrast already at zero agrees,
@@ -94,6 +133,15 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter)
 
     std::memcpy(bytes + skia_abi::kRecMaskFormat, &mask_format, sizeof(mask_format));
     std::memcpy(bytes + skia_abi::kRecFlags, &flags, sizeof(flags));
+
+    if (static const bool log = std::getenv("DWC_REC_LOG") != nullptr; log) {
+        (void)std::fprintf(stderr,
+                           "chromium-patch: rec: size %.2f mask %u flags %#x -> "
+                           "mask %u flags %#x plain=%d\n",
+                           static_cast<double>(text_size), arrived_mask,
+                           flags_before_filter, mask_format, flags,
+                           plain_fontations ? 1 : 0);
+    }
 }
 
 namespace {

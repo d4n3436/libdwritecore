@@ -19,6 +19,8 @@
 
 #include "font_facts.h"
 
+#include "../windows_fonts.h"
+
 #include <cstring>
 #include <string>
 
@@ -248,6 +250,79 @@ bool HasCbdt(const std::vector<uint8_t>& font, const uint32_t face_index)
 bool HasEbdt(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
     return FindTable(font, Tag('E', 'B', 'D', 'T'), face_index).data != nullptr;
+}
+
+// The Windows Unicode family name, name ID 1 from the 3/1 records, decoded
+// from UTF-16BE with anything past ASCII refused, which is enough for the
+// base-install list it is compared against.
+static std::string WindowsFamilyName(const std::vector<uint8_t>& font,
+                                     const uint32_t face_index)
+{
+    const Span name = FindTable(font, Tag('n', 'a', 'm', 'e'), face_index);
+    if (name.data == nullptr || name.size < 6) {
+        return {};
+    }
+    const uint16_t count = Be16(name.data + 2);
+    const uint16_t string_offset = Be16(name.data + 4);
+    for (uint16_t i = 0; i < count; ++i) {
+        const size_t at = 6 + static_cast<size_t>(i) * 12;
+        if (at + 12 > name.size) {
+            break;
+        }
+        const uint16_t platform = Be16(name.data + at);
+        const uint16_t encoding = Be16(name.data + at + 2);
+        const uint16_t id = Be16(name.data + at + 6);
+        if (platform != 3 || encoding != 1 || id != 1) {
+            continue;
+        }
+        const uint16_t length = Be16(name.data + at + 8);
+        const size_t start = static_cast<size_t>(string_offset) + Be16(name.data + at + 10);
+        if (start + length > name.size || length % 2 != 0) {
+            continue;
+        }
+        std::string out;
+        out.reserve(length / 2);
+        for (uint16_t k = 0; k < length; k += 2) {
+            const uint16_t unit = Be16(name.data + start + k);
+            if (unit == 0 || unit > 0x7F) {
+                return {};
+            }
+            out.push_back(static_cast<char>(unit));
+        }
+        return out;
+    }
+    return {};
+}
+
+bool FontationsPreferred(const std::vector<uint8_t>& font, const uint32_t face_index)
+{
+    if (font.empty()) {
+        return false;
+    }
+    const Span avar = FindTable(font, Tag('a', 'v', 'a', 'r'), face_index);
+    if (avar.data != nullptr && avar.size >= 2 && Be16(avar.data) >= 2) {
+        return true;
+    }
+    if (FindTable(font, Tag('C', 'F', 'F', '2'), face_index).data != nullptr) {
+        return true;
+    }
+    if (HasCbdt(font, face_index)) {
+        return true;
+    }
+    const Span colr = FindTable(font, Tag('C', 'O', 'L', 'R'), face_index);
+    if (colr.data != nullptr && colr.size >= 2 && Be16(colr.data) >= 1) {
+        // A COLRv1 face from the Windows install, Segoe UI Emoji, renders
+        // through DirectWrite there; only a web font takes the Fontations
+        // route.
+        const std::string family = WindowsFamilyName(font, face_index);
+        for (const char* known : windows_fonts::kBaseInstall) {
+            if (family == known) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 windows_path::FontFacts Describe(const std::vector<uint8_t>& font, const int gasp_ppem,

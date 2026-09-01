@@ -307,6 +307,17 @@ bool ClearSyntheticBold(void* rec, const std::vector<uint8_t>& font)
     if ((flags & skia_abi::kEmbolden) == 0) {
         return false;
     }
+    // Windows synthesizes only over a face lighter than semibold
+    // (font_cache_skia_win.cc `!typeface->isBold()`, which is weight 600),
+    // while Linux strokes whenever the request sits 200 above the face
+    // (font_cache_skia.cc). A face already at 600 or more keeps its own
+    // outlines on Windows, so the stroke goes and nothing is substituted.
+    if (WeightOf(font) >= 600) {
+        const auto cleared = static_cast<uint16_t>(flags & ~skia_abi::kEmbolden);
+        std::memcpy(static_cast<unsigned char*>(rec) + skia_abi::kRecFlags, &cleared,
+                    sizeof(cleared));
+        return true;
+    }
     // Synthetic italic, which Blink writes as the SkFont's skew
     // (font_platform_data.cc, `font.setSkewX(synthetic_italic_ ? -1/4 : 0)`)
     // and SkScalerContext copies into fPreSkewX. Windows draws such a run

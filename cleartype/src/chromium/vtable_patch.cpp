@@ -87,6 +87,8 @@
 #include <sys/syscall.h>
 #include <link.h>
 #include <sys/mman.h>
+#include <execinfo.h>
+#include <csignal>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -166,6 +168,46 @@ bool EnvDisables(const char* name)
 {
     const char* v = std::getenv(name);
     return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
+}
+
+// DWC_STACK_TRAP=1 installs a SIGUSR2 handler that prints the receiving
+// thread's own stack to stderr. A hung renderer refuses ptrace, so the way to
+// read where its threads sit is to signal every task in /proc/<pid>/task and
+// collect the prints.
+__attribute__((constructor)) void InstallStackTrap()
+{
+    if (std::getenv("DWC_STACK_TRAP") == nullptr) {
+        return;
+    }
+    struct sigaction sa = {};
+    sa.sa_handler = [](int) {
+        void* frames[64];
+        const int n = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, n, 2);
+        (void)!write(2, "---- end of thread ----\n", 24);
+    };
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGUSR2, &sa, nullptr);
+}
+
+// The half for crashes. Crashpad replaces whatever handler a constructor
+// installs, so this one is re-installed from the first scaler hook call,
+// which runs long after crashpad settled in.
+void InstallCrashTrap()
+{
+    if (std::getenv("DWC_STACK_TRAP") == nullptr) {
+        return;
+    }
+    struct sigaction sa = {};
+    sa.sa_handler = [](int) {
+        void* frames[64];
+        const int n = backtrace(frames, 64);
+        (void)!write(2, "---- crash ----\n", 16);
+        backtrace_symbols_fd(frames, n, 2);
+        _exit(139);
+    };
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGSEGV, &sa, nullptr);
 }
 
 
@@ -412,6 +454,11 @@ std::atomic g_patched{false};
 // time under Skia's lock, so one slot carries it across the call.
 std::atomic<uint16_t> g_flags_before_filter{0};
 
+// Whether the typeface the rec belongs to renders through plain Fontations on
+// Windows, carried from OnChromiumFilterRec to OnChromiumFilterRecDone, which
+// only sees the rec.
+std::atomic<bool> g_plain_before_filter{false};
+
 // ---------------------------------------------------------------------------
 // Finding generateImage.
 //
@@ -561,7 +608,13 @@ constexpr int kRasterCallsAhead = 2;
 void** VtableBaseFrom(const Image& image, void** known_slot)
 {
     const auto* relro_lo = reinterpret_cast<const uintptr_t*>(image.relro.begin);
+    const auto* relro_hi = reinterpret_cast<const uintptr_t*>(image.relro.end);
     auto* p = reinterpret_cast<uintptr_t*>(known_slot);
+    // A vtable lives in the image's relro, so a pointer landing anywhere else
+    // is not a slot and walking from it would read arbitrary memory.
+    if (p < relro_lo || p >= relro_hi || (reinterpret_cast<uintptr_t>(p) & 7) != 0) {
+        return nullptr;
+    }
     for (unsigned back = 0; back < 64; ++back, --p) {
         if (p - 2 < relro_lo) {
             return nullptr;
@@ -950,14 +1003,27 @@ struct sigaction g_probe_old_segv;
 struct sigaction g_probe_old_bus;
 std::atomic g_probe_faulted{false};
 
+// The jump buffer and the saved handlers are shared, so one guarded probe or
+// read runs at a time.
+std::mutex g_probe_mutex;
+
+// The address range a guarded read covers, so the handler can tell its fault
+// from a real crash. Empty outside a read.
+std::atomic<uintptr_t> g_probe_read_lo{0};
+std::atomic<uintptr_t> g_probe_read_hi{0};
+
 void ProbeFaultHandler(int sig, siginfo_t* info, void* uc)
 {
     // Only this thread faulting on the tag itself belongs to the guard.
     // Anything else is a real crash and goes to the handler already there,
     // which is the one that would have run had the guard not been installed.
+    const uintptr_t at =
+        info != nullptr ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
     const bool mine =
         info != nullptr && syscall(SYS_gettid) == g_probe_tid.load(std::memory_order_acquire) &&
-        reinterpret_cast<uintptr_t>(info->si_addr) == kHeadTag;
+        (at == kHeadTag ||
+         (at >= g_probe_read_lo.load(std::memory_order_acquire) &&
+          at < g_probe_read_hi.load(std::memory_order_acquire)));
     if (!mine) {
         const struct sigaction& old = sig == SIGBUS ? g_probe_old_bus : g_probe_old_segv;
         if ((old.sa_flags & SA_SIGINFO) != 0 && old.sa_sigaction != nullptr) {
@@ -980,6 +1046,7 @@ bool ReadsHeadTable(const GetTableDataFn probe, const void* typeface)
     // onGetTableData yet, and one that ignores the length writes a whole
     // table. The slack keeps that inside the buffer.
     unsigned char head[512] = {};
+    const std::lock_guard probe_lock(g_probe_mutex);
     struct sigaction guard = {};
     guard.sa_sigaction = &ProbeFaultHandler;
     guard.sa_flags = SA_SIGINFO | SA_NODEFER;
@@ -1009,6 +1076,43 @@ bool ReadsHeadTable(const GetTableDataFn probe, const void* typeface)
     uint32_t magic = 0;
     std::memcpy(&magic, head + kHeadMagicAt, sizeof(magic));
     return __builtin_bswap32(magic) == kHeadMagic;
+}
+
+// Reads one pointer-sized word from an address that is only suspected to be
+// mapped. False means the read faulted and *out is not written.
+// process_vm_readv would answer without faulting, but the renderer's seccomp
+// policy files it under IsDebug, which IsBaselinePolicyWatched turns into a
+// crashing SIGSYS (sandbox/linux/seccomp-bpf-helpers/baseline_policy.cc), so
+// the read is made directly under the probe guard instead.
+bool ReadWordGuarded(const void* addr, uintptr_t* out)
+{
+    const std::lock_guard probe_lock(g_probe_mutex);
+    struct sigaction guard = {};
+    guard.sa_sigaction = &ProbeFaultHandler;
+    guard.sa_flags = SA_SIGINFO | SA_NODEFER;
+    (void)sigemptyset(&guard.sa_mask);
+    if (sigaction(SIGSEGV, &guard, &g_probe_old_segv) != 0) {
+        return false;
+    }
+    if (sigaction(SIGBUS, &guard, &g_probe_old_bus) != 0) {
+        (void)sigaction(SIGSEGV, &g_probe_old_segv, nullptr);
+        return false;
+    }
+    const auto lo = reinterpret_cast<uintptr_t>(addr);
+    g_probe_read_lo.store(lo, std::memory_order_release);
+    g_probe_read_hi.store(lo + sizeof(uintptr_t), std::memory_order_release);
+    g_probe_tid.store(syscall(SYS_gettid), std::memory_order_release);
+    bool ok = false;
+    if (sigsetjmp(g_probe_jmp, 1) == 0) {
+        std::memcpy(out, addr, sizeof(uintptr_t));
+        ok = true;
+    }
+    g_probe_tid.store(0, std::memory_order_release);
+    g_probe_read_lo.store(0, std::memory_order_release);
+    g_probe_read_hi.store(0, std::memory_order_release);
+    (void)sigaction(SIGSEGV, &g_probe_old_segv, nullptr);
+    (void)sigaction(SIGBUS, &g_probe_old_bus, nullptr);
+    return ok;
 }
 
 std::atomic g_typeface_resolved{false};
@@ -1059,7 +1163,15 @@ void ResolveTypefaceFromContext(const void* context, const bool may_patch)
 void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
                            const bool through_proxy)
 {
-    auto* vptr = *static_cast<uintptr_t* const*>(typeface);
+    // The word the context held at the typeface offset is not known to be a
+    // pointer until its vtable checks out, so nothing here may fault on it.
+    if ((reinterpret_cast<uintptr_t>(typeface) & 7) != 0) {
+        return;
+    }
+    uintptr_t vptr = 0;
+    if (!ReadWordGuarded(typeface, &vptr)) {
+        return;
+    }
     auto* base = VtableBaseFrom(g_image, reinterpret_cast<void**>(vptr));
     if (base == nullptr) {
         return;
@@ -1122,7 +1234,8 @@ void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
         const std::vector<uintptr_t> data_fns{
             slots[tags_at + 1], reinterpret_cast<uintptr_t>(&ChromiumGetTableData)};
         typeface_bridge::SetAnchors(tag_fns, data_fns);
-        typeface_bridge::SetSlotHint(vptr, static_cast<unsigned>(tags_at),
+        typeface_bridge::SetSlotHint(reinterpret_cast<const void*>(vptr),
+                                     static_cast<unsigned>(tags_at),
                                      static_cast<unsigned>(tags_at + 1));
         g_typeface_resolved.store(true, std::memory_order_release);
         if (may_patch) {
@@ -1199,15 +1312,15 @@ void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
     // SkTypeface_FCI derives from SkTypeface_proxy and forwards the table
     // calls, so its own vtable reaches none of the bridge. The typeface it
     // proxies for does, and it is the one Skia reads the font through.
-    if (const auto* inner = skia_abi::Read<const void*>(
-            typeface, typeface_bridge::kProxyRealTypeface);
-        inner != nullptr && inner != typeface &&
-        (reinterpret_cast<uintptr_t>(inner) & 7) == 0 && !through_proxy) {
-        if (const auto* inner_vptr = skia_abi::Read<const void*>(inner, 0);
-            inner_vptr != nullptr && (reinterpret_cast<uintptr_t>(inner_vptr) & 7) == 0) {
-            ResolveTypefaceVtable(inner, may_patch, true);
-            return;
-        }
+    if (uintptr_t inner = 0;
+        !through_proxy &&
+        ReadWordGuarded(static_cast<const unsigned char*>(typeface) +
+                            typeface_bridge::kProxyRealTypeface,
+                        &inner) &&
+        inner != 0 && inner != reinterpret_cast<uintptr_t>(typeface) &&
+        (inner & 7) == 0) {
+        ResolveTypefaceVtable(reinterpret_cast<const void*>(inner), may_patch, true);
+        return;
     }
     static std::atomic said{false};
     if (!said.exchange(true)) {
@@ -2081,6 +2194,30 @@ using FontBytes = std::shared_ptr<const std::vector<uint8_t>>;
 std::unordered_map<const void*, FontBytes> g_fonts;
 std::unordered_map<const void*, std::vector<dwrite_raster::VariationCoord>> g_var_coords;
 
+// Typefaces Windows itself hands to Fontations rather than DirectWrite; see
+// font_facts::FontationsPreferred. Cached beside the bytes so every hook
+// answers alike for a typeface.
+std::unordered_map<const void*, bool> g_plain_fontations;
+
+// Read under g_font_mutex like everything beside the bytes.
+bool PlainFontationsLocked(void* typeface, const std::vector<uint8_t>& font)
+{
+    static const bool off = EnvDisables("DWC_PLAIN_FONTATIONS");
+    if (off) {
+        return false;
+    }
+    auto found = g_plain_fontations.find(typeface);
+    if (found == g_plain_fontations.end()) {
+        found = g_plain_fontations.emplace(typeface,
+                                           font_facts::FontationsPreferred(font)).first;
+        if (found->second) {
+            Report("typeface %p renders through Fontations on Windows; parity "
+                   "substitutions stand aside for it", typeface);
+        }
+    }
+    return found->second;
+}
+
 // onGetVariationDesignPosition, called through each typeface's own vtable so
 // the proxy typeface Linux hands out forwards to the face behind it. The
 // SkSpan parameter is a pointer and a count in registers, and an empty span
@@ -2401,20 +2538,24 @@ bool OnChromiumFilterRec(void* self, void* rec)
     }
     // Before Fontations turns a synthetic bold into a stroke. A family with a
     // real bold face is given it instead, which is the face Windows was handed
-    // and the reason its rec carries no stroke at all.
+    // and the reason its rec carries no stroke at all. A typeface Windows
+    // renders through plain Fontations keeps the stroke, since Windows does.
+    bool plain = false;
     if (self != nullptr && chromium_patch::ParityWanted()) {
         FontBytes font;
         {
             const std::lock_guard lock(g_font_mutex);
             font = FontBytesLocked(self);
+            plain = PlainFontationsLocked(self, *font);
         }
-        if (!font->empty() && bold_fallback::ClearSyntheticBold(rec, *font)) {
+        if (!plain && !font->empty() && bold_fallback::ClearSyntheticBold(rec, *font)) {
             static std::atomic said{false};
             if (!said.exchange(true)) {
                 Report("synthetic bold replaced with a real bold face");
             }
         }
     }
+    g_plain_before_filter.store(plain, std::memory_order_relaxed);
     const uint16_t arrived = skia_abi::Read<uint16_t>(rec, skia_abi::kRecFlags);
     g_flags_before_filter.store(arrived, std::memory_order_relaxed);
     {
@@ -2440,7 +2581,8 @@ void OnChromiumFilterRecDone(void* rec)
         return;
     }
     render_params::ApplyWindowsParams(
-        rec, g_flags_before_filter.load(std::memory_order_relaxed));
+        rec, g_flags_before_filter.load(std::memory_order_relaxed),
+        g_plain_before_filter.load(std::memory_order_relaxed));
 }
 
 // Runs after Skia's own generateMetrics, on the metrics it produced.
@@ -2772,11 +2914,13 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
     FontBytes font;
+    bool plain = false;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
+        plain = PlainFontationsLocked(typeface, *font);
     }
-    if (font->empty()) {
+    if (plain || font->empty()) {
         return;
     }
     const std::vector<uint8_t>* use = font.get();
@@ -2919,6 +3063,8 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
 // work runs after it, in OnChromiumMetrics.
 void OnChromiumMetricsPre(void* context, const void* glyph)
 {
+    static const bool trap = [] { InstallCrashTrap(); return true; }();
+    (void)trap;
     if (!g_patched.load(std::memory_order_acquire) || context == nullptr || glyph == nullptr) {
         return;
     }
@@ -2968,9 +3114,14 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
     FontBytes font;
+    bool plain = false;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
+        plain = PlainFontationsLocked(typeface, *font);
+    }
+    if (plain) {
+        return;
     }
     if (font->empty()) {
         static std::atomic said{false};
@@ -3124,11 +3275,13 @@ void OnChromiumFontMetrics(void* context, void* metrics)
     const int bitmap_ppem = static_cast<int>(gdi_text_size);
 
     FontBytes font;
+    bool plain = false;
     {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
+        plain = PlainFontationsLocked(typeface, *font);
     }
-    if (font->empty()) {
+    if (plain || font->empty()) {
         return;
     }
     const std::vector<uint8_t>* use = font.get();
@@ -3201,9 +3354,17 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     // face answers the gasp and strike questions for itself, so it has to be
     // resolved before the tree is walked and not just before the draw.
     FontBytes font;
+    bool plain = false;
     if (chromium_patch::ParityWanted()) {
         const std::lock_guard lock(g_font_mutex);
         font = FontBytesLocked(typeface);
+        plain = PlainFontationsLocked(typeface, *font);
+    }
+    if (plain) {
+        // The metrics hook stood aside for this typeface, so the mask has to
+        // stay Skia's too, and no stale color source may describe this face.
+        colr_outline::SetSource(nullptr, nullptr, 0, 0);
+        return false;
     }
     if (font == nullptr) {
         font = std::make_shared<const std::vector<uint8_t>>();

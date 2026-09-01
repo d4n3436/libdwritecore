@@ -374,10 +374,14 @@ const char* Surveyed(const Installed& have, const char* family)
     return nullptr;
 }
 
-// The nine weights CSS names, which are the only ones a page asks for as a
-// keyword or a round number. Anything between them lands on a neighbor and
-// takes that rule.
-constexpr int kCssWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900};
+// The weights CSS names plus 1000, the top of the scale, which are the ones a
+// page asks for as a keyword or a round number. Anything between them lands on
+// a neighbor and takes that rule.
+constexpr int kCssWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
+
+// DWRITE_FONT_STYLE values, which dwrite_raster.h takes as plain ints.
+constexpr int kStyleOblique = 1;
+constexpr int kStyleItalic = 2;
 
 std::string WeightRules()
 {
@@ -395,25 +399,64 @@ std::string WeightRules()
             continue;
         }
         constexpr size_t kCount = sizeof(kCssWeights) / sizeof(kCssWeights[0]);
-        // What GetFirstMatchingFont answers for each weight, asked once
-        // upright and once italic. The two differ: Arial at 900 upright and
-        // 900 italic are both Arial Black, but 800 italic stays on Arial's own
-        // italic face while 800 upright goes to Arial Black.
+        // What GetFirstMatchingFont answers for each weight, asked upright,
+        // italic and oblique. The three differ: Arial at 900 upright and 900
+        // italic are both Arial Black, 800 italic stays on Arial's own italic
+        // face while 800 upright goes to Arial Black, and an oblique request
+        // is answered by a simulated entry over the upright face even where a
+        // real italic exists.
         int upright[kCount] = {};
         int slanted[kCount] = {};
         bool kept_slant[kCount] = {};
+        int obliqued[kCount] = {};
+        bool kept_oblique[kCount] = {};
         bool varies = false;
         bool has_italic = false;
         for (size_t i = 0; i < kCount; ++i) {
             upright[i] = dwrite_raster::FamilyMatchWeight(family.c_str(), kCssWeights[i]);
             bool italic = false;
-            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], true,
+            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], kStyleItalic,
                                                 &slanted[i], &italic)) {
                 slanted[i] = 0;
             }
             kept_slant[i] = italic;
+            bool oblique = false;
+            if (!dwrite_raster::FamilyMatchFace(family.c_str(), kCssWeights[i], kStyleOblique,
+                                                &obliqued[i], &oblique)) {
+                obliqued[i] = 0;
+            }
+            kept_oblique[i] = oblique;
             varies = varies || upright[i] != upright[0] || slanted[i] != slanted[0];
             has_italic = has_italic || italic;
+        }
+        // Oblique, said for any family with an italic face; without the rule
+        // fontconfig answers a slant 110 request with that italic face, while
+        // the simulated entry GetFirstMatchingFont answers with sends
+        // SkFontMgr_win_dw.cpp's strip-and-retry loop to the upright face.
+        // Independent of `varies`, since it matters even where one weight
+        // answers everything.
+        for (size_t i = 0; i < kCount; ++i) {
+            if (!has_italic || obliqued[i] == 0 || kept_oblique[i]) {
+                continue;
+            }
+            const int from = family_match::FontconfigWeight(kCssWeights[i]);
+            const int to = family_match::FontconfigWeight(obliqued[i]);
+            if (from == 0 || to == 0) {
+                continue;
+            }
+            char rule[640];
+            (void)std::snprintf(
+                rule, sizeof(rule),
+                "  <match target=\"pattern\">\n"
+                "    <test name=\"family\"><string>%s</string></test>\n"
+                "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
+                "    <test name=\"slant\" compare=\"eq\"><int>110</int></test>\n"
+                "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
+                "    <edit name=\"slant\" mode=\"assign\"><int>0</int></edit>\n"
+                "  </match>\n",
+                family.c_str(), from, to);
+            out += rule;
+            ++ruled;
         }
         // One face answers every weight, so fontconfig reaches it whatever the
         // request and there is nothing to say.
@@ -459,7 +502,7 @@ std::string WeightRules()
                 "  <match target=\"pattern\">\n"
                 "    <test name=\"family\"><string>%s</string></test>\n"
                 "    <test name=\"weight\" compare=\"eq\"><int>%d</int></test>\n"
-                "    <test name=\"slant\" compare=\"not_eq\"><int>0</int></test>\n"
+                "    <test name=\"slant\" compare=\"eq\"><int>100</int></test>\n"
                 "    <edit name=\"weight\" mode=\"assign\"><int>%d</int></edit>\n"
                 "%s"
                 "  </match>\n",

@@ -41,10 +41,14 @@ enum Slot
     kPushClipGlyph = 5,
     kPushClipRectangle = 6,
     kPopClip = 7,
+    kFillSolid = 8,
+    kFillLinear = 9,
     kFillRadial = 10,
+    kFillSweep = 11,
     kFillGlyphSolid = 12,
     kFillGlyphRadial = 13,
     kFillGlyphLinear = 14,
+    kFillGlyphSweep = 15,
     kSlotCount = 18,
 };
 
@@ -91,6 +95,8 @@ using PushTransformFn = void (*)(void*, const Transform*);
 using PopTransformFn = void (*)(void*);
 using FillGlyphLinearFn = void (*)(void*, uint16_t, const Transform*, const void*, void*,
                                    uint8_t);
+using PushClipGlyphFn = void (*)(void*, uint16_t);
+using FillParamsFn = void (*)(void*, const void*, void*, uint8_t);
 
 using NextStopFn = bool (*)(void*, ColorStop*);
 using NumStopsFn = size_t (*)(const void*);
@@ -104,6 +110,13 @@ ClipBoxFn g_clip_box = nullptr;
 PushTransformFn g_push_transform = nullptr;
 PopTransformFn g_pop_transform = nullptr;
 FillGlyphLinearFn g_fill_glyph_linear = nullptr;
+PushClipRectFn g_push_clip_rect = nullptr;
+FillGlyphLinearFn g_fill_glyph_sweep = nullptr;
+PushClipGlyphFn g_push_clip_glyph = nullptr;
+PopClipFn g_pop_clip = nullptr;
+FillParamsFn g_fill_linear = nullptr;
+FillParamsFn g_fill_radial = nullptr;
+FillParamsFn g_fill_sweep = nullptr;
 
 // outlines, glyph, size, coords, hinting instance, the two rust::Vec outputs
 // and the metrics the caller reads back.
@@ -124,8 +137,14 @@ struct VecOps
     VecDataFn data = nullptr;
     VecReserveFn reserve = nullptr;
     VecSetLenFn set_len = nullptr;
-    bool Ready() const { return data != nullptr && reserve != nullptr && set_len != nullptr; }
+    // reserve is optional: where a build never emitted it for this element
+    // type, writes stay inside the capacity the extraction call reserves.
+    bool Ready() const { return data != nullptr && set_len != nullptr; }
 };
+
+// VerbsPointsPen::new reserves this many elements in both vectors on every
+// extraction call, so a path this size fits without growing either one.
+constexpr size_t kPathExtractionReserve = 150;
 
 VecOps g_verbs;
 VecOps g_points;
@@ -146,6 +165,10 @@ struct Source
 };
 
 thread_local Source t_source;
+
+// Whether the current walk carries the subpixel transform PushPhase adds, so
+// the clip snap can put the phase on both sides of its rounding.
+thread_local bool t_phased = false;
 
 uint16_t Be16At(const std::vector<uint8_t>& font, const size_t at)
 {
@@ -206,16 +229,31 @@ bool Substitute(const uint16_t glyph, void* verbs, void* points)
                                      &dw_points, s.face_index)) {
         return false;
     }
-    float to_upem = static_cast<float>(s.upem) / s.render_size;
+    // Skia scales the outline to em with SkMatrix::Scale(1 / render size)
+    // before its canvas matrix multiplies the size back in, and the
+    // Fontations scaler matrix divides the path by units per em. Multiplying
+    // by the same reciprocal first and by upem second keeps every coordinate
+    // on the float values Windows draws, since a power-of-two em makes the
+    // upem factor exact.
+    const float to_em = 1.0f / s.render_size;
+    float upem = static_cast<float>(s.upem);
     if (const char* k = std::getenv("DWC_COLR_SCALE"); k != nullptr) {
-        to_upem *= static_cast<float>(std::atof(k));
+        upem *= static_cast<float>(std::atof(k));
     }
     for (path_abi::Point& p : dw_points) {
-        p.x *= to_upem;
-        p.y *= to_upem;
+        p.x = p.x * to_em * upem;
+        p.y = p.y * to_em * upem;
     }
-    g_verbs.reserve(verbs, dw_verbs.size());
-    g_points.reserve(points, dw_points.size());
+    if (g_verbs.reserve != nullptr) {
+        g_verbs.reserve(verbs, dw_verbs.size());
+    } else if (dw_verbs.size() > kPathExtractionReserve) {
+        return false;
+    }
+    if (g_points.reserve != nullptr) {
+        g_points.reserve(points, dw_points.size());
+    } else if (dw_points.size() > kPathExtractionReserve) {
+        return false;
+    }
     auto* verb_data = const_cast<uint8_t*>(static_cast<const uint8_t*>(g_verbs.data(verbs)));
     auto* point_data =
         const_cast<path_abi::Point*>(static_cast<const path_abi::Point*>(g_points.data(points)));
@@ -333,6 +371,29 @@ void SayStops(const uint16_t glyph, void* stops)
     (void)std::fprintf(stderr, "\n");
 }
 
+// SkScalerContext_DW::drawColorV1Image draws every layer as a clip on the
+// layer glyph's outline followed by a drawPaint, so on Windows the paint runs
+// under an antialiased clip and its blitter. The Fontations painter's
+// fill_glyph_* shortcuts draw one drawPath instead, which composes the
+// gradient through a different blitter once the glyph's own clip box is
+// snapped to whole pixels and no longer antialiased. Decomposing a shortcut
+// into its clip and fill halves is what the painter itself does when a clip
+// is already open, and matches the Windows walk. Solid glyphs stay whole,
+// since Windows draws DWRITE_PAINT_TYPE_SOLID_GLYPH with one drawPath too.
+// Bounds mode keeps the original call, which joins the same box either way.
+bool SplitFills(void* self)
+{
+    static const bool split_off = dwcft::IsOffValue(std::getenv("DWC_COLR_FILLCLIP"));
+    // Only for glyphs the parity path owns. A COLRv1 web font renders through
+    // plain Fontations on Windows too, and its shortcut fills stay whole
+    // there, so a walk with no source set keeps the painter untouched.
+    if (split_off || self == nullptr || t_source.upem == 0) {
+        return false;
+    }
+    auto** vtable = *reinterpret_cast<void***>(self);
+    return !reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode])(self);
+}
+
 void FillGlyphRadialHook(void* self, const uint16_t glyph, const Transform* transform,
                          const RadialParams* params, void* stops, const uint8_t extend)
 {
@@ -346,7 +407,29 @@ void FillGlyphRadialHook(void* self, const uint16_t glyph, const Transform* tran
             SayStops(glyph, stops);
         }
     }
+    if (transform != nullptr && SplitFills(self)) {
+        g_push_clip_glyph(self, glyph);
+        g_push_transform(self, transform);
+        g_fill_radial(self, params, stops, extend);
+        g_pop_transform(self);
+        g_pop_clip(self);
+        return;
+    }
     g_fill_glyph_radial(self, glyph, transform, params, stops, extend);
+}
+
+void FillGlyphSweepHook(void* self, const uint16_t glyph, const Transform* t, const void* params,
+                        void* stops, const uint8_t extend)
+{
+    if (t != nullptr && SplitFills(self)) {
+        g_push_clip_glyph(self, glyph);
+        g_push_transform(self, t);
+        g_fill_sweep(self, params, stops, extend);
+        g_pop_transform(self);
+        g_pop_clip(self);
+        return;
+    }
+    g_fill_glyph_sweep(self, glyph, t, params, stops, extend);
 }
 
 int g_depth = 0;
@@ -375,8 +458,9 @@ void PopTransformHook(void* self)
 void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, const void* params,
                          void* stops, const uint8_t extend)
 {
+    static const bool say = std::getenv("DWC_COLR_XFORM") != nullptr;
     const auto* p = static_cast<const float*>(params);
-    if (t != nullptr && p != nullptr) {
+    if (say && t != nullptr && p != nullptr) {
         (void)std::fprintf(stderr,
                            "chromium-patch: colr linear [%d]: glyph %u p0=(%.4f,%.4f) "
                            "p1=(%.4f,%.4f) p2=(%.4f,%.4f) xform=[%.6f %.6f %.6f %.6f %.6f %.6f]\n",
@@ -387,7 +471,41 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
                            static_cast<double>(t->yx), static_cast<double>(t->yy),
                            static_cast<double>(t->dx), static_cast<double>(t->dy));
     }
+    if (t != nullptr && SplitFills(self)) {
+        g_push_clip_glyph(self, glyph);
+        g_push_transform(self, t);
+        g_fill_linear(self, params, stops, extend);
+        g_pop_transform(self);
+        g_pop_clip(self);
+        return;
+    }
     g_fill_glyph_linear(self, glyph, t, params, stops, extend);
+}
+
+// skrifa forwards the glyph's own COLRv1 clip box through push_clip_rectangle,
+// which always antialiases, so an edge that falls between device pixels
+// attenuates its boundary row or column by the fractional coverage. Windows
+// applies the same box with SkCanvas::clipRect's default, which rounds every
+// edge to a whole device pixel, so the box is snapped to the same pixels here
+// and the antialiasing has nothing left to blend. Bounds mode keeps the
+// unrounded box, which is what Windows measures.
+void PushClipRectangleHook(void* self, float x_min, float y_min, float x_max, float y_max)
+{
+    static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
+    if (!clip_off && t_source.upem != 0 && t_source.render_size > 0) {
+        auto** vtable = *reinterpret_cast<void***>(self);
+        if (!reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode])(self)) {
+            const float s = t_source.render_size / static_cast<float>(t_source.upem);
+            const float ox = t_phased ? t_source.sub_x : 0.0f;
+            const float oy = t_phased ? t_source.sub_y : 0.0f;
+            x_min = (std::round(x_min * s + ox) - ox) / s;
+            x_max = (std::round(x_max * s + ox) - ox) / s;
+            // The painter negates each y on the way to the device rect.
+            y_min = (std::round(y_min * s - oy) + oy) / s;
+            y_max = (std::round(y_max * s - oy) + oy) / s;
+        }
+    }
+    g_push_clip_rect(self, x_min, y_min, x_max, y_max);
 }
 // Patch the painter's vtable once per distinct table. The object is built on
 // the stack of drawCOLRGlyph, so the vtable is what persists, not the object.
@@ -412,6 +530,13 @@ void PatchPainter(void* painter)
     g_push_transform = reinterpret_cast<PushTransformFn>(vtable[kPushTransform]);
     g_pop_transform = reinterpret_cast<PopTransformFn>(vtable[kPopTransform]);
     g_fill_glyph_linear = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphLinear]);
+    g_push_clip_rect = reinterpret_cast<PushClipRectFn>(vtable[kPushClipRectangle]);
+    g_fill_glyph_sweep = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphSweep]);
+    g_push_clip_glyph = reinterpret_cast<PushClipGlyphFn>(vtable[kPushClipGlyph]);
+    g_pop_clip = reinterpret_cast<PopClipFn>(vtable[kPopClip]);
+    g_fill_linear = reinterpret_cast<FillParamsFn>(vtable[kFillLinear]);
+    g_fill_radial = reinterpret_cast<FillParamsFn>(vtable[kFillRadial]);
+    g_fill_sweep = reinterpret_cast<FillParamsFn>(vtable[kFillSweep]);
     const long page = ::sysconf(_SC_PAGESIZE);
     auto* slot = reinterpret_cast<unsigned char*>(&vtable[0]);
     auto* base = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(slot) &
@@ -420,10 +545,12 @@ void PatchPainter(void* painter)
         return;
     }
     vtable[kFillGlyphRadial] = reinterpret_cast<void*>(&FillGlyphRadialHook);
+    vtable[kPushClipRectangle] = reinterpret_cast<void*>(&PushClipRectangleHook);
+    vtable[kFillGlyphLinear] = reinterpret_cast<void*>(&FillGlyphLinearHook);
+    vtable[kFillGlyphSweep] = reinterpret_cast<void*>(&FillGlyphSweepHook);
     if (std::getenv("DWC_COLR_XFORM") != nullptr) {
         vtable[kPushTransform] = reinterpret_cast<void*>(&PushTransformHook);
         vtable[kPopTransform] = reinterpret_cast<void*>(&PopTransformHook);
-        vtable[kFillGlyphLinear] = reinterpret_cast<void*>(&FillGlyphLinearHook);
     }
     (void)::mprotect(base, static_cast<size_t>(page) * 2, PROT_READ);
     Say("painter vtable patched, fill_glyph_radial slot", kFillGlyphRadial);
@@ -475,6 +602,7 @@ bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t gl
     static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
     static const bool phase_off = dwcft::IsOffValue(std::getenv("DWC_COLR_SUBPIXEL"));
     const bool phased = !phase_off && painter != nullptr && PushPhase(painter);
+    t_phased = phased;
     ClipBox box{};
     if (!clip_off && g_clip_box != nullptr && painter != nullptr && t_source.upem != 0 &&
         t_source.render_size > 0) {
@@ -523,6 +651,7 @@ bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t gl
             if (phased) {
                 PopPhase(painter);
             }
+            t_phased = false;
             return ok;
         }
     }
@@ -530,6 +659,7 @@ bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t gl
     if (phased) {
         PopPhase(painter);
     }
+    t_phased = false;
     return ok;
 }
 
@@ -633,6 +763,15 @@ void InstallAtLoad()
         } else if (name.size() > 8 && name.compare(name.size() - 8, 8, "$set_len") == 0) {
             ops->set_len = reinterpret_cast<VecSetLenFn>(address);
         }
+    }
+    // set_len writes the length field, which sits at the same place whatever
+    // the element type, so a build that only emitted the u8 one still covers
+    // the points vector. Chromium 144 is such a build.
+    if (g_points.set_len == nullptr) {
+        g_points.set_len = g_verbs.set_len;
+    }
+    if (g_points.data == nullptr) {
+        g_points.data = g_verbs.data;
     }
     Say("installed, call sites rewritten", moved);
     Say("  vector shims ready", g_verbs.Ready() && g_points.Ready() ? 1 : 0);

@@ -20,10 +20,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 // ID2D1SimplifiedGeometrySink, reconstructed. IDWriteFontFace::GetGlyphRunOutline
 // takes one of these, and include/dwrite.h only forward declares it, since the
@@ -95,8 +97,25 @@ struct Dwrite
     bool ok = false;
 };
 
-std::mutex g_mutex;
+// Three locks, so unrelated faces render concurrently instead of the whole
+// shim serializing behind one mutex. What is shared is the factory, written
+// once, and the face cache, a map. The DirectWrite calls themselves are
+// per-face, so they take that face's own lock.
+//
+// Lock order is faces or collection first, then init. Nothing takes g_init
+// and then reaches for either of the others.
+std::mutex g_init_mutex;
+std::mutex g_faces_mutex;
+std::mutex g_collection_mutex;
 Dwrite g_dw;
+
+// A cached face and the lock that serializes DirectWrite work on it. The slot
+// is stable in memory, so a caller can hold the pointer while the map grows.
+struct FaceSlot
+{
+    IDWriteFontFace* face = nullptr;
+    std::mutex mu;
+};
 
 // Loading the library and building a factory are deliberately separate, and
 // happen on opposite sides of the fork.
@@ -135,8 +154,12 @@ bool PreloadLibrary()
     return true;
 }
 
+// Guards itself, so every entry point can call it without holding anything
+// wider. The mutex is also what publishes g_dw to the threads that read it
+// afterwards without a lock, since they all pass through here first.
 bool EnsureFactory()
 {
+    const std::lock_guard lock(g_init_mutex);
     if (g_dw.tried) {
         return g_dw.ok;
     }
@@ -215,11 +238,25 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
         face5->Release();
         return face;
     }
+    // Windows builds this list from the resource's default axis values with
+    // the arguments overriding by tag (apply_fontargument_variation,
+    // src/ports/SkTypeface_win_dw.cpp). The typeface's design position states
+    // the same axis values, and GetDefaultFontAxisValues does not work in a
+    // sandboxed renderer, so the position is what goes in.
     std::vector<DWRITE_FONT_AXIS_VALUE> values;
     values.reserve(coords->size());
     for (const VariationCoord& c : *coords) {
         values.push_back({static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(c.axis)),
                           c.value});
+    }
+    if (std::getenv("DWC_VAR_LOG") != nullptr) {
+        (void)std::fprintf(stderr, "chromium-patch: var [%d]: passing:", ::getpid());
+        for (const DWRITE_FONT_AXIS_VALUE& v : values) {
+            const uint32_t t = __builtin_bswap32(static_cast<uint32_t>(v.axisTag));
+            (void)std::fprintf(stderr, " %c%c%c%c=%g", t >> 24, (t >> 16) & 0xff,
+                               (t >> 8) & 0xff, t & 0xff, static_cast<double>(v.value));
+        }
+        (void)std::fprintf(stderr, "\n");
     }
     IDWriteFontFace5* varied = nullptr;
     const HRESULT hr = resource->CreateFontFace(
@@ -236,17 +273,21 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
 // One font face per typeface, built from the bytes typeface_bridge rebuilt,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
-IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes,
-                         const uint32_t face_index, const bool simulate_bold,
-                         const bool simulate_oblique)
+FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
+                  const uint32_t face_index, const bool simulate_bold,
+                  const bool simulate_oblique)
 {
     // A simulated face is a different face for the same bytes, and so is every
     // other face of a collection, whose bytes are the whole file and therefore
     // the same for all of them.
-    static std::unordered_map<FaceKey, IDWriteFontFace*, KeyHash> faces;
+    static std::unordered_map<FaceKey, std::unique_ptr<FaceSlot>, KeyHash> faces;
     const FaceKey key{typeface, face_index, simulate_bold, simulate_oblique};
+    const std::lock_guard lock(g_faces_mutex);
+    if (!EnsureFactory()) {
+        return nullptr;
+    }
     if (const auto it = faces.find(key); it != faces.end()) {
-        return it->second;
+        return it->second.get();
     }
     // A collection carries 'ttcf' where a single face carries its SFNT
     // version, and DirectWrite has to be told which of the two it was given
@@ -270,11 +311,14 @@ IDWriteFontFace* FaceFor(const void* typeface, const std::vector<uint8_t>& bytes
         file->Release();
         face = ApplyVariations(face, typeface, sims);
     }
-    faces[key] = face;
     if (face == nullptr) {
         Say("could not build a font face from the rebuilt bytes");
     }
-    return face;
+    auto slot = std::make_unique<FaceSlot>();
+    slot->face = face;
+    FaceSlot* held = slot.get();
+    faces.emplace(key, std::move(slot));
+    return held;
 }
 
 uint8_t ApplyLut(const uint8_t v, const uint8_t* table)
@@ -444,7 +488,7 @@ private:
 
 bool Preload()
 {
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_init_mutex);
     return PreloadLibrary();
 }
 
@@ -482,7 +526,7 @@ bool FamilyCoverage(const char* family, const unsigned* points, const unsigned c
     if (family == nullptr || points == nullptr || covers == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_collection_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -510,7 +554,7 @@ bool FamilyNames(std::vector<std::string>* out)
     if (out == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_collection_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -560,21 +604,19 @@ bool FamilyNames(std::vector<std::string>* out)
     return !out->empty();
 }
 
-// The weight DirectWrite answers a request for this one with, among the faces
-// of this family. GetFirstMatchingFont is what
-// SkFontStyleSet_DirectWrite::matchStyle calls, so this is the rule itself
-// rather than a restatement of it. Zero when the family is not there.
-// The face GetFirstMatchingFont answers with, weight and slant both. Windows
-// drops the slant before it drops the weight at the top of the scale: Arial at
-// 900 italic is answered by Arial Black, which has no italic face, while 800
-// italic stays on an italic one.
-bool FamilyMatchFace(const char* family, const int weight, const bool italic,
+// The face GetFirstMatchingFont answers with, weight and slant both.
+// GetFirstMatchingFont is what SkFontStyleSet_DirectWrite::matchStyle calls,
+// so this is the rule itself rather than a restatement of it. The slant goes
+// before the weight at the top of the scale: Arial at 900 italic is answered
+// by Arial Black, which has no italic face, while 800 italic stays on an
+// italic one.
+bool FamilyMatchFace(const char* family, const int weight, const int style,
                      int* out_weight, bool* out_italic)
 {
     if (family == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_collection_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -596,7 +638,7 @@ bool FamilyMatchFace(const char* family, const int weight, const bool italic,
         SUCCEEDED(collection->GetFontFamily(index, &group)) && group != nullptr &&
         SUCCEEDED(group->GetFirstMatchingFont(
             static_cast<DWRITE_FONT_WEIGHT>(weight), DWRITE_FONT_STRETCH_NORMAL,
-            italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, &font)) &&
+            static_cast<DWRITE_FONT_STYLE>(style), &font)) &&
         font != nullptr) {
         if (out_weight != nullptr) {
             *out_weight = static_cast<int>(font->GetWeight());
@@ -625,7 +667,7 @@ int FamilyMatchWeight(const char* family, const int weight)
     if (family == nullptr) {
         return 0;
     }
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_collection_mutex);
     if (!EnsureFactory()) {
         return 0;
     }
@@ -666,7 +708,7 @@ bool FamilyDirectory(const char* family, char* out, const size_t size)
     if (family == nullptr || out == nullptr || size == 0) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
+    const std::lock_guard lock(g_collection_mutex);
     if (!EnsureFactory()) {
         return false;
     }
@@ -735,7 +777,6 @@ bool FamilyDirectory(const char* family, char* out, const size_t size)
 
 bool Available()
 {
-    const std::lock_guard lock(g_mutex);
     return EnsureFactory();
 }
 
@@ -754,14 +795,14 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
-    if (!EnsureFactory()) {
+    FaceSlot* slot = SlotFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
+    if (slot == nullptr || slot->face == nullptr) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
-    if (face == nullptr) {
-        return false;
-    }
+    // Only this face is held, so a thread measuring another one
+    // does not wait here.
+    const std::lock_guard lock(slot->mu);
+    IDWriteFontFace* face = slot->face;
 
     DWRITE_MATRIX transform{};
     float scale_y = 0;
@@ -846,14 +887,14 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (advance_x == nullptr || advance_y == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
-    if (!EnsureFactory()) {
+    FaceSlot* slot = SlotFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
+    if (slot == nullptr || slot->face == nullptr) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
-    if (face == nullptr) {
-        return false;
-    }
+    // Only this face is held, so a thread measuring another one
+    // does not wait here.
+    const std::lock_guard lock(slot->mu);
+    IDWriteFontFace* face = slot->face;
 
     DWRITE_GLYPH_METRICS gm{};
     const UINT16 id = glyph_id;
@@ -913,14 +954,14 @@ bool FontMetrics(const void* typeface, const std::vector<uint8_t>& font_bytes,
     if (sk_font_metrics == nullptr) {
         return false;
     }
-    const std::lock_guard lock(g_mutex);
-    if (!EnsureFactory()) {
+    FaceSlot* slot = SlotFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
+    if (slot == nullptr || slot->face == nullptr) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
-    if (face == nullptr) {
-        return false;
-    }
+    // Only this face is held, so a thread measuring another one
+    // does not wait here.
+    const std::lock_guard lock(slot->mu);
+    IDWriteFontFace* face = slot->face;
 
     DWRITE_FONT_METRICS dwfm{};
     const bool gdi = decision.measuring_mode == windows_path::kMeasureGdiClassic ||
@@ -990,14 +1031,14 @@ bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
                   std::vector<path_abi::Point>* points, const uint32_t face_index,
                   const bool simulate_bold, const bool simulate_oblique)
 {
-    const std::lock_guard lock(g_mutex);
-    if (!EnsureFactory()) {
+    FaceSlot* slot = SlotFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
+    if (slot == nullptr || slot->face == nullptr) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
-    if (face == nullptr) {
-        return false;
-    }
+    // Only this face is held, so a thread measuring another one
+    // does not wait here.
+    const std::lock_guard lock(slot->mu);
+    IDWriteFontFace* face = slot->face;
     verbs->clear();
     points->clear();
     Sink sink(verbs, points);
@@ -1024,14 +1065,14 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
         return false;
     }
 
-    const std::lock_guard lock(g_mutex);
-    if (!EnsureFactory()) {
+    FaceSlot* slot = SlotFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
+    if (slot == nullptr || slot->face == nullptr) {
         return false;
     }
-    IDWriteFontFace* face = FaceFor(typeface, font_bytes, face_index, simulate_bold, simulate_oblique);
-    if (face == nullptr) {
-        return false;
-    }
+    // Only this face is held, so a thread measuring another one
+    // does not wait here.
+    const std::lock_guard lock(slot->mu);
+    IDWriteFontFace* face = slot->face;
 
     // getDWMaskBits: the transform carries the sub-pixel offset, and the run
     // is one glyph with a zero advance at the origin.

@@ -58,9 +58,11 @@ bool FamilyDirectory(const char* family, char* out, size_t size);
 // Every family the system collection holds, ASCII-named ones only.
 bool FamilyNames(std::vector<std::string>* out);
 
-// The face GetFirstMatchingFont answers with, weight and slant both. False
-// when the family is not in the collection.
-bool FamilyMatchFace(const char* family, int weight, bool italic,
+// The face GetFirstMatchingFont answers with, weight and slant both. `style`
+// is the DWRITE_FONT_STYLE value the request carries, since an italic and an
+// oblique request are answered differently. False when the family is not in
+// the collection.
+bool FamilyMatchFace(const char* family, int weight, int style,
                      int* out_weight, bool* out_italic);
 
 // The weight DirectWrite answers a request for `weight` with, among this

@@ -35,8 +35,10 @@ namespace render_params {
 // allowed to. `flags_before_filter` is the rec's fFlags as it arrived, sampled
 // before the typeface's own onFilterRec runs. Fontations clears
 // kGenA8FromLCD_Flag there, and that flag is the only evidence that the
-// surface could not display subpixel text.
-void ApplyWindowsParams(void* rec, uint16_t flags_before_filter);
+// surface could not display subpixel text. `plain_fontations` says Windows
+// renders this typeface through plain Fontations, whose rec keeps SkFont's
+// default hinting and never regains kGenA8FromLCD_Flag.
+void ApplyWindowsParams(void* rec, uint16_t flags_before_filter, bool plain_fontations);
 
 // Replace the loaded image's GetFontRenderParamsFromFcPattern with one that
 // states those same answers, for the browser process, which is where Chromium

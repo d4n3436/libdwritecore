@@ -134,41 +134,46 @@ bool HasFamily(const PatternGetStringFn get_string, const void* font, const char
     return false;
 }
 
-// Whether Windows answers an italic request for this family and weight with an
-// upright face. Cached, since the answer is a property of the installed family
-// and the sort asks a handful of times per page.
-int DWriteWantsUpright(const char* family, const int weight)
+// Whether Windows answers a slanted request for this family and weight with an
+// upright face. `style` is the DWRITE_FONT_STYLE the request carries, since an
+// oblique request is answered by a simulated entry where an italic one keeps a
+// real italic face. Cached, since the answer is a property of the installed
+// family and the sort asks a handful of times per page.
+int DWriteWantsUpright(const char* family, const int weight, const int style)
 {
     struct Answer
     {
         char family[64];
         int weight;
+        int style;
         int upright;
     };
     static Answer seen[64];
     static unsigned count = 0;
     for (unsigned i = 0; i < count; ++i) {
-        if (seen[i].weight == weight && strcasecmp(seen[i].family, family) == 0) {
+        if (seen[i].weight == weight && seen[i].style == style &&
+            strcasecmp(seen[i].family, family) == 0) {
             return seen[i].upright;
         }
     }
     int got_weight = 0;
     bool got_italic = false;
     const int upright =
-        dwrite_raster::FamilyMatchFace(family, weight, true, &got_weight, &got_italic)
+        dwrite_raster::FamilyMatchFace(family, weight, style, &got_weight, &got_italic)
             ? (got_italic ? 0 : 1)
             : -1;
     if (std::getenv("DWC_FAMILY_MATCH_LOG") != nullptr) {
         (void)std::fprintf(stderr,
-                           "chromium-patch: family match: dwrite %s at %d italic -> "
+                           "chromium-patch: family match: dwrite %s at %d style %d -> "
                            "weight %d %s (upright=%d)\n",
-                           family, weight, got_weight,
+                           family, weight, style, got_weight,
                            got_italic ? "italic" : "upright", upright);
     }
     if (count < sizeof(seen) / sizeof(seen[0]) &&
         std::strlen(family) < sizeof(seen[0].family)) {
         (void)std::snprintf(seen[count].family, sizeof(seen[count].family), "%s", family);
         seen[count].weight = weight;
+        seen[count].style = style;
         seen[count].upright = upright;
         ++count;
     }
@@ -231,18 +236,24 @@ void ReorderForWindows(const void* pattern, void* sorted)
     }
     const float wanted = OpenTypeWeightImpl(fc_weight);
 
+    // The slant the request asked for, not the one fontconfig chose; an
+    // oblique request is matched to an italic face by fontconfig, and the
+    // distinction is what GetFirstMatchingFont answers by.
     int slant = 0;
-    if (get_integer(set->fonts[0], "slant", 0, &slant) != kFcResultMatch) {
+    if (get_integer(pattern, "slant", 0, &slant) != kFcResultMatch &&
+        get_integer(set->fonts[0], "slant", 0, &slant) != kFcResultMatch) {
         return;
     }
-    // Which slant to hold candidates to. Usually the one fontconfig already
-    // chose, so an italic request keeps picking among italics. Windows gives
-    // up the slant before the weight at the top of the scale, though, so
+    // Which slant to hold candidates to. Usually the requested one, so an
+    // italic request keeps picking among italics. Windows gives up the slant
+    // before the weight at the top of the scale, and for oblique requests at
+    // every weight where the answer is a simulated entry, so
     // GetFirstMatchingFont is asked and its answer decides. Arial at 900
     // italic is Arial Black there, which has no italic face.
     int want_slant = slant;
     if (slant != 0) {
-        if (const int upright = DWriteWantsUpright(family, static_cast<int>(wanted));
+        const int style = slant >= 110 ? 1 : 2;    // DWRITE oblique : italic
+        if (const int upright = DWriteWantsUpright(family, static_cast<int>(wanted), style);
             upright > 0) {
             want_slant = 0;
         }
