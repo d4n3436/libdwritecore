@@ -42,6 +42,7 @@ def main():
         vp.converge_inner_size(b, args.width, args.height, vp.SETUP_TIMEOUT)
         vp.hide_scrollbars(b)
         vp.pin_color_scheme(b)
+        vp.block_offserver(b, args.prefix)
         return b
 
     browser = connect()

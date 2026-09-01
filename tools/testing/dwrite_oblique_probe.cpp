@@ -51,7 +51,7 @@ std::u16string Wide(const char* s)
 // CSS scale and lands on the heaviest face.
 void Matrix(IDWriteFontFamily* family, const char* name)
 {
-    constexpr int kWeights[] = {100, 200, 300, 400, 500, 600, 700, 800, 900, 950, 1000};
+    constexpr int kWeights[] = {100, 250, 400, 500, 549, 550, 551, 600, 700, 800, 900, 1000};
     constexpr DWRITE_FONT_STYLE kStyles[] = {DWRITE_FONT_STYLE_NORMAL,
                                              DWRITE_FONT_STYLE_ITALIC,
                                              DWRITE_FONT_STYLE_OBLIQUE};

@@ -1,0 +1,19 @@
+# Page paths whose difference comes from the toolkit drawing native form
+# controls, which no font decision reaches. Passed to compare_pages.sh with
+# --accept, or named by an `accept` line in a plan.
+#
+# An accepted cell is still captured, compared and printed, marked `accepted`.
+# It stays out of the worst-channel figure and the wedge heuristics and is
+# counted on its own line, so it still reports when it starts matching and
+# when its difference changes.
+#
+# The cells below differ on solid control edges at a max channel difference of
+# 255. GTK draws the control on Linux and the Windows theme draws it on
+# Windows.
+#
+# Two rules for an entry. Keep a pattern as tight as the class it names: the
+# glob is matched with `case`, whose * crosses a slash, so a directory pattern
+# covers everything under it and can mark a cell that broke for an unrelated
+# reason. And never list a cell whose difference fails to repeat, since an
+# accepted cell no longer reports a new kind of failure; fix the flake.
+wt/external/wpt/css/css-writing-modes/forms/*

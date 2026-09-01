@@ -530,6 +530,44 @@ def wait_for_removal(path, deadline=WORK_TIMEOUT):
         time.sleep(POLL)
 
 
+# A fixture that fetches from the network is not comparable: the two machines
+# reach a different web at a different moment, and a page that builds itself
+# from what it fetched then differs everywhere with nothing wrong underneath.
+# Network.setBlockedURLs takes URLPattern entries matched first to last, each
+# saying whether it blocks, so the page server is allowed and everything else
+# refused. Local subresources are unaffected; only the CDP driver can do this.
+def block_offserver(browser, prefix):
+    """Refuse every request the page server did not serve."""
+    if not hasattr(browser, "call"):
+        return
+    browser.call("Network.setBlockedURLs", {"urlPatterns": [
+        {"urlPattern": prefix.rstrip("/") + "/*", "block": False},
+        {"urlPattern": "*://*/*", "block": True},
+    ]})
+
+
+# A page that animates photographs at whatever phase each machine reached, so
+# an infinite CSS animation or a long transition differs on every capture with
+# nothing wrong underneath. Every animation is paused and seeked to its start,
+# which both sides can do exactly. getAnimations covers CSS animations, CSS
+# transitions and script-driven ones alike, and a page without any is a no-op.
+PIN_ANIMATIONS = """
+let pinned = 0;
+for (const a of document.getAnimations()) {
+  try { a.pause(); a.currentTime = 0; pinned++; } catch (e) {}
+}
+return pinned;
+"""
+
+
+def pin_animations(browser):
+    """Hold every animation on the current page at its first frame."""
+    try:
+        return browser.script(PIN_ANIMATIONS)
+    except Exception:                      # noqa: BLE001
+        return 0
+
+
 def park_pointer(browser):
     """Move the pointer to the top-left corner of the viewport.
 
@@ -613,6 +651,7 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
     # sits, and whatever is under it renders hovered until the pointer is
     # moved again, so the park is per page.
     park_pointer(browser)
+    pin_animations(browser)
     # The frame heuristics above cannot prove that everything painted: a
     # background image decodes with nothing to await and its first frame can
     # land after any fixed number of quiet ones. Two consecutive captures

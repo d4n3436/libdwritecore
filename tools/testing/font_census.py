@@ -24,6 +24,9 @@ session is one table row.
             and once with Latin text, since the maps key on the element's
             locale and pick the CJK face for Latin text inside a CJK element.
   families  every named family crossed with the nine weights and both slants.
+  uifonts   the CSS system font keywords, caption through status-bar, each
+            resolved to a family, size, weight and slant. LayoutThemeFontProvider
+            answers these, and its Windows and default builds disagree.
   fallback  which family draws every renderable codepoint, per content
             language and generic. Ranges that answer with one family are taken
             whole and mixed ones are split, so the full space costs little
@@ -43,6 +46,12 @@ session is one table row.
             that needs pixels; everything the other modes cleared that still
             differs here is rasterization itself.
   all       every mode above, with one summary.
+
+--mirror-a and --mirror-b name extra connections to more instances of the
+same build, which take a share of that side's metrics measuring. One renderer
+stops scaling past a few worker threads, so a second browser instance is what
+turns more cores into a faster pass; run_electron_side.sh's guest command
+starts one on the guest at 9231 for this.
 
 --full widens fallback and raster to every language the generics mode knows.
 --accept names a file of cell keys (one per line, # comments) to report as
@@ -121,8 +130,10 @@ METRIC_SIZES = [11, 12, 12.5, 13, 13.28, 13.33, 14.4, 16, 16.6, 17.28,
 
 # The weights a family is actually asked for on a page, plus the ones that
 # Windows maps differently inside a family. 900 and 1000 reach the heaviest
-# face and the synthetic-bold decision over it.
-METRIC_WEIGHTS = [300, 400, 500, 600, 700, 900, 1000]
+# face and the synthetic-bold decision over it. 250, 550 and 800 are the
+# midpoints between the face weights a Windows family usually carries, where
+# the nearest-weight rule ties and the tie-break decides the face on its own.
+METRIC_WEIGHTS = [250, 300, 400, 500, 550, 600, 700, 800, 900, 1000]
 
 # Whether the face is asked for upright or slanted. A family with no italic
 # face gets a synthetic oblique, and which faces exist differs by family, so
@@ -259,6 +270,7 @@ class CdpSide:
     def __init__(self, endpoint):
         host, _, port = endpoint.partition(":")
         self.name = endpoint
+        self.mirrors = []
         self.browser = vp.CdpBrowser(host, int(port or 9222), timeout=120.0)
         self.browser.navigate("about:blank")
         vp.await_condition(self.browser, vp.PAGE_LOADED, 30,
@@ -351,11 +363,55 @@ class MarionetteSide:
     def __init__(self, endpoint):
         host, _, port = endpoint.partition(":")
         self.name = endpoint
+        self.mirrors = []
         self.m = marionette.Marionette(host, int(port or 2828), timeout=120)
         self.m.start("content")
         self.m.call("WebDriver:Navigate", {"url": "about:blank"})
         self.evaluate("document.documentElement.style.overflow = 'hidden';"
                       "return 1;")
+        if kViewport is not None and not self.pin_viewport(*kViewport):
+            sys.exit("%s would not take a %dx%d content area; a mode that "
+                     "compares whole screenshots needs both sides the same "
+                     "size, and mismatched ones report negative counts"
+                     % (self.name, kViewport[0], kViewport[1]))
+
+    def pin_viewport(self, width, height):
+        """Size the window so its content area is exactly width by height.
+
+        Marionette sizes the window and DevTools sizes the viewport, so this
+        has to work back through the chrome between them, which differs per
+        profile and per window manager. The difference is measured rather
+        than assumed, and more than once, since a window manager can hand
+        back a size other than the one it was given.
+
+        A viewport larger than the screen is taken, not refused: Firefox
+        reports the layout viewport whatever the window manager does with the
+        frame. That only matters to a mode that photographs the window, and
+        none does on this driver.
+        """
+        entry = None
+        for _ in range(4):
+            inner_w, inner_h, outer_w, outer_h = json.loads(self.evaluate(
+                "return JSON.stringify([innerWidth, innerHeight,"
+                " outerWidth, outerHeight]);"))
+            if inner_w == width and inner_h == height:
+                return True
+            if entry is None:
+                entry = (outer_w, outer_h)
+            self.m.call("WebDriver:SetWindowRect",
+                        {"width": outer_w + width - inner_w,
+                         "height": outer_h + height - inner_h})
+        inner_w, inner_h = json.loads(self.evaluate(
+            "return JSON.stringify([innerWidth, innerHeight]);"))
+        if inner_w == width and inner_h == height:
+            return True
+        # A window manager can clamp one axis and take the other, leaving the
+        # browser at neither size. Restoring what it had keeps a refusal from
+        # changing what the next caller measures through.
+        if entry is not None:
+            self.m.call("WebDriver:SetWindowRect",
+                        {"width": entry[0], "height": entry[1]})
+        return False
 
     def build(self, spec):
         self.m.script(BUILD, [json.dumps(spec)])
@@ -661,11 +717,12 @@ return JSON.stringify(out);
 
 ASCII = "".join(chr(c) for c in range(0x21, 0x7F))
 
-# measureText is nearly the whole cost of a metrics pass, and it runs inside
-# the page, so threads are the lever: a renderer measures on one thread per
-# worker. Past four the curve flattens, since configs are family-major and
-# threads start sharing a face. DWC_METRIC_WORKERS=0 measures on the main
-# thread.
+# measureText is nearly the whole cost of a metrics pass and runs inside the
+# page, so threads are the lever. Four is the optimum for a lone browser: a
+# renderer stops scaling there whatever the core count, and more workers than
+# that collapse into lock convoys. Three is faster when a side has mirrors,
+# since two renderers on one machine oversubscribe it.
+# DWC_METRIC_WORKERS=0 measures on the main thread.
 kMetricWorkers = int(os.environ.get("DWC_METRIC_WORKERS", "4"))
 
 # The same measurement as MEASURE, against an OffscreenCanvas because a worker
@@ -749,6 +806,50 @@ def workers_agree(side, batch):
 
 
 
+# The CSS system font keywords, which are CSSValueID kCaption through
+# kStatusBar (CSSParserFastPaths::IsValidSystemFont). Each resolves to a
+# family and a size through LayoutThemeFontProvider, whose Windows and default
+# implementations differ, so the keyword is a decision layer of its own and no
+# other mode reaches it.
+UI_FONTS = ["caption", "icon", "menu", "message-box", "small-caption",
+            "-webkit-mini-control", "-webkit-small-control", "-webkit-control",
+            "status-bar"]
+
+UI_MEASURE = """
+const keys = arguments[0];
+const out = [];
+for (const key of keys) {
+  const d = document.createElement('div');
+  d.style.font = key;
+  const span = document.createElement('span');
+  span.textContent = 'Hxg 0123';
+  d.appendChild(span);
+  document.body.appendChild(d);
+  const cs = getComputedStyle(d);
+  const r = span.getBoundingClientRect();
+  out.push([cs.fontFamily, cs.fontSize, cs.fontWeight, cs.fontStyle,
+            Math.round(r.width * 100) / 100, Math.round(r.height * 100) / 100]);
+  d.remove();
+}
+return JSON.stringify(out);
+"""
+
+
+def mode_uifonts(sides, full):
+    labels = ["family", "size", "weight", "style", "width", "height"]
+
+    def ask(side):
+        return json.loads(side.evaluate(UI_MEASURE, [UI_FONTS]))
+
+    rows = list(both_sides(ask, sides))
+    out = {}
+    for i, key in enumerate(UI_FONTS):
+        for v, (va, vb) in enumerate(zip(rows[0][i], rows[1][i])):
+            if va != vb:
+                out["%s|%s" % (key, labels[v])] = (va, vb)
+    return out, len(UI_FONTS) * len(labels)
+
+
 def mode_metrics(sides, full):
     configs = shard([['"%s"' % fam, size, weight, style]
                      for fam in FAMILIES if keep_family(fam) for size in METRIC_SIZES
@@ -760,19 +861,50 @@ def mode_metrics(sides, full):
     # outruns the socket timeout and leaves the renderer still running it, so
     # the browser is wedged for every run after. A batch also gives the run
     # something to print.
+    #
+    # A side with mirrors measures its share of the configs on each of them at
+    # once. One renderer stops scaling past kMetricWorkers threads however many
+    # cores the machine has, so the way to use more cores is more browsers.
     def measure(side):
+        conns = [side] + side.mirrors
         fast = (kMetricWorkers >= 2 and
-                workers_agree(side, configs[:kWorkerProbe]))
+                all(workers_agree(conn, configs[:kWorkerProbe]) for conn in conns))
         if kMetricWorkers >= 2 and not fast:
             print("  %s: workers declined, measuring on the main thread"
                   % side.name, file=sys.stderr)
-        got = []
-        step = kConfigsPerWorkerBatch if fast else kConfigsPerBatch
-        for at in range(0, len(configs), step):
-            batch = configs[at:at + step]
-            rows = measure_workers(side, batch) if fast else None
-            got.extend(rows if rows is not None else measure_main(side, batch))
-        return got
+        if not fast:
+            got = []
+            for at in range(0, len(configs), kConfigsPerBatch):
+                got.extend(measure_main(side, configs[at:at + kConfigsPerBatch]))
+            return got
+        # Contiguous shares, one per connection, so joining the parts in
+        # connection order restores config order.
+        share = (len(configs) + len(conns) - 1) // len(conns)
+        parts = [configs[i * share:(i + 1) * share] for i in range(len(conns))]
+        rows = [None] * len(conns)
+        errors = [None] * len(conns)
+
+        def run(i):
+            try:
+                got = []
+                for at in range(0, len(parts[i]), kConfigsPerWorkerBatch):
+                    batch = parts[i][at:at + kConfigsPerWorkerBatch]
+                    measured = measure_workers(conns[i], batch)
+                    got.extend(measured if measured is not None
+                               else measure_main(conns[i], batch))
+                rows[i] = got
+            except BaseException as exc:             # noqa: BLE001
+                errors[i] = exc
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(len(conns))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for exc in errors:
+            if exc is not None:
+                raise exc
+        return [row for part in rows for row in part]
 
     rows = list(both_sides(measure, sides))
     labels = ["applied", "boxAscent", "boxDescent", "inkAscent", "inkDescent",
@@ -880,6 +1012,16 @@ def mode_raster(sides, full):
     import numpy as np
     from PIL import Image
 
+    # Only where the screenshot photographs the window. Marionette answers
+    # TakeScreenshot out of drawSnapshot, which re-renders the page with
+    # grayscale antialiasing where the window carries subpixel, so the grid
+    # differs for a reason no font decides.
+    if any(side.driver == "marionette" for side in sides):
+        sys.exit("raster mode needs a screenshot of the window, and Firefox "
+                 "answers with a drawSnapshot re-render whose antialiasing is "
+                 "not what it paints. Sweep the page set with compare_pages.sh "
+                 "instead, whose capture photographs the real window.")
+
     cps = renderable(0x30000) if full else renderable(0x10000)[::16]
     # The quick run keeps to the no-language set. A --lang or --full run
     # takes the per-language rows through keep_lang, the same way fallback
@@ -943,6 +1085,7 @@ def mode_raster(sides, full):
 
 MODES = {
     "generics": mode_generics,
+    "uifonts": mode_uifonts,
     "families": mode_families,
     "fallback": mode_fallback,
     "metrics": mode_metrics,
@@ -1007,6 +1150,13 @@ def main():
     ap.add_argument("--viewport", default=None, metavar="WxH",
                     help="pin both sides to this viewport, for raster mode on a "
                          "browser whose window size the platforms disagree on")
+    ap.add_argument("--mirror-a", action="append", default=None, metavar="SPEC",
+                    help="another connection to the same build as sideA that "
+                         "takes a share of its metrics measuring; repeatable. "
+                         "One renderer stops scaling past a few worker threads, "
+                         "so a second browser instance is what uses more cores.")
+    ap.add_argument("--mirror-b", action="append", default=None, metavar="SPEC",
+                    help="same as --mirror-a, for sideB")
     ap.add_argument("--accept", action="append", default=None,
                     help="file of cell keys to report as accepted; repeatable, "
                          "so a build with its own accepted cells adds a file "
@@ -1032,6 +1182,13 @@ def main():
         sys.exit("both sides must be the same browser; %s answers over %s and "
                  "%s over %s" % (args.a, sides[0].driver, args.b,
                                  sides[1].driver))
+    for side, specs in zip(sides, (args.mirror_a, args.mirror_b)):
+        for spec in specs or []:
+            mirror = open_side(spec)
+            if mirror.driver != side.driver:
+                sys.exit("mirror %s answers over %s, its side over %s"
+                         % (spec, mirror.driver, side.driver))
+            side.mirrors.append(mirror)
     if args.lang is not None:
         globals()["kOnlyLangs"] = set(args.lang.split(","))
     if args.configs is not None:
@@ -1047,6 +1204,13 @@ def main():
             sys.exit("--family does not know %s" % ", ".join(unknown))
         globals()["kOnlyFamilies"] = set(args.family)
     names = sorted(MODES) if args.mode == "all" else [args.mode]
+    # Named on its own, raster says why it cannot answer for this browser and
+    # stops. Reached through `all`, it is dropped instead, so the modes that
+    # do answer still run.
+    if args.mode == "all" and any(side.driver == "marionette" for side in sides):
+        names = [name for name in names if name != "raster"]
+        print("  note: raster does not run on Firefox, whose screenshot is a "
+              "drawSnapshot re-render rather than the window", file=sys.stderr)
     failing = 0
     try:
         started = time.monotonic()
@@ -1070,6 +1234,8 @@ def main():
             print("== %d modes in %s" % (len(names), elapsed(time.monotonic() - started)))
     finally:
         for side in sides:
+            for mirror in side.mirrors:
+                mirror.close()
             side.close()
     return 1 if failing else 0
 

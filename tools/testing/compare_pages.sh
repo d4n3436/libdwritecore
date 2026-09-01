@@ -3,12 +3,14 @@
 # compare_pages.sh - run a whole page set past two browsers and tabulate it.
 #
 #   compare_pages.sh <plan> [--keep] [--clusters N] [--css RULES]
+#                            [--accept FILE]...
 #
 # The plan is the comparison, written down. Everything a sweep needs is in it:
 #
 #     size 2200 1150
 #     side linux x11::99          127.0.0.1  2828 http://127.0.0.1:8080
 #     side win   libvirt:<domain> <guest-ip> 2929 http://<host-ip>:8080 cdp
+#     accept widget-chrome.accept
 #     page example/index.html     0
 #     page example-long/index.html 0 1000 4600 8800
 #
@@ -21,6 +23,14 @@
 #           server by, which is not the same string on both when one of them
 #           is a guest
 #   page    a path under both prefixes, then one or more scroll offsets
+#   accept  a file of page-path globs whose difference is known not to be the
+#           shim's, one per line with # comments, repeatable. Those cells are
+#           still captured, compared and printed, marked `accepted`, and are
+#           kept out of the worst-channel figure and the wedge heuristics.
+#           Nothing is dropped: a cell listed there that changes is still
+#           visible. --accept on the command line adds a file to whatever the
+#           plan names. A relative path is looked for beside the plan first,
+#           then beside this script.
 #
 # A side's sixth field is its browser driver, `marionette` for Firefox or
 # `cdp` for Chromium and Electron, and it defaults to marionette.
@@ -65,11 +75,13 @@ PLAN="$1"; shift
 KEEP=0
 CLUSTERS=""
 CSS=()
+ACCEPT_FILES=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --keep)     KEEP=1; shift ;;
         --clusters) CLUSTERS="--clusters $2"; shift 2 ;;
         --css)      CSS=(--css "$2"); shift 2 ;;
+        --accept)   ACCEPT_FILES+=("$2"); shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -92,6 +104,7 @@ while read -r kind rest; do
             LABELS+=("$1"); BACKENDS+=("$2"); HOSTS+=("$3"); PORTS+=("$4"); PREFIXES+=("$5")
             DRIVERS+=("${6:-marionette}") ;;
         page) PAGES+=("$rest") ;;
+        accept) ACCEPT_FILES+=("$rest") ;;
         *) echo "unknown plan line: $kind $rest" >&2; exit 2 ;;
     esac
 done < "$PLAN"
@@ -152,8 +165,41 @@ printf '%-38s %8s  %10s  %8s\n' "-------------------------------------" ------- 
 STARTED=$(date +%s)
 WORST=0
 EXACT=0
+# Page paths whose difference no font decision reaches. Those cells are still
+# captured, compared and printed, marked, and counted on their own line; they
+# stay out of the worst-channel figure and the wedge heuristics. A pattern is
+# a shell glob against the page path as the plan writes it, and a relative
+# accept file is looked for beside the plan first, then beside this script.
+ACCEPT_PATTERNS=()
+for file in ${ACCEPT_FILES+"${ACCEPT_FILES[@]}"}; do
+    found="$file"
+    [ -f "$found" ] || found="$(dirname "$PLAN")/$file"
+    [ -f "$found" ] || found="$HERE/$file"
+    [ -f "$found" ] || { echo "no such accept file: $file" >&2; exit 2; }
+    while read -r pattern; do
+        case "${pattern:-}" in ""|\#*) continue ;; esac
+        ACCEPT_PATTERNS+=("$pattern")
+    done < "$found"
+done
+
+is_accepted() {
+    local path="$1" pattern
+    for pattern in ${ACCEPT_PATTERNS+"${ACCEPT_PATTERNS[@]}"}; do
+        case "$path" in $pattern) return 0 ;; esac
+    done
+    return 1
+}
+
+# How long one cell may go undelivered while some sweeper is still alive. A
+# slow page on a loaded machine is ordinary, so only a side that has stopped
+# delivering should reach it.
+STALL_SECONDS=180
+STALL_TICKS=$((STALL_SECONDS * 20))
+
 FAILED=0
 CELLS=0
+ACCEPTED=0
+STALLED=0
 STRIKES=0
 
 # The longest run of consecutive cells that came out unrecognizable, and where
@@ -294,11 +340,20 @@ if [ "$DIRECT" = 1 ]; then
     for n in $(seq 1 "$CELLS"); do
         cell="$SHOTS/cell$n"
         a="$cell/${LABELS[0]}_clean.png"; b="$cell/${LABELS[1]}_clean.png"
+        # A cell needs both sides. Sweepers exit at different times when a
+        # side shards, so one being gone does not mean the sweep is over; the
+        # deadline is what ends the wait when nothing arrives at all.
+        waited=0
         while [ ! -f "$a" ] || [ ! -f "$b" ]; do
-            # A sweeper that has finished will not deliver anything more.
             alive=0
             for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
             if [ "$alive" = 0 ]; then break; fi
+            if [ "$waited" -ge "$STALL_TICKS" ]; then
+                echo "no capture for cell $n in ${STALL_SECONDS}s while a sweeper is still running; treating it as failed" >&2
+                STALLED=$((STALLED + 1))
+                break
+            fi
+            waited=$((waited + 1))
             sleep 0.05
         done
         if [ ! -f "$a" ] || [ ! -f "$b" ]; then
@@ -307,8 +362,15 @@ if [ "$DIRECT" = 1 ]; then
             grep "^fail $n " "$SHOTS/${LABELS[0]}".*.log \
                  "$SHOTS/${LABELS[1]}".*.log 2>/dev/null | sed 's/^/    /' >&2
             FAILED=$((FAILED + 1))
+            # A side that stopped delivering fails every cell after this one
+            # too, each at the full stall wait, so two in a row ends the plan.
+            if [ "$STALLED" -ge 2 ]; then
+                echo "two cells in a row waited out the capture, so one side is not delivering; the rest of the plan is skipped" >&2
+                break
+            fi
             continue
         fi
+        STALLED=0
         python3 "$HERE/compare_viewport.py" "$WIDTH" "$HEIGHT" "$a" "$b" \
                 --cluster-log "$SHOTS/clusters.tsv" \
                 --cluster-tag "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
@@ -316,11 +378,18 @@ if [ "$DIRECT" = 1 ]; then
         out="$(cat "$cell/out")"
         pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
         max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
-        printf '%-38s %8s  %9s%%  %8s\n' "${ALL_PATHS[$((n-1))]}" \
-               "${ALL_SCROLLS[$((n-1))]}" "${pct:-?}" "${max:-0}"
-        if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+        mark=""
+        if [ "${pct:-}" != "100.0000" ] && is_accepted "${ALL_PATHS[$((n-1))]}"; then
+            mark=" accepted"
+            ACCEPTED=$((ACCEPTED + 1))
+        fi
+        printf '%-38s %8s  %9s%%  %8s%s\n' "${ALL_PATHS[$((n-1))]}" \
+               "${ALL_SCROLLS[$((n-1))]}" "${pct:-?}" "${max:-0}" "$mark"
+        if [ -z "$mark" ]; then
+            if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+            note_divergence "${pct:-}" "$n"
+        fi
         [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
-        note_divergence "${pct:-}" "$n"
         if [ -n "$CLUSTERS" ]; then
             printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
         fi
@@ -328,7 +397,8 @@ if [ "$DIRECT" = 1 ]; then
     wait "${SWEEPERS[@]}" 2>/dev/null
     [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
-    printf '\n%d of %d identical\n' "$EXACT" "$CELLS"
+    printf '\n%d of %d identical%s\n' "$EXACT" "$CELLS" \
+           "$([ "$ACCEPTED" -gt 0 ] && echo ", $ACCEPTED accepted")"
     printf '%d cells in %ds, worst channel difference %d%s\n' \
            "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
            "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
@@ -351,10 +421,17 @@ report() {
     out="$(cat "$P_DIR/out")"
     pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
     max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
-    printf '%-38s %8s  %9s%%  %8s\n' "$P_PATH" "$P_SCROLL" "${pct:-?}" "${max:-0}"
-    if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+    mark=""
+    if [ "${pct:-}" != "100.0000" ] && is_accepted "$P_PATH"; then
+        mark=" accepted"
+        ACCEPTED=$((ACCEPTED + 1))
+    fi
+    printf '%-38s %8s  %9s%%  %8s%s\n' "$P_PATH" "$P_SCROLL" "${pct:-?}" "${max:-0}" "$mark"
+    if [ -z "$mark" ]; then
+        if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+        note_divergence "${pct:-}" "$P_N"
+    fi
     [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
-    note_divergence "${pct:-}" "$P_N"
     if [ -n "$CLUSTERS" ]; then
         printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
     fi
@@ -418,7 +495,8 @@ done
 report
 [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
-printf '\n%d of %d identical\n' "$EXACT" "$CELLS"
+printf '\n%d of %d identical%s\n' "$EXACT" "$CELLS" \
+       "$([ "$ACCEPTED" -gt 0 ] && echo ", $ACCEPTED accepted")"
 printf '%d cells in %ds, worst channel difference %d%s\n' \
        "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
        "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"

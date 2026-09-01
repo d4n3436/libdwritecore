@@ -19,6 +19,11 @@ lines only, one per test file, so:
 
 Skipped outright: -expected files, and the tests that render differently on
 purpose from one run to the next, which are listed in SKIP with the reason.
+
+An `accept` line is emitted ahead of the pages, naming the file of paths whose
+difference is the toolkit drawing its own widgets. Those cells are still swept
+and printed, marked, and kept out of the totals that a regression would show
+in; see widget-chrome.accept for what is in it and why.
 """
 
 import os
@@ -34,10 +39,16 @@ SKIP = {
 }
 
 
+# Written ahead of the pages, so a generated plan carries its own accepted
+# cells and a sweep of it needs no extra argument to stay readable.
+ACCEPT = "widget-chrome.accept"
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__.strip())
     root = sys.argv[1]
+    print("accept %s" % ACCEPT)
     for suite in sys.argv[2:]:
         for base, _, names in sorted(os.walk(os.path.join(root, suite))):
             rel_base = os.path.relpath(base, root)

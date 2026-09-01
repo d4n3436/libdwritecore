@@ -56,9 +56,14 @@ case "${1:-}" in
     guest|guest-stop) COMMAND="$1"; GUEST_DOMAIN="${2:?guest needs a libvirt domain}"
         shift 2
         GUEST_PORT=9223
+        # A second instance for census --mirror-b. One renderer stops scaling
+        # past a few worker threads, so the extra guest cores are only reached
+        # through another browser.
+        MIRROR_PORT=9231
         while [ $# -gt 0 ]; do
             case "$1" in
                 --port) GUEST_PORT="$2"; shift 2 ;;
+                --mirror-port) MIRROR_PORT="$2"; shift 2 ;;
                 *) echo "unknown option: $1" >&2; exit 2 ;;
             esac
         done
@@ -85,8 +90,11 @@ if [ "${COMMAND:-}" = "guest-stop" ]; then
     run_guest "
 Get-Process electron -ErrorAction SilentlyContinue | Stop-Process -Force
 schtasks /delete /tn dwcel /f 2>&1 | Out-Null
+schtasks /delete /tn dwcelb /f 2>&1 | Out-Null
 netsh interface portproxy delete v4tov4 listenport=$GUEST_PORT listenaddress=0.0.0.0 | Out-Null
+netsh interface portproxy delete v4tov4 listenport=$MIRROR_PORT listenaddress=0.0.0.0 | Out-Null
 netsh advfirewall firewall delete rule name=dwc-devtools | Out-Null
+netsh advfirewall firewall delete rule name=dwc-devtools-b | Out-Null
 Write-Output 'guest stopped'
 "
     exit $?
@@ -102,10 +110,15 @@ New-Item -ItemType Directory -Force -Path C:\eparity\app | Out-Null
 [IO.File]::WriteAllBytes('C:\eparity\app\main.js', [Convert]::FromBase64String('$MAIN_B64'))
 [IO.File]::WriteAllBytes('C:\eparity\app\package.json', [Convert]::FromBase64String('$PKG_B64'))
 Set-Content -Path C:\eparity\run.cmd -Value 'set DWC_URL=about:blank&& set DWC_W=1920&& set DWC_H=1080&& C:\eparity\electron\electron.exe --remote-debugging-port=9222 --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion C:\eparity\app'
+Set-Content -Path C:\eparity\run-b.cmd -Value 'set DWC_URL=about:blank&& set DWC_W=1920&& set DWC_H=1080&& C:\eparity\electron\electron.exe --remote-debugging-port=9230 --user-data-dir=C:\eparity\udb --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion C:\eparity\app'
 schtasks /create /tn dwcel /tr 'cmd.exe /c C:\eparity\run.cmd' /sc onstart /ru SYSTEM /rl highest /f | Out-Null
+schtasks /create /tn dwcelb /tr 'cmd.exe /c C:\eparity\run-b.cmd' /sc onstart /ru SYSTEM /rl highest /f | Out-Null
 netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$GUEST_PORT connectaddress=127.0.0.1 connectport=9222 | Out-Null
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$MIRROR_PORT connectaddress=127.0.0.1 connectport=9230 | Out-Null
 netsh advfirewall firewall add rule name=dwc-devtools dir=in action=allow protocol=TCP localport=$GUEST_PORT 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-devtools-b dir=in action=allow protocol=TCP localport=$MIRROR_PORT 2>&1 | Out-Null
 schtasks /run /tn dwcel | Out-Null
+schtasks /run /tn dwcelb | Out-Null
 foreach (\$i in 1..60) {
     Start-Sleep -Milliseconds 500
     try {
