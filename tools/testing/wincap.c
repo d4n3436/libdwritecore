@@ -7,6 +7,8 @@
  * --serve answers one request per connection, the shape the sweep's grabber
  * wants:
  *
+ *   KEEP                 -> "OK\n", and the connection then takes further
+ *                           requests instead of closing after one
  *   SIZE                 -> "W H\n", the matched window's size
  *   GRAB  x y w h        -> "P6\nW H\n255\n" then w*h*3 bytes of RGB
  *   GRABZ x y w h        -> "PK\nW H N\n" then N bytes, PackBits over whole
@@ -158,6 +160,131 @@ static unsigned char* grab_rect(int x, int y, int w, int h)
  * find its marker and then takes the viewport, so the rectangle is the whole
  * protocol; anything richer would be a second thing to keep in step with the
  * host side. */
+/* One request on an open connection. False once the socket is finished with,
+ * which is a client that has gone away, a malformed request, or an answer sent
+ * on a connection that never asked to be kept. */
+static int serve_one(SOCKET c, int* keep)
+{
+    char req[256] = {0};
+    int got = 0;
+    int whole = 0;
+    /* One byte at a time, which stops exactly at the newline and so cannot eat
+     * into the next request on a kept connection. The bytes are already in the
+     * socket buffer, so this is syscalls and not round trips. */
+    while (got < (int)sizeof(req) - 1) {
+        const int n = recv(c, req + got, 1, 0);
+        if (n <= 0) { return 0; }
+        if (req[got] == '\n') { whole = 1; break; }
+        ++got;
+    }
+    if (!whole) { return 0; }
+    req[got] = '\0';
+
+    if (strncmp(req, "KEEP", 4) == 0) {
+        *keep = 1;
+        send(c, "OK\n", 3, 0);
+        return 1;
+    }
+
+    int x = 0, y = 0, w = 0, h = 0;
+    const int packed = (strncmp(req, "GRABZ", 5) == 0);
+    if (strncmp(req, "SIZE", 4) == 0) {
+        char line[64];
+        int fw = 0, fh = 0;
+        window_size(&fw, &fh);
+        const int n = snprintf(line, sizeof(line), "%d %d\n", fw, fh);
+        send(c, line, n, 0);
+        return *keep;
+    }
+    if (sscanf(req + (packed ? 5 : 4), " %d %d %d %d", &x, &y, &w, &h) != 4 ||
+        w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+        const char* err = "P6\n0 0\n255\n";
+        send(c, err, (int)strlen(err), 0);
+        return *keep;
+    }
+    unsigned char* bgra = grab_rect(x, y, w, h);
+    if (bgra == NULL) {
+        const char* err = "P6\n0 0\n255\n";
+        send(c, err, (int)strlen(err), 0);
+        return *keep;
+    }
+    if (packed) {
+        /* PackBits over whole pixels. A page of text is mostly one color, so
+         * this is worth 20 to 50 times on a viewport and turns the wire into
+         * the cheap part of a sweep again. The host reverses it; the length
+         * prefix lets it read exactly one answer. */
+        const size_t pixels_n = (size_t)w * (size_t)h;
+        unsigned char* packbuf = (unsigned char*)malloc(pixels_n * 4 + 64);
+        size_t out_n = 0;
+        size_t i = 0;
+        while (i < pixels_n) {
+            const unsigned char* px = bgra + i * 4;
+            size_t run = 1;
+            while (i + run < pixels_n && run < 128 &&
+                   memcmp(bgra + (i + run) * 4, px, 3) == 0) {
+                ++run;
+            }
+            if (run > 1) {
+                packbuf[out_n++] = (unsigned char)(257 - run);
+                packbuf[out_n++] = px[2];
+                packbuf[out_n++] = px[1];
+                packbuf[out_n++] = px[0];
+                i += run;
+                continue;
+            }
+            size_t lit = 1;
+            while (i + lit < pixels_n && lit < 128 &&
+                   memcmp(bgra + (i + lit) * 4, bgra + (i + lit - 1) * 4, 3) != 0) {
+                ++lit;
+            }
+            packbuf[out_n++] = (unsigned char)(lit - 1);
+            for (size_t k = 0; k < lit; ++k) {
+                const unsigned char* q = bgra + (i + k) * 4;
+                packbuf[out_n++] = q[2];
+                packbuf[out_n++] = q[1];
+                packbuf[out_n++] = q[0];
+            }
+            i += lit;
+        }
+        char ph[80];
+        const int phn = snprintf(ph, sizeof(ph), "PK\n%d %d %llu\n", w, h,
+                                 (unsigned long long)out_n);
+        send(c, ph, phn, 0);
+        size_t sent = 0;
+        while (sent < out_n) {
+            const size_t want = (out_n - sent) > 65536 ? 65536 : (out_n - sent);
+            const int n = send(c, (const char*)packbuf + sent, (int)want, 0);
+            if (n <= 0) { break; }
+            sent += (size_t)n;
+        }
+        free(packbuf);
+        free(bgra);
+        return *keep;
+    }
+    char head[64];
+    const int hn = snprintf(head, sizeof(head), "P6\n%d %d\n255\n", w, h);
+    send(c, head, hn, 0);
+    const size_t pixels = (size_t)w * (size_t)h;
+    unsigned char* rgb = (unsigned char*)malloc(pixels * 3);
+    if (rgb != NULL) {
+        for (size_t i = 0; i < pixels; ++i) {
+            rgb[i * 3 + 0] = bgra[i * 4 + 2];
+            rgb[i * 3 + 1] = bgra[i * 4 + 1];
+            rgb[i * 3 + 2] = bgra[i * 4 + 0];
+        }
+        size_t sent = 0;
+        while (sent < pixels * 3) {
+            const int n = send(c, (const char*)rgb + sent,
+                               (int)((pixels * 3 - sent) > 65536 ? 65536 : (pixels * 3 - sent)), 0);
+            if (n <= 0) { break; }
+            sent += (size_t)n;
+        }
+        free(rgb);
+    }
+    free(bgra);
+    return *keep;
+}
+
 static int serve(int port)
 {
     WSADATA wsa;
@@ -185,121 +312,56 @@ static int serve(int port)
     printf("serving captures on %d\n", port);
     fflush(stdout);
 
+    /* A kept connection stays open for a whole sweep and would hold the
+     * server against everyone else: compare_pages.sh runs a sweeper per live
+     * browser port against one capture server, and wincap_size.py polls the
+     * same one. select() over the listener and the open connections keeps all
+     * of them served from a single thread, which is what the capture wants
+     * anyway, since GDI is doing one window at a time regardless. */
+    SOCKET conns[FD_SETSIZE];
+    int keeps[FD_SETSIZE];
+    int nconn = 0;
+
     for (;;) {
-        SOCKET c = accept(listener, NULL, NULL);
-        if (c == INVALID_SOCKET) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(listener, &readable);
+        for (int i = 0; i < nconn; ++i) {
+            FD_SET(conns[i], &readable);
+        }
+        if (select(0, &readable, NULL, NULL, NULL) <= 0) {
             continue;
         }
-        char req[256] = {0};
-        int got = 0;
-        while (got < (int)sizeof(req) - 1) {
-            const int n = recv(c, req + got, 1, 0);
-            if (n <= 0) { break; }
-            if (req[got] == '\n') { break; }
-            ++got;
-        }
-        req[got] = '\0';
-        int x = 0, y = 0, w = 0, h = 0;
-        const int packed = (strncmp(req, "GRABZ", 5) == 0);
-        if (strncmp(req, "SIZE", 4) == 0) {
-            char line[64];
-            int fw = 0, fh = 0;
-            window_size(&fw, &fh);
-            const int n = snprintf(line, sizeof(line), "%d %d\n", fw, fh);
-            send(c, line, n, 0);
-            closesocket(c);
-            continue;
-        }
-        if (sscanf(req + (packed ? 5 : 4), " %d %d %d %d", &x, &y, &w, &h) != 4 ||
-            w <= 0 || h <= 0 || w > 16384 || h > 16384) {
-            const char* err = "P6\n0 0\n255\n";
-            send(c, err, (int)strlen(err), 0);
-            closesocket(c);
-            continue;
-        }
-        unsigned char* bgra = grab_rect(x, y, w, h);
-        if (bgra == NULL) {
-            const char* err = "P6\n0 0\n255\n";
-            send(c, err, (int)strlen(err), 0);
-            closesocket(c);
-            continue;
-        }
-        if (packed) {
-            /* PackBits over whole pixels. A page of text is mostly one color,
-             * so this is worth 20 to 50 times on a viewport and turns the wire
-             * into the cheap part of a sweep again. The host reverses it; the
-             * length prefix lets it read exactly one answer. */
-            const size_t pixels_n = (size_t)w * (size_t)h;
-            unsigned char* packbuf = (unsigned char*)malloc(pixels_n * 4 + 64);
-            size_t out_n = 0;
-            size_t i = 0;
-            while (i < pixels_n) {
-                const unsigned char* px = bgra + i * 4;
-                size_t run = 1;
-                while (i + run < pixels_n && run < 128 &&
-                       memcmp(bgra + (i + run) * 4, px, 3) == 0) {
-                    ++run;
-                }
-                if (run > 1) {
-                    packbuf[out_n++] = (unsigned char)(257 - run);
-                    packbuf[out_n++] = px[2];
-                    packbuf[out_n++] = px[1];
-                    packbuf[out_n++] = px[0];
-                    i += run;
-                    continue;
-                }
-                size_t lit = 1;
-                while (i + lit < pixels_n && lit < 128 &&
-                       memcmp(bgra + (i + lit) * 4, bgra + (i + lit - 1) * 4, 3) != 0) {
-                    ++lit;
-                }
-                packbuf[out_n++] = (unsigned char)(lit - 1);
-                for (size_t k = 0; k < lit; ++k) {
-                    const unsigned char* q = bgra + (i + k) * 4;
-                    packbuf[out_n++] = q[2];
-                    packbuf[out_n++] = q[1];
-                    packbuf[out_n++] = q[0];
-                }
-                i += lit;
+
+        if (FD_ISSET(listener, &readable) && nconn < FD_SETSIZE - 1) {
+            SOCKET c = accept(listener, NULL, NULL);
+            if (c != INVALID_SOCKET) {
+                /* The header and the payload go out as separate sends, so
+                 * Nagle would hold the header back until the payload's ACK
+                 * came in. */
+                BOOL nodelay = TRUE;
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay,
+                           sizeof(nodelay));
+                conns[nconn] = c;
+                keeps[nconn] = 0;
+                ++nconn;
             }
-            char ph[80];
-            const int phn = snprintf(ph, sizeof(ph), "PK\n%d %d %llu\n", w, h,
-                                     (unsigned long long)out_n);
-            send(c, ph, phn, 0);
-            size_t sent = 0;
-            while (sent < out_n) {
-                const size_t want = (out_n - sent) > 65536 ? 65536 : (out_n - sent);
-                const int n = send(c, (const char*)packbuf + sent, (int)want, 0);
-                if (n <= 0) { break; }
-                sent += (size_t)n;
-            }
-            free(packbuf);
-            free(bgra);
-            closesocket(c);
-            continue;
         }
-        char head[64];
-        const int hn = snprintf(head, sizeof(head), "P6\n%d %d\n255\n", w, h);
-        send(c, head, hn, 0);
-        const size_t pixels = (size_t)w * (size_t)h;
-        unsigned char* rgb = (unsigned char*)malloc(pixels * 3);
-        if (rgb != NULL) {
-            for (size_t i = 0; i < pixels; ++i) {
-                rgb[i * 3 + 0] = bgra[i * 4 + 2];
-                rgb[i * 3 + 1] = bgra[i * 4 + 1];
-                rgb[i * 3 + 2] = bgra[i * 4 + 0];
+
+        for (int i = 0; i < nconn; ) {
+            if (!FD_ISSET(conns[i], &readable)) {
+                ++i;
+                continue;
             }
-            size_t sent = 0;
-            while (sent < pixels * 3) {
-                const int n = send(c, (const char*)rgb + sent,
-                                   (int)((pixels * 3 - sent) > 65536 ? 65536 : (pixels * 3 - sent)), 0);
-                if (n <= 0) { break; }
-                sent += (size_t)n;
+            if (serve_one(conns[i], &keeps[i])) {
+                ++i;
+                continue;
             }
-            free(rgb);
+            closesocket(conns[i]);
+            conns[i] = conns[nconn - 1];
+            keeps[i] = keeps[nconn - 1];
+            --nconn;
         }
-        free(bgra);
-        closesocket(c);
     }
 }
 

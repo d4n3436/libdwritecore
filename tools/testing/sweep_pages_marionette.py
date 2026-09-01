@@ -185,6 +185,11 @@ class GuestGrabber:
 
     GRABZ is used for the payload, which is PackBits over whole pixels. A page
     of text compresses enough that the wire is not what a sweep costs.
+
+    The connection is kept. wincap answers one request per connection unless
+    the client opens with KEEP, and a handshake polls the screen several times
+    a cell, so a fresh TCP connect for each costs more than a small grab. A
+    server that declines KEEP is served one request per connection.
     """
 
     def __init__(self, hostport):
@@ -192,24 +197,79 @@ class GuestGrabber:
         if not host or not port.isdigit():
             sys.exit("guest backend is guest:<host>:<port>")
         self.addr = (host, int(port))
+        self.sock = None
+        self.stream = None
+        self.keep = self._open()
         self.width, self.height = self._size()
 
-    def _ask(self, request):
+    def _open(self):
+        """Connect and ask to keep it. True once the server has agreed."""
         sock = socket.create_connection(self.addr, timeout=60)
-        try:
-            sock.sendall(request)
-            chunks = []
-            while True:
-                chunk = sock.recv(1 << 16)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            return b"".join(chunks)
-        finally:
-            sock.close()
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        stream = sock.makefile("rb")
+        sock.sendall(b"KEEP\n")
+        if stream.readline().strip() == b"OK":
+            self.sock, self.stream = sock, stream
+            return True
+        stream.close()
+        sock.close()
+        return False
+
+    def _drop(self):
+        for handle in (self.stream, self.sock):
+            try:
+                if handle is not None:
+                    handle.close()
+            except OSError:
+                pass
+        self.sock = self.stream = None
+
+    def _ask(self, request, read):
+        """Send one request and read exactly its answer.
+
+        Every answer is self-delimiting, so the reader stops on its own
+        boundary and leaves the connection at the start of the next one.
+        """
+        if not self.keep:
+            sock = socket.create_connection(self.addr, timeout=60)
+            try:
+                sock.sendall(request)
+                return read(sock.makefile("rb"))
+            finally:
+                sock.close()
+        for attempt in (0, 1):
+            try:
+                if self.sock is None and not self._open():
+                    self.keep = False
+                    return self._ask(request, read)
+                self.sock.sendall(request)
+                return read(self.stream)
+            except OSError:
+                self._drop()
+                if attempt:
+                    raise
+        raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _read_size(stream):
+        return stream.readline().split()
+
+    @staticmethod
+    def _read_frame(stream):
+        # "PK\n<w> <h> <bytes>\n", then the packed pixels.
+        head = stream.readline().strip()
+        if head != b"PK":
+            sys.exit("wincap answered %r, not a packed frame" % head[:16])
+        gw, gh, count = (int(v) for v in stream.readline().split())
+        if gw <= 0 or gh <= 0:
+            sys.exit("wincap could not capture the window")
+        packed = stream.read(count)
+        if len(packed) != count:
+            raise OSError("wincap sent %d of %d packed bytes" % (len(packed), count))
+        return _unpack(packed, gw, gh)
 
     def _size(self):
-        answer = self._ask(b"SIZE\n").split()
+        answer = self._ask(b"SIZE\n", self._read_size)
         if len(answer) != 2:
             sys.exit("wincap did not answer SIZE")
         return int(answer[0]), int(answer[1])
@@ -217,16 +277,7 @@ class GuestGrabber:
     def grab(self, x=0, y=0, w=None, h=None):
         w = self.width if w is None else w
         h = self.height if h is None else h
-        blob = self._ask(b"GRABZ %d %d %d %d\n" % (x, y, w, h))
-        # "PK\n<w> <h> <bytes>\n", then the packed pixels.
-        head, _, packed = blob.partition(b"\n")
-        if head != b"PK":
-            sys.exit("wincap answered %r, not a packed frame" % head[:16])
-        dims, _, packed = packed.partition(b"\n")
-        gw, gh, count = (int(v) for v in dims.split())
-        if gw <= 0 or gh <= 0:
-            sys.exit("wincap could not capture the window")
-        return _unpack(packed[:count], gw, gh)
+        return self._ask(b"GRABZ %d %d %d %d\n" % (x, y, w, h), self._read_frame)
 
 
 def _unpack(packed, w, h):
