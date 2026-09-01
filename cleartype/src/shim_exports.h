@@ -56,6 +56,13 @@ void CleartypeEndInitMetrics(void);
 // claims nothing.
 int CleartypeClaimFace(void* candidate, double ft_size);
 
+// Name the unquantized size a face is about to be measured at, before the
+// measuring starts. Kept so that the em can be recovered from the 26.6 char
+// size FreeType is given, which is all a size that is not a whole app unit
+// leaves behind. Answers zero for a pointer this library does not know as a
+// face, or one that is not scalable.
+int CleartypeClaimSize(void* candidate, double px);
+
 // The whole-pixel size Windows rounds gfxFont::mAdjustedSize to for the face
 // last measured, or 0 when that face keeps the size it was asked for.
 // gfxDWriteFont::ComputeMetrics rounds it for a CJK face that carries a strike
@@ -105,6 +112,20 @@ unsigned CleartypeEndGlyphPath(const struct CleartypeGlyphPathPoint** points);
 // blob image through DrawTargetSkia on those, which is the one place Skia
 // asks its own scan converter for a glyph on both platforms.
 int CleartypeOnBlobRaster(void);
+
+// True when the glyph about to be drawn on this blob thread has to come from
+// DirectWrite's mask rather than from its outline, which is an unhinted face
+// under a non-uniform scale. Everything else keeps the outline route.
+int CleartypeBlobPrefersMask(void);
+
+// The ink box of one glyph in pixels, as four edges: left, top, right, bottom.
+// `candidate` is offered a word at a time the way CleartypeClaimFace is, and
+// anything but a face this library knows is refused. `ft_size` is the font's
+// mFTSize, which names the instance, and `embolden` its mEmbolden. Answers only
+// for a box the slot's 26.6 metrics were written from, so a caller can undo
+// that rounding.
+int CleartypeGlyphInkBox(void* candidate, double ft_size, int embolden, unsigned glyph,
+                         double* out);
 
 }  // extern "C"
 

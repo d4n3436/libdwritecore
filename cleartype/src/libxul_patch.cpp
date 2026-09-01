@@ -1118,6 +1118,10 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
     return found;
 }
 
+// The distance back from the metrics struct to mAdjustedSize, in doubles.
+// Fixed by the build, so it is learned once and used from then on.
+std::atomic<size_t> g_adjusted_size_delta{0};
+
 // gfxFont::mAdjustedSize, the size everything below the metrics is scaled
 // from and the one gfxFontconfigFont::GetScaledFont hands WebRender.
 //
@@ -1134,10 +1138,9 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
 // trailing fields identify it; the size on its own appears several times over.
 double* FindAdjustedSize(void* self, const double* metrics, const double size)
 {
-    // The distance back from the metrics struct is fixed by the build, so it
-    // is learned once and used from then on. A second run of doubles matching
-    // the same pattern makes the search ambiguous and nothing is written.
-    static std::atomic<size_t> known{0};
+    // A second run of doubles matching the same pattern makes the search
+    // ambiguous and nothing is written.
+    std::atomic<size_t>& known = g_adjusted_size_delta;
 
     auto* base = static_cast<double*>(self);
     if (metrics < base + 3) {
@@ -1206,8 +1209,42 @@ void ClaimOwnFace(void* self)
     }
 }
 
+// The size this font is about to be measured at, named before InitMetrics runs
+// rather than after.
+//
+// gfxFont::GetAdjustedSize fills mAdjustedSize lazily from mStyle.size, and
+// InitMetrics asks for it before it loads a glyph, so by the time the metrics
+// struct is being filled the field already holds the size the face will be set
+// to. It is read here so that the advances InitMetrics caches for space, zero
+// and the water ideograph are measured at the same size as everything after
+// them; claiming afterwards leaves those three off by a rounding. Nothing is
+// claimed until an earlier font has taught the two offsets.
+void PreClaimOwnSize(void* self)
+{
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    const size_t back = g_adjusted_size_delta.load(std::memory_order_relaxed);
+    if (self == nullptr || at == 0 || back == 0 || back > at) {
+        return;
+    }
+    auto* const shared = static_cast<void* const*>(self)[at - 1];
+    if (shared == nullptr) {
+        return;
+    }
+    double size = 0.0;
+    std::memcpy(&size, static_cast<double*>(self) + (at - back), sizeof(size));
+    if (!(size > 0.0) || !(size < 65536.0)) {
+        return;                              // still the -1.0 it starts at
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (CleartypeClaimSize(static_cast<void* const*>(shared)[i], size) != 0) {
+            return;
+        }
+    }
+}
+
 extern "C" void DwcInitMetrics(void* self)
 {
+    PreClaimOwnSize(self);
     g_init_metrics(self);
     ClaimOwnFace(self);
 
@@ -1251,6 +1288,19 @@ extern "C" void DwcInitMetrics(void* self)
             static_cast<size_t>(reinterpret_cast<void**>(found) -
                                 static_cast<void**>(self)),
             std::memory_order_relaxed);
+    }
+
+    // Where mAdjustedSize sits, learned even when nothing below writes it, so
+    // that PreClaimOwnSize can read it on the next font. mFTSize is the same
+    // value for a scalable face, which is what the pattern needs to match on.
+    if (const size_t word = g_ftface_word.load(std::memory_order_relaxed);
+        word != 0 && g_adjusted_size_delta.load(std::memory_order_relaxed) == 0) {
+        double ft_size = 0.0;
+        std::memcpy(&ft_size, static_cast<void* const*>(self) + word + kFTSizeWord,
+                    sizeof(ft_size));
+        if (ft_size > 0.0 && ft_size < 65536.0) {
+            (void)FindAdjustedSize(self, found, ft_size);
+        }
     }
 
     // gfxDWriteFont::ComputeMetrics rounds mAdjustedSize onto the strike it is
@@ -2347,6 +2397,9 @@ void DrawGlyphsFromPath(void* self)
     if (typeface < 0x10000 || (typeface & 7u) != 0 || effect != 0 || filter != 0) {
         return;                              // not the shape this expects
     }
+    if (CleartypeBlobPrefersMask() != 0) {
+        return;                              // this one comes from the mask
+    }
     if (probe[kImageFromPathAt] != 0) {
         return;                              // already set, or not a boolean
     }
@@ -2357,8 +2410,12 @@ extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, v
 
 extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, void* alloc)
 {
+    // The real call first, so the shim has seen this scaler's face by the time
+    // the route is chosen; internalMakeGlyph reads the flag only after
+    // generateMetrics returns, so setting it here is still in time.
+    void* const result = g_generate_metrics(sret, self, glyph, alloc);
     DrawGlyphsFromPath(self);
-    return g_generate_metrics(sret, self, glyph, alloc);
+    return result;
 }
 
 extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph);
@@ -2402,6 +2459,282 @@ bool PatchGlyphPath(const Image& image, const FunctionStarts& starts)
             g_generate_metrics = nullptr;
         }
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The glyph ink box.
+//
+// gfxFT2FontBase::GetGlyphBounds answers what canvas measureText and layout
+// use for the ink extents of a run. It reads the box back out of the glyph
+// slot's FT_Glyph_Metrics, which are 26.6, so the exact edges the shim wrote
+// there arrive rounded to 1/64 px. Windows has no such step. gfxDWriteFont
+// takes GetDesignGlyphMetrics and scales it, in doubles the whole way.
+//
+// Everything else downstream carries that rounding as a rounding.
+// gfxFont::Measure widens a synthetically obliqued box by ceil(skew * edge) in
+// app units, where half a 1/64 px moves the ceiling by one and takes 1/60 px
+// of ink on the reported left or right with it.
+//
+// So the real function runs and the four edges are put back at full precision
+// afterwards. Nothing here names it. It is found as the one function that
+// compares both the SVG and the COLR sfnt tags while emboldening through
+// FT_MulFix and sizing through FT_Set_Char_Size, whose one caller sits in a
+// vtable.
+// ---------------------------------------------------------------------------
+
+using GetGlyphBoundsFn = bool (*)(void* self, uint16_t gid, double* bounds, bool tight);
+GetGlyphBoundsFn g_glyph_bounds = nullptr;
+
+// gfxFont builds them as TRUETYPE_TAG(a,b,c,d), which packs the first
+// character into the high byte, so the immediate reads back to front.
+constexpr uint32_t kSvgTag = 0x53564720;     // 'SVG '
+constexpr uint32_t kColrTag = 0x434F4C52;    // 'COLR'
+
+constexpr unsigned kMaxBoundsFns = 24;
+
+// Every function holding `value` as a four-byte immediate. A byte scan cannot
+// tell an operand from the middle of an instruction, so this only ever narrows
+// a candidate set that other tests have to agree with.
+bool FunctionsHolding(const Image& image, const FunctionStarts& starts, const uint32_t value,
+                      uintptr_t* out, unsigned* count, const unsigned max)
+{
+    unsigned char want[sizeof(value)];
+    std::memcpy(want, &value, sizeof(want));
+    *count = 0;
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        for (const unsigned char* p = r.begin; p + sizeof(want) <= r.end; ++p) {
+            if (std::memcmp(p, want, sizeof(want)) != 0) {
+                continue;
+            }
+            const uintptr_t fn = starts.Enclosing(reinterpret_cast<uintptr_t>(p));
+            bool seen = false;
+            for (unsigned k = 0; k < *count; ++k) {
+                seen = seen || out[k] == fn;
+            }
+            if (!seen && fn != 0) {
+                if (*count == max) {
+                    return false;            // more than this can account for
+                }
+                out[(*count)++] = fn;
+            }
+        }
+    }
+    return true;
+}
+
+// Every place in relro holding `function`. FindVtableSlot answers for one
+// slot and refuses a second; a method inherited by two concrete classes is in
+// both their vtables, and both have to be written.
+unsigned CollectVtableSlots(const Image& image, const uintptr_t function, void** out,
+                            const unsigned max)
+{
+    unsigned count = 0;
+    const auto* p = reinterpret_cast<const uintptr_t*>(image.relro.begin);
+    const auto* end = reinterpret_cast<const uintptr_t*>(image.relro.end);
+    for (; p + 1 <= end; ++p) {
+        if (*p != function) {
+            continue;
+        }
+        if (count == max) {
+            return 0;
+        }
+        out[count++] = const_cast<void*>(static_cast<const void*>(p));
+    }
+    return count;
+}
+
+// gfxFT2FontBase::GetFTGlyphExtents, the one function that asks the entry for
+// both an SVG and a COLR table while it has a face sized and emboldened.
+uintptr_t FindGlyphExtents(const Image& image, const FunctionStarts& starts)
+{
+    void** const size = GotSlot(image, "FT_Set_Char_Size");
+    void** const embolden = GotSlot(image, "FT_MulFix");
+    if (size == nullptr || embolden == nullptr) {
+        Report("libxul: no glyph sizing or emboldening to find the ink box by");
+        return 0;
+    }
+    uintptr_t svg[kMaxBoundsFns], colr[kMaxBoundsFns];
+    uintptr_t sizers[kMaxBoundsFns], embolders[kMaxBoundsFns];
+    unsigned n_svg = 0, n_colr = 0, n_sizers = 0, n_embolders = 0;
+    if (!FunctionsHolding(image, starts, kSvgTag, svg, &n_svg, kMaxBoundsFns) ||
+        !FunctionsHolding(image, starts, kColrTag, colr, &n_colr, kMaxBoundsFns) ||
+        !FunctionsCalling(image, starts, size, sizers, &n_sizers, kMaxBoundsFns) ||
+        !FunctionsCalling(image, starts, embolden, embolders, &n_embolders, kMaxBoundsFns)) {
+        Report("libxul: more functions carry an sfnt tag or size a face than can be "
+               "accounted for, so the ink box cannot be identified");
+        return 0;
+    }
+    uintptr_t found = 0;
+    for (unsigned i = 0; i < n_svg; ++i) {
+        const uintptr_t candidate = svg[i];
+        if (!Holds(colr, n_colr, candidate) || !Holds(sizers, n_sizers, candidate) ||
+            !Holds(embolders, n_embolders, candidate)) {
+            continue;
+        }
+        if (found != 0) {
+            Report("libxul: more than one function reads both sfnt tags off a sized "
+                   "face; leaving the ink box alone");
+            return 0;
+        }
+        found = candidate;
+    }
+    if (found == 0) {
+        Report("libxul: no function has the shape GetFTGlyphExtents has");
+    }
+    return found;
+}
+
+// gfxFT2FontBase::GetGlyphBounds, the only caller of that which a vtable
+// holds. The other three are GetCharExtents, GetCachedGlyphMetrics and
+// InitMetrics, none of them virtual.
+uintptr_t FindGlyphBounds(const Image& image, const FunctionStarts& starts, void** slots,
+                          unsigned* n_slots, const unsigned max)
+{
+    const uintptr_t extents = FindGlyphExtents(image, starts);
+    if (extents == 0) {
+        return 0;
+    }
+    DirectCallers set[1];
+    set[0].target = extents;
+    CollectDirectCallers(image, starts, set, 1);
+    if (set[0].overflowed) {
+        Report("libxul: GetFTGlyphExtents at %#lx has more callers than a private "
+               "method has", extents);
+        return 0;
+    }
+    uintptr_t found = 0;
+    unsigned found_slots = 0;
+    for (unsigned i = 0; i < set[0].count; ++i) {
+        void* here[kMaxBoundsFns];
+        const unsigned n = CollectVtableSlots(image, set[0].callers[i], here, kMaxBoundsFns);
+        if (n == 0) {
+            continue;
+        }
+        if (found != 0) {
+            Report("libxul: more than one caller of GetFTGlyphExtents sits in a vtable; "
+                   "leaving the ink box alone");
+            return 0;
+        }
+        found = set[0].callers[i];
+        found_slots = n > max ? 0 : n;
+        for (unsigned k = 0; k < found_slots; ++k) {
+            slots[k] = here[k];
+        }
+    }
+    if (found == 0 || found_slots == 0) {
+        Report("libxul: no caller of GetFTGlyphExtents at %#lx is in a vtable", extents);
+        return 0;
+    }
+    *n_slots = found_slots;
+    return found;
+}
+
+// The four edges the real function returned, put back at the precision the
+// slot's 26.6 metrics could not hold.
+//
+// gfxFT2FontBase::GetFTGlyphExtents builds its rect out of them as
+//
+//     x = horiBearingX;   y = -horiBearingY;   x2 = x + width;   y2 = y + height
+//     y -= bold.y;        x2 += bold.x
+//     rect = (x, y, x2 - x, y2 - y)
+//
+// and scales it by GetAdjustedSize() / mFTSize. Where the shim wrote that box
+// it also placed the bearings so the emboldening lands on the Windows edge, so
+// all four edges come back as whole 1/64 px of the shim's own numbers. Each is
+// checked against them before it moves, and a box that does not agree is left
+// as it came: it went through hint rounding, or the color fallback replaced it,
+// or FreeType's own metrics were never overwritten.
+void SubstituteInkBox(void* self, const uint16_t gid, double* bounds)
+{
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    const size_t back = g_adjusted_size_delta.load(std::memory_order_relaxed);
+    if (self == nullptr || bounds == nullptr || at == 0 || back == 0 || back > at) {
+        return;
+    }
+    auto* const shared = static_cast<void* const*>(self)[at - 1];
+    if (shared == nullptr) {
+        return;
+    }
+    // `Metrics mMetrics; int mFTLoadFlags; bool mEmbolden; gfxFloat mFTSize;`
+    // puts the flags and the bool in the word before the size.
+    unsigned char flags_word[sizeof(void*)] = {};
+    double ft_size = 0.0, adjusted = 0.0;
+    std::memcpy(flags_word, static_cast<void* const*>(self) + at + kMetricsFields,
+                sizeof(flags_word));
+    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord, sizeof(ft_size));
+    std::memcpy(&adjusted, static_cast<double*>(self) + (at - back), sizeof(adjusted));
+    if (!(ft_size > 0.0) || !(adjusted > 0.0) || flags_word[sizeof(int)] > 1) {
+        return;                              // not a boolean where one should be
+    }
+    const int embolden = flags_word[sizeof(int)];
+    double box[4] = {};
+    bool have = false;
+    for (size_t i = 0; i < 4 && !have; ++i) {
+        have = CleartypeGlyphInkBox(static_cast<void* const*>(shared)[i], ft_size, embolden,
+                                    gid, box) != 0;
+    }
+    if (!have) {
+        return;
+    }
+    const double scale = adjusted / ft_size;
+    if (!(scale > 0.0) || !std::isfinite(scale)) {
+        return;
+    }
+    // What the shim rounded into the slot, and what the rect above made of it.
+    const double want[4] = {std::round(box[0] * 64.0), -std::round(box[1] * 64.0),
+                            std::round(box[2] * 64.0), std::round(box[3] * 64.0)};
+    const double to_26_6 = 64.0 / scale;
+    const double got[4] = {bounds[0] * to_26_6, bounds[1] * to_26_6,
+                           (bounds[0] + bounds[2]) * to_26_6,
+                           (bounds[1] + bounds[3]) * to_26_6};
+    constexpr double kNear = 1.0 / 4096.0;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (std::fabs(got[i] - want[i]) > kNear) {
+            return;
+        }
+    }
+    const double left = box[0] * scale;
+    const double top = -box[1] * scale;
+    bounds[0] = left;
+    bounds[1] = top;
+    bounds[2] = box[2] * scale - left;
+    bounds[3] = box[3] * scale - top;
+}
+
+extern "C" bool DwcGetGlyphBounds(void* self, uint16_t gid, double* bounds, bool tight);
+
+extern "C" bool DwcGetGlyphBounds(void* self, const uint16_t gid, double* bounds,
+                                  const bool tight)
+{
+    const bool ok = g_glyph_bounds(self, gid, bounds, tight);
+    if (ok) {
+        SubstituteInkBox(self, gid, bounds);
+    }
+    return ok;
+}
+
+bool PatchGlyphBounds(const Image& image, const FunctionStarts& starts)
+{
+    void* slots[kMaxBoundsFns];
+    unsigned n_slots = 0;
+    const uintptr_t found = FindGlyphBounds(image, starts, slots, &n_slots, kMaxBoundsFns);
+    if (found == 0) {
+        return false;
+    }
+    g_glyph_bounds = reinterpret_cast<GetGlyphBoundsFn>(found);
+    unsigned written = 0;
+    for (unsigned i = 0; i < n_slots; ++i) {
+        written += WriteSlot(static_cast<void**>(slots[i]),
+                             reinterpret_cast<void*>(&DwcGetGlyphBounds)) ? 1u : 0u;
+    }
+    if (written == 0) {
+        g_glyph_bounds = nullptr;
+        return false;
+    }
+    Report("libxul: GetGlyphBounds %#lx now returns through this library "
+           "(%u of %u vtable slots)", found, written, n_slots);
     return true;
 }
 
@@ -2472,6 +2805,7 @@ void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(
     // other.
     PatchUnderline(image, starts);
     PatchGlyphPath(image, starts);
+    PatchGlyphBounds(image, starts);
 }
 
 // What the callback brings back. dlpi_name points into the link map and stays

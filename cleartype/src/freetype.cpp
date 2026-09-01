@@ -724,6 +724,8 @@ static thread_local FT_Face g_last_sfnt_face = nullptr;
 // several fonts share one face at different sizes and the face carries
 // whichever size was installed last.
 static thread_local FT_Fixed g_claimed_em_26_6 = 0;
+// The same size before it was quantized, or 0. See the claimed-size table.
+static thread_local double g_claimed_em_px = 0.0;
 
 
 
@@ -1118,6 +1120,11 @@ void FreeTrackedBuffersForFace(FT_Face face);
 // Defined with the pending-outline table. Takes g_shifts_mutex under
 // g_faces_mutex; nothing takes them the other way.
 void ForgetPendingOutlines(FT_Face face);
+#if CLEARTYPE_FIREFOX_PARITY
+// Defined with the claimed-size table. Takes g_claimed_mutex under
+// g_faces_mutex; nothing takes them the other way.
+void ForgetClaimedSizes(FT_Face face);
+#endif
 
 void EraseFaceLocked(const size_t index)
 {
@@ -1130,6 +1137,9 @@ void EraseFaceLocked(const size_t index)
     FreeTrackedBuffersForFace(g_faces[index].face);
     ForgetPendingOutlines(g_faces[index].face);
     ForgetSfntCopiesLocked(g_faces[index].face);
+#if CLEARTYPE_FIREFOX_PARITY
+    ForgetClaimedSizes(g_faces[index].face);
+#endif
     std::vector<IDWriteFontFace*> faces;
     for (const CachedDWriteFace& cached : g_faces[index].dwrite_faces) {
         if (cached.face != nullptr) {
@@ -2398,6 +2408,12 @@ struct PendingOutline
     const FT_Outline* outline;
     FT_Pos dx;
     FT_Pos dy;
+    // synthesize_italics' origin shift for vertical text, in device pixels,
+    // recovered rather than read back from the 26.6 delta FreeType was given.
+    // Zero when there is none or it could not be recovered, in which case the
+    // delta is in dx and dy like any other translate.
+    double delta_x;
+    double delta_y;
     DWRITE_FONT_SIMULATIONS simulations;
     bool unrepresentable;
     bool has_matrix;
@@ -2435,7 +2451,8 @@ PendingOutline* PendingOutlineLocked(const FT_Outline* outline)
         g_shifts.erase(g_shifts.begin());
     }
     constexpr FT_Matrix identity = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
-    g_shifts.push_back(PendingOutline{.outline = outline, .dx = 0, .dy = 0,
+    g_shifts.push_back(PendingOutline{.outline = outline, .dx = 0, .dy = 0, .delta_x = 0.0,
+                                      .delta_y = 0.0,
                                       .simulations = DWRITE_FONT_SIMULATIONS_NONE,
                                       .unrepresentable = false, .has_matrix = false,
                                       .matrix = identity, .face = nullptr});
@@ -2522,26 +2539,18 @@ void RecordShift(const FT_Outline* outline, const FT_Pos dx, const FT_Pos dy)
 }
 
 #if CLEARTYPE_FIREFOX_PARITY
-// FT_Set_Transform's delta, put back onto the glyph just loaded.
-//
-// FreeType applies it by translating the slot outline from inside
-// FT_Load_Glyph, and that translate is no longer recorded, so the value comes
-// from the face instead. It is the origin shift synthetic italics asks for in
-// vertical text, which Windows passes as the DWRITE_MATRIX's dx and dy.
-void RecordTransformDelta(FT_Face face)
+// The same, for a translate whose exact value is known in device pixels
+// rather than 26.6. Device space is y-down, so no sign flip here.
+void RecordExactDelta(const FT_Outline* outline, const double dx, const double dy)
 {
-    if (face == nullptr || face->glyph == nullptr) {
+    if (!InterposerWanted()) {
         return;
     }
-    FT_Vector delta = { .x = 0, .y = 0 };
-    pthread_mutex_lock(&g_faces_mutex);
-    if (const FaceEntry* entry = FindFaceLocked(face)) {
-        delta = entry->transform_delta;
-    }
-    pthread_mutex_unlock(&g_faces_mutex);
-    if (delta.x != 0 || delta.y != 0) {
-        RecordShift(&face->glyph->outline, delta.x, delta.y);
-    }
+    pthread_mutex_lock(&g_shifts_mutex);
+    PendingOutline* pending = PendingOutlineLocked(outline);
+    pending->delta_x += dx;
+    pending->delta_y += dy;
+    pthread_mutex_unlock(&g_shifts_mutex);
 }
 #endif  // CLEARTYPE_FIREFOX_PARITY
 
@@ -2549,7 +2558,7 @@ void RecordTransformDelta(FT_Face face)
 // applies to exactly the next render of that outline, or to nothing.
 PendingOutline TakeOutlineState(const FT_Outline* outline)
 {
-    PendingOutline state{.outline = outline, .dx = 0, .dy = 0,
+    PendingOutline state{.outline = outline, .dx = 0, .dy = 0, .delta_x = 0.0, .delta_y = 0.0,
                          .simulations = DWRITE_FONT_SIMULATIONS_NONE,
                          .unrepresentable = false,
                          .has_matrix = false, .matrix = {}, .face = nullptr};
@@ -2570,7 +2579,7 @@ PendingOutline TakeOutlineState(const FT_Outline* outline)
 // the render the entry belongs to.
 PendingOutline PeekOutlineState(const FT_Outline* outline)
 {
-    PendingOutline state{.outline = outline, .dx = 0, .dy = 0,
+    PendingOutline state{.outline = outline, .dx = 0, .dy = 0, .delta_x = 0.0, .delta_y = 0.0,
                          .simulations = DWRITE_FONT_SIMULATIONS_NONE,
                          .unrepresentable = false,
                          .has_matrix = false, .matrix = {}, .face = nullptr};
@@ -2949,6 +2958,156 @@ FT_Fixed CharSize26_6(const double px)
     return static_cast<FT_Fixed>(std::trunc(px * 64.0 + 0.5));
 }
 
+// gfxFontStyle::AdjustForSubSuperscript, forwards.
+//
+// aAppUnitsPerDevPixel and AppUnitsPerCSSPixel are both 60, so the reduction
+// is decided on the size itself, narrowed to f32 the way the source narrows
+// it.
+double SubSuperSize(const double size)
+{
+    const auto css = static_cast<double>(static_cast<float>(size));
+    if (css < 20.0) {
+        return size * 0.82;
+    }
+    if (css >= 45.0) {
+        return size * 0.667;
+    }
+    const double t = (css - 20.0) / (45.0 - 20.0);
+    return size * ((1.0 - t) * 0.82 + t * 0.667);
+}
+
+// The size behind a 26.6 value that no whole app unit produces.
+//
+// A sub- or superscript run is drawn at 0.82, 0.667 or an interpolation of the
+// size around it, and small capitals at 0.8, so the product is not a whole app
+// unit and ExactEmSize cannot invert the rounding of it. The reduction is
+// inverted by search instead, over the whole app units it could have started
+// from, which the ratio bounds. Where the size is Gecko's own the claimed-size
+// table answers first and this is never reached; it is for the process that
+// rasterizes, which holds no gfxFont to claim from.
+//
+// Two starting sizes can land on one 26.6 value (16 px reduced by 0.82 and
+// 16.4 px by 0.8 both give 13.12), so what has to be unique is the size
+// answered with, not the one behind it. Two that disagree answer nothing and
+// FreeType's own value stands.
+bool ReducedEmSize(const FT_Fixed em_size_26_6, double* exact)
+{
+    if (em_size_26_6 <= 0) {
+        return false;
+    }
+    // The search runs over every app unit the reduction could have started
+    // from, thousands of them at a large size, and every glyph in a run asks
+    // about the same size. Remembering the last answer turns a run into one
+    // search.
+    static thread_local FT_Fixed memo_size = 0;
+    static thread_local double memo_px = 0.0;
+    if (memo_size == em_size_26_6) {
+        if (!(memo_px > 0.0)) {
+            return false;
+        }
+        *exact = memo_px;
+        return true;
+    }
+    memo_size = em_size_26_6;
+    memo_px = 0.0;
+
+    const double got = static_cast<double>(em_size_26_6) / 64.0;
+    const auto lo = static_cast<long>(std::floor(got * kAppUnitsPerCSSPixel / 0.82));
+    const auto hi = static_cast<long>(std::ceil(got * kAppUnitsPerCSSPixel / 0.667)) + 1;
+    bool found = false;
+    double answer = 0.0;
+    for (long units = lo > 1 ? lo : 1; units <= hi; ++units) {
+        const double size = static_cast<double>(units) / kAppUnitsPerCSSPixel;
+        for (const double px : { SubSuperSize(size), size * 0.8 }) {
+            if (CharSize26_6(px) != em_size_26_6) {
+                continue;
+            }
+            if (found && px != answer) {
+                return false;
+            }
+            answer = px;
+            found = true;
+        }
+    }
+    if (found) {
+        memo_px = answer;
+        *exact = answer;
+    }
+    return found;
+}
+
+// The unquantized sizes Gecko has named for a face.
+//
+// gfxFT2FontBase::LockFTFace rounds gfxFont::mAdjustedSize into
+// FT_Set_Char_Size's 26.6, and ExactEmSize can only invert that where the size
+// was a whole app unit. A sub- or superscript run is not one.
+// gfxFontStyle::AdjustForSubSuperscript multiplies by 0.82, 0.667 or an
+// interpolation between them, so 16 px becomes 13.12 and arrives as 840. The
+// size itself does reach this library, as mFTSize through the InitMetrics hook
+// in libxul_patch.cpp, so it is kept here and matched back by the 26.6 value
+// it quantizes to.
+//
+// One face carries several at once, since a superscript run and the text
+// around it share it. The table is bounded and the oldest entry is dropped;
+// only sizes still in use are ever asked for.
+struct ClaimedSize
+{
+    FT_Face face;
+    FT_Fixed size_26_6;
+    double px;
+};
+
+ClaimedSize g_claimed_sizes[64] = {};
+size_t g_claimed_next = 0;
+pthread_mutex_t g_claimed_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void RecordClaimedSize(FT_Face face, const double px)
+{
+    if (face == nullptr || !(px > 0.0) || !(px < 65536.0)) {
+        return;
+    }
+    const FT_Fixed size_26_6 = CharSize26_6(px);
+    pthread_mutex_lock(&g_claimed_mutex);
+    for (ClaimedSize& slot : g_claimed_sizes) {
+        if (slot.face == face && slot.size_26_6 == size_26_6) {
+            slot.px = px;
+            pthread_mutex_unlock(&g_claimed_mutex);
+            return;
+        }
+    }
+    g_claimed_sizes[g_claimed_next] = ClaimedSize{ .face = face, .size_26_6 = size_26_6, .px = px };
+    g_claimed_next = (g_claimed_next + 1) % std::size(g_claimed_sizes);
+    pthread_mutex_unlock(&g_claimed_mutex);
+}
+
+bool ClaimedSizeFor(FT_Face face, const FT_Fixed size_26_6, double* px)
+{
+    bool found = false;
+    pthread_mutex_lock(&g_claimed_mutex);
+    for (const ClaimedSize& slot : g_claimed_sizes) {
+        if (slot.face == face && slot.size_26_6 == size_26_6) {
+            *px = slot.px;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_claimed_mutex);
+    return found;
+}
+
+// A face's slots, dropped with the face. The next allocation to land on that
+// address would otherwise inherit its sizes.
+void ForgetClaimedSizes(FT_Face face)
+{
+    pthread_mutex_lock(&g_claimed_mutex);
+    for (ClaimedSize& slot : g_claimed_sizes) {
+        if (slot.face == face) {
+            slot = ClaimedSize{};
+        }
+    }
+    pthread_mutex_unlock(&g_claimed_mutex);
+}
+
 // The em size Windows rasterizes a transformed glyph at.
 //
 // platform/windows/font.rs get_glyph_parameters passes
@@ -2971,32 +3130,29 @@ FT_Fixed CharSize26_6(const double px)
 // Every step is checked against the 26.6 sizes FreeType was asked for, so a
 // transform that did not come from WebRender fails one and keeps the size
 // FreeType reported.
-bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_Fixed y_26_6,
-                            const double seed_px, double* em_size)
-{
-    if (x_26_6 <= 0 || y_26_6 <= 0 || !(seed_px > 0.0)) {
-        return false;
-    }
-    // Column one of the shape, in FontTransform's terms. unix/font.rs negates
-    // skew_y on its way into FT_Matrix, and the synthetic oblique only ever
-    // adds a multiple of this column to the other one, so it arrives untouched
-    // whether or not the glyph is slanted.
-    const double a = static_cast<double>(m.xx) / 65536.0;
-    const double b = -static_cast<double>(m.yx) / 65536.0;
-    // Column two. A slanted glyph carries the oblique shear here, which is a
-    // multiple of column one and leaves the determinant alone but not the
-    // pair of integers, so this recovers an upright transform only.
-    const double c = -static_cast<double>(m.xy) / 65536.0;
-    const double d = static_cast<double>(m.yy) / 65536.0;
 
-    // compute_scale makes x_scale the length of column one, and the shape is
-    // the transform divided by it, so that column arrives as a unit vector.
-    // Any other shape, such as Skia's own or one swap_xy has permuted for
-    // vertical text, is left alone.
-    constexpr double kUnit = 8.0 / 65536.0;
-    if (std::fabs(std::hypot(a, b) - 1.0) > kUnit) {
-        return false;
-    }
+// The transform WebRender handed down, as the search recovered it: its four
+// terms over 1024, the size it was asked for, and the two scales
+// compute_scale split out of it.
+struct RecoveredTransform
+{
+    long k1, k2, k3, k4;
+    double req;
+    double x_scale;
+    double y_scale;
+    double em_size;
+    // synthesize_italics' skew, and which column it moved. Zero and false for
+    // an upright glyph.
+    float skew;
+    bool vertical;
+};
+
+// One pass of the search, over a shape whose column two is already free of
+// any synthetic oblique.
+bool SearchTransformedEmSize(const double a, const double b, const double c, const double d,
+                             const FT_Fixed x_26_6, const FT_Fixed y_26_6, const double seed_px,
+                             RecoveredTransform* out)
+{
     const double x_px = static_cast<double>(x_26_6) / 64.0;
     const double y_px = static_cast<double>(y_26_6) / 64.0;
     const double x_est = x_px / seed_px;
@@ -3056,7 +3212,16 @@ bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_
                             std::fabs(back_c - c) > kBack || std::fabs(back_d - d) > kBack) {
                             continue;
                         }
-                        *em_size = static_cast<double>(static_cast<float>(req * y_scale));
+                        out->k1 = k1;
+                        out->k2 = k2;
+                        out->k3 = k3;
+                        out->k4 = k4;
+                        out->req = req;
+                        out->x_scale = x_scale;
+                        out->y_scale = y_scale;
+                        out->em_size = static_cast<double>(static_cast<float>(req * y_scale));
+                        out->skew = 0.0f;
+                        out->vertical = false;
                         return true;
                     }
                 }
@@ -3064,6 +3229,116 @@ bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_
         }
     }
     return false;
+}
+
+// Rounds `guess` to the nearest skew SyntheticItalics can hold, takes that
+// much of one column back out of the other, and searches the shape that
+// leaves. `vertical` picks which column carries the skew, matching the two
+// branches of FontTransform::synthesize_italics.
+bool RetryWithoutSkew(const double guess, const double a, const double b, const double c,
+                      const double d, const bool vertical, const FT_Fixed x_26_6,
+                      const FT_Fixed y_26_6, const double seed_px, RecoveredTransform* out)
+{
+    const double angle = std::atan(guess) * (180.0 / M_PI) * 256.0;
+    if (!(std::fabs(angle) < 89.0 * 256.0)) {
+        return false;
+    }
+    const long nearest = static_cast<long>(std::floor(angle + 0.5));
+    for (long candidate = nearest - 1; candidate <= nearest + 1; ++candidate) {
+        if (candidate == 0 || candidate < -89L * 256 || candidate > 89L * 256) {
+            continue;
+        }
+        const float exact = SkewForAngle(static_cast<int>(candidate));
+        const double skew = static_cast<double>(exact);
+        const bool found =
+            vertical ? SearchTransformedEmSize(a - skew * c, b - skew * d, c, d, x_26_6, y_26_6,
+                                               seed_px, out)
+                     : SearchTransformedEmSize(a, b, c + skew * a, d + skew * b, x_26_6, y_26_6,
+                                               seed_px, out);
+        if (found) {
+            out->skew = exact;
+            out->vertical = vertical;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_Fixed y_26_6,
+                            const double seed_px, RecoveredTransform* out)
+{
+    if (x_26_6 <= 0 || y_26_6 <= 0 || !(seed_px > 0.0)) {
+        return false;
+    }
+    // Column one of the shape, in FontTransform's terms. unix/font.rs negates
+    // skew_y on its way into FT_Matrix, and the synthetic oblique only ever
+    // adds a multiple of this column to the other one, so it arrives untouched
+    // whether or not the glyph is slanted.
+    const double a = static_cast<double>(m.xx) / 65536.0;
+    const double b = -static_cast<double>(m.yx) / 65536.0;
+    // Column two, which does carry the oblique.
+    const double c = -static_cast<double>(m.xy) / 65536.0;
+    const double d = static_cast<double>(m.yy) / 65536.0;
+
+    // compute_scale makes x_scale the length of column one, and the shape is
+    // the transform divided by it, so that column arrives as a unit vector.
+    // Any other shape, such as Skia's own or one swap_xy has permuted, is left
+    // alone. A synthetic oblique moves one column by a multiple of the other,
+    // which leaves the determinant and therefore y_scale alone but takes the
+    // column it moved off the 1024th grid, so it has to come back out before
+    // the search can find any integers. SyntheticItalics only ever holds the
+    // tangent of a 256th of a degree, so rounding to the nearest such angle
+    // gives back the f32 Windows was handed.
+    //
+    // Which column moved says how to estimate the skew, and both estimates
+    // are the same projection. The transform WebRender started from is a
+    // rotation and a scale, so its two columns are perpendicular and whatever
+    // one column holds of the other's direction is the skew and nothing else.
+    constexpr double kUnit = 8.0 / 65536.0;
+    const double along = a * c + b * d;
+    if (std::fabs(std::hypot(a, b) - 1.0) <= kUnit) {
+        if (SearchTransformedEmSize(a, b, c, d, x_26_6, y_26_6, seed_px, out)) {
+            return true;
+        }
+        // Horizontal text: the skew multiplies column one into column two.
+        if (RetryWithoutSkew(-along, a, b, c, d, false, x_26_6, y_26_6, seed_px, out)) {
+            return true;
+        }
+    }
+    // Vertical text: the skew multiplies column two into column one instead,
+    // so column one is the one that no longer has unit length. Taking the skew
+    // back out has to restore that length, which is a quadratic. Its vertex is
+    // the projection, and where the two columns are perpendicular that is the
+    // answer and the two roots are a square root's worth of noise either side
+    // of it; where they are not, one of the roots is the answer and the vertex
+    // is not. All three are cheap to try.
+    const double len2 = c * c + d * d;
+    if (!(len2 > 0.0)) {
+        return false;
+    }
+    const double vertex = along / len2;
+    const double disc = vertex * vertex - (a * a + b * b - 1.0) / len2;
+    const double root = disc > 0.0 ? std::sqrt(disc) : 0.0;
+    for (const double guess : { vertex, vertex - root, vertex + root }) {
+        if (RetryWithoutSkew(guess, a, b, c, d, true, x_26_6, y_26_6, seed_px, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// synthesize_italics' origin shift, which only vertical text has. The skew is
+// applied about the middle of the glyph rather than its edge, and the shift
+// that takes reaches Windows as the DWRITE_MATRIX's dx and dy while
+// unix/font.rs spends it on FT_Set_Transform's 26.6 delta.
+void SyntheticItalicOffset(const RecoveredTransform& r, double* dx, double* dy)
+{
+    const auto inv = static_cast<float>(1.0 / r.y_scale);
+    const float skew_x = static_cast<float>(r.k3) / 1024.0f * inv;
+    const float scale_y = static_cast<float>(r.k4) / 1024.0f * inv;
+    const double ty = -(r.req * r.y_scale) * 0.5 * static_cast<double>(r.skew);
+    *dx = static_cast<double>(skew_x) * ty;
+    *dy = static_cast<double>(scale_y) * ty;
 }
 #endif  // CLEARTYPE_FIREFOX_PARITY
 
@@ -3157,10 +3432,55 @@ void ApplyTransformedEmSize(FT_Face face, double* em_size)
     }
     const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
     const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
-    double exact = 0.0;
-    if (ExactTransformedEmSize(shape, x_26_6, y_26_6, *em_size, &exact)) {
-        *em_size = exact;
+    RecoveredTransform recovered = {};
+    if (ExactTransformedEmSize(shape, x_26_6, y_26_6, *em_size, &recovered)) {
+        *em_size = recovered.em_size;
     }
+}
+
+// FT_Set_Transform's delta, put back onto the glyph just loaded.
+//
+// FreeType applies it by translating the slot outline from inside
+// FT_Load_Glyph, and that translate is no longer recorded, so the value comes
+// from the face instead. It is the origin shift synthetic italics asks for in
+// vertical text, which Windows passes as the DWRITE_MATRIX's dx and dy.
+void RecordTransformDelta(FT_Face face)
+{
+    if (face == nullptr || face->glyph == nullptr) {
+        return;
+    }
+    FT_Vector delta = { .x = 0, .y = 0 };
+    FT_Matrix shape = {};
+    bool transformed = false;
+    pthread_mutex_lock(&g_faces_mutex);
+    if (const FaceEntry* entry = FindFaceLocked(face)) {
+        delta = entry->transform_delta;
+        shape = entry->transform_matrix;
+        transformed = !entry->transform_identity;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (delta.x == 0 && delta.y == 0) {
+        return;
+    }
+    // A delta only ever carries the vertical synthetic oblique's origin
+    // shift, which Windows keeps to full precision. Where the transform it
+    // came from can be recovered the shift is recomputed from that; where it
+    // cannot, the 26.6 value FreeType was given is all there is.
+    if (transformed && face->size != nullptr && face->units_per_EM != 0) {
+        const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+        const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
+        RecoveredTransform recovered = {};
+        if (x_26_6 > 0 && y_26_6 > 0 &&
+            ExactTransformedEmSize(shape, x_26_6, y_26_6, static_cast<double>(y_26_6) / 64.0,
+                                   &recovered) &&
+            recovered.vertical) {
+            double dx = 0.0, dy = 0.0;
+            SyntheticItalicOffset(recovered, &dx, &dy);
+            RecordExactDelta(&face->glyph->outline, dx, dy);
+            return;
+        }
+    }
+    RecordShift(&face->glyph->outline, delta.x, delta.y);
 }
 #endif  // CLEARTYPE_FIREFOX_PARITY
 
@@ -3185,8 +3505,11 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
         size_26_6 = requested;
         *em_size = static_cast<double>(requested) / 64.0;
     }
+    // A size Gecko named for this face outranks the reconstruction, being the
+    // value itself rather than an inversion of its rounding.
     double exact = 0.0;
-    if (ExactEmSize(size_26_6, &exact)) {
+    if (ClaimedSizeFor(face, size_26_6, &exact) || ExactEmSize(size_26_6, &exact) ||
+        ReducedEmSize(size_26_6, &exact)) {
         *em_size = exact;
     }
 #else
@@ -3210,7 +3533,10 @@ bool GetEmSizeClaimed(FT_Face face, const FT_Fixed requested, double* em_size,
         }
         *em_size = static_cast<double>(g_claimed_em_26_6) / 64.0;
         double exact = 0.0;
-        if (ExactEmSize(g_claimed_em_26_6, &exact)) {
+        if (g_claimed_em_px > 0.0) {
+            *em_size = g_claimed_em_px;
+        } else if (ExactEmSize(g_claimed_em_26_6, &exact) ||
+                   ReducedEmSize(g_claimed_em_26_6, &exact)) {
             *em_size = exact;
         }
         return true;
@@ -3755,7 +4081,11 @@ bool SizesMatch(const double a, const double b)
 
 // The instance for this face at this requested size, computed on first use.
 // Called with g_faces_mutex held.
-WinInstance* GetWinInstanceLocked(FaceEntry* entry, const double size)
+// The instance for this size and axis position if one has been built, and
+// nothing otherwise. A caller that only reads an instance takes this, since
+// building one reads the face's current FreeType state and evicts the oldest
+// entry, neither of which belongs to a caller that is merely asking.
+WinInstance* FindWinInstanceLocked(FaceEntry* entry, const double size)
 {
     const FT_Fixed key = static_cast<FT_Fixed>(std::floor(size * 64.0 + 0.5));
     const std::vector<DWRITE_FONT_AXIS_VALUE> axes = GetAxisValues(entry->face);
@@ -3764,6 +4094,16 @@ WinInstance* GetWinInstanceLocked(FaceEntry* entry, const double size)
             return &inst;
         }
     }
+    return nullptr;
+}
+
+WinInstance* GetWinInstanceLocked(FaceEntry* entry, const double size)
+{
+    if (WinInstance* found = FindWinInstanceLocked(entry, size)) {
+        return found;
+    }
+    const FT_Fixed key = static_cast<FT_Fixed>(std::floor(size * 64.0 + 0.5));
+    const std::vector<DWRITE_FONT_AXIS_VALUE> axes = GetAxisValues(entry->face);
     if (entry->instances.size() >= 32) {
         if (entry->instances.front().dwrite_face != nullptr) {
             entry->instances.front().dwrite_face->Release();
@@ -4552,16 +4892,24 @@ bool WinGlyphInkBox(IDWriteFontFace* dwrite_face, const float funits_conv, const
 //     x = horiBearingX;      x2 = x + width
 //     y = -horiBearingY;     y2 = y + height
 //
-// so the height carries the bearing with it. A degenerate box is left alone,
-// since an empty one is how that function is told to fall back to the
-// font-wide ascent and descent for a color glyph with no outline.
+// so the height carries the bearing with it.
+// The four edges as 26.6, and whether the box is one the slot will take. An
+// empty box is how GetFTGlyphExtents is told to fall back to the font-wide
+// ascent and descent for a color glyph with no outline, so a degenerate one is
+// left out of the slot.
+bool InkBox26Dot6(const WinInkBox& box, FT_Pos* x, FT_Pos* x2, FT_Pos* y, FT_Pos* y2)
+{
+    *x = static_cast<FT_Pos>(llround(box.left * 64.0));
+    *x2 = static_cast<FT_Pos>(llround(box.right * 64.0));
+    *y = static_cast<FT_Pos>(llround(box.top * 64.0));
+    *y2 = static_cast<FT_Pos>(llround(box.bottom * 64.0));
+    return *x2 > *x && *y + *y2 > 0;
+}
+
 void SetGlyphInkBox(FT_GlyphSlot slot, const WinInkBox& box)
 {
-    const auto x = static_cast<FT_Pos>(llround(box.left * 64.0));
-    const auto x2 = static_cast<FT_Pos>(llround(box.right * 64.0));
-    const auto y = static_cast<FT_Pos>(llround(box.top * 64.0));
-    const auto y2 = static_cast<FT_Pos>(llround(box.bottom * 64.0));
-    if (x2 > x && y + y2 > 0) {
+    FT_Pos x = 0, x2 = 0, y = 0, y2 = 0;
+    if (InkBox26Dot6(box, &x, &x2, &y, &y2)) {
         slot->metrics.horiBearingX = x;
         slot->metrics.width = x2 - x;
         slot->metrics.horiBearingY = y;
@@ -4670,8 +5018,9 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
     const WinInstance* instance =
         entry != nullptr ? GetWinInstanceLocked(entry, em_size) : nullptr;
     double advance_px = -1.0;
-    double win_ink_top = -1.0;
-    double win_ink_right = -1.0;
+    double win_ink_top = 0.0;
+    double win_ink_right = 0.0;
+    bool have_win_ink = false;
     bool win_fattens_outline = true;
     double extents_scale = 1.0;
     if (instance != nullptr && instance->valid && instance->dwrite_face != nullptr) {
@@ -4681,9 +5030,13 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         // at their plain weight and only the advance moves.
         win_fattens_outline = !(entry->memory != nullptr || FaceHasCOLRLocked(entry));
         if (win_fattens_outline) {
-            WinBoldGlyphInkLocked(entry, *instance,
-                                  static_cast<UINT16>(face->glyph->glyph_index),
-                                  &win_ink_top, &win_ink_right);
+            // The bool is the answer here. A glyph whose ink is all below
+            // the baseline, like the underscore, has a negative top and is
+            // still a glyph Windows fattens.
+            have_win_ink =
+                WinBoldGlyphInkLocked(entry, *instance,
+                                      static_cast<UINT16>(face->glyph->glyph_index),
+                                      &win_ink_top, &win_ink_right);
         }
         advance_px = WinBoldGlyphAdvanceLocked(entry, *instance,
                                                static_cast<UINT16>(face->glyph->glyph_index),
@@ -4707,7 +5060,7 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         gm.horiBearingY -= strength;
         gm.height -= strength;
         gm.width -= strength;
-    } else if (win_ink_top > 0.0 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+    } else if (have_win_ink && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
         // Where Windows does fatten the outline, the glyph top it reports is
         // the one DirectWrite's simulated face carries, and GetFTGlyphExtents
         // reaches its own by adding the strength to a bearing FreeType already
@@ -4725,11 +5078,9 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         // is placed to land that sum on the Windows edge. The bearing is left
         // where it is, since the left edge is not one of the two the
         // emboldening moves.
-        if (win_ink_right > 0.0) {
-            const FT_Pos want_x2 = static_cast<FT_Pos>(llround(win_ink_right * 64.0)) - strength;
-            if (want_x2 > gm.horiBearingX) {
-                gm.width = want_x2 - gm.horiBearingX;
-            }
+        const FT_Pos want_x2 = static_cast<FT_Pos>(llround(win_ink_right * 64.0)) - strength;
+        if (want_x2 > gm.horiBearingX) {
+            gm.width = want_x2 - gm.horiBearingX;
         }
     }
     if (advance_px < 0.0) {
@@ -5013,6 +5364,38 @@ bool FaceIsHintedLocked(FaceEntry* entry)
         }
     }
     return entry->is_hinted != 0;
+}
+
+// Which of the two routes a blob glyph takes on Windows.
+//
+// SkScalerContext_DW::generateMetrics gets texture bounds for an ordinary
+// glyph, so the mask comes from DirectWrite and not from the outline. The
+// mask and an outline fill only part company where DirectWrite has something
+// to grid-fit onto: a hinted face at a hinted rendering mode, or a
+// non-uniform scale, which moves the fitted edges off the geometric ones.
+// Everywhere else the two agree, which is why the outline route this library
+// takes for every other blob glyph measures exact.
+//
+// So this names the one shape that has to come from the mask, an unhinted face
+// under a squeeze, which is what text-combine-upright asks Ahem for. A hinted
+// face keeps the outline route, where SkiaScanlineBitmap already reproduces
+// Skia's own scan converter.
+bool BlobPrefersDWriteMask(FT_Face face)
+{
+    if (face == nullptr || face->size == nullptr || face->units_per_EM == 0) {
+        return false;
+    }
+    const float aspect = SnappedPixelAspect(face);
+    if (aspect >= 0.9999f && aspect <= 1.0001f) {
+        return false;
+    }
+    bool hinted = true;
+    pthread_mutex_lock(&g_faces_mutex);
+    if (FaceEntry* entry = FindFaceLocked(face)) {
+        hinted = FaceIsHintedLocked(entry);
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return !hinted;
 }
 
 bool HasBitmapStrikeInRangeLocked(FaceEntry* entry, const GaspRange& range)
@@ -5428,8 +5811,10 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     }
     const bool keep_phase = options.subpixel_positioning && !webrender_bitmaps;
     const FT_Pos shift_x = keep_phase ? pending.dx : pending.dx & ~static_cast<FT_Pos>(63);
-    const float offset_x = static_cast<float>(shift_x) / 64.0f;
-    const float offset_y = -static_cast<float>(pending.dy) / 64.0f;
+    const auto offset_x =
+        static_cast<float>(static_cast<double>(shift_x) / 64.0 + pending.delta_x);
+    const auto offset_y =
+        static_cast<float>(-static_cast<double>(pending.dy) / 64.0 + pending.delta_y);
 
     // create_glyph_analysis(): one glyph, zero advance, zero offset, not
     // sideways, bidi level zero, em size in DIPs.
@@ -5739,6 +6124,9 @@ thread_local unsigned g_in_real_freetype = 0;
 // FreeType translates and transforms scratch outlines in its own stack frame
 // while it works, and those are not the caller's glyph; see ForeignToCaller.
 thread_local const FT_Outline* g_loading_outline = nullptr;
+// The face this thread last loaded a glyph for. Names the font behind a Skia
+// scaler, which carries an SkTypeface and no FreeType face of its own.
+thread_local FT_Face g_last_loaded_face = nullptr;
 
 struct InRealFreeType
 {
@@ -6219,6 +6607,9 @@ FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 l
                                                                      : nullptr);
     const FT_Error error = real(face, glyph_index, flags);
     if (error == 0) {
+#if CLEARTYPE_FIREFOX_PARITY
+        g_last_loaded_face = face;
+#endif
         if (face != nullptr && face->glyph != nullptr) {
             SetPendingOutlineFace(&face->glyph->outline, face);
 #if CLEARTYPE_FIREFOX_PARITY
@@ -6392,6 +6783,7 @@ extern "C" void CleartypeEndInitMetrics(void)
 #if CLEARTYPE_FIREFOX_PARITY
     g_last_sfnt_face = nullptr;
     g_claimed_em_26_6 = 0;
+    g_claimed_em_px = 0.0;
 #endif
 }
 
@@ -6679,10 +7071,130 @@ extern "C" int CleartypeClaimFace(void* candidate, double ft_size)
     g_claimed_em_26_6 = (ft_size > 0.0 && ft_size < 65536.0)
                             ? static_cast<FT_Fixed>(ft_size * 64.0 + 0.5)
                             : 0;
+    // mFTSize is FindClosestSize(face, GetAdjustedSize()), which is the
+    // adjusted size itself only for a scalable face; for a bitmap one it is
+    // whichever strike was chosen, and gfxFT2FontBase scales the metrics back
+    // up from it afterwards.
+    g_claimed_em_px = g_claimed_em_26_6 > 0 && FT_IS_SCALABLE(face) ? ft_size : 0.0;
+    if (g_claimed_em_px > 0.0) {
+        RecordClaimedSize(face, g_claimed_em_px);
+    }
     return 1;
 #else
     (void)candidate;
     (void)ft_size;
+    return 0;
+#endif
+}
+
+extern "C" int CleartypeClaimSize(void* candidate, double px)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (candidate == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    auto* face = static_cast<FT_Face>(candidate);
+    pthread_mutex_lock(&g_faces_mutex);
+    const bool known = FindFaceLocked(face) != nullptr;
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (!known || !FT_IS_SCALABLE(face)) {
+        return 0;
+    }
+    RecordClaimedSize(face, px);
+    return 1;
+#else
+    (void)candidate;
+    (void)px;
+    return 0;
+#endif
+}
+
+// The ink box for one glyph, in pixels and without the 1/64 step the slot's
+// metrics store it in. Four edges: left, top, right, bottom. `embolden` is the
+// font's mEmbolden, which decides whether the top and the right come off the
+// face DirectWrite simulates bold on, as they do in the slot.
+//
+// gfxFT2FontBase::GetFTGlyphExtents rebuilds its box out of those metrics, so
+// the edges SetGlyphInkBox wrote arrive rounded. gfxFont::Measure then extends
+// a synthetically obliqued box by ceil(skew * edge) in app units, where half a
+// 1/64 px moves the ceiling a whole app unit and 1/60 px of ink with it. The
+// caller puts these edges back; see SubstituteInkBox in libxul_patch.cpp.
+//
+// `ft_size` is the font's mFTSize, and everything read here is either that or
+// per-face state, never the size or the variation the face carries right now.
+// This runs after gfxFT2FontBase::GetFTGlyphExtents has let the face lock go,
+// so another font sharing the face may already have re-set both, and a lookup
+// that read them would answer differently on two threads.
+//
+// A variable face is refused for the same reason. Its instance is keyed on the
+// axis position, which is read off the face and is that same live state.
+//
+// The instance is the one the glyph load that came just before built. Nothing
+// is built here, because building reads the face's FreeType state and evicts
+// the oldest instance, and neither belongs to a caller that is only asking.
+extern "C" int CleartypeGlyphInkBox(void* candidate, double ft_size, int embolden,
+                                    unsigned glyph, double* out)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (candidate == nullptr || out == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    auto* face = static_cast<FT_Face>(candidate);
+    if (!(ft_size > 0.0) || !(ft_size < 65536.0)) {
+        return 0;
+    }
+    // The candidate is offered a word at a time and is not a face until the
+    // table says so, so nothing reads through it before that.
+    pthread_mutex_lock(&g_faces_mutex);
+    WinInkBox box{};
+    bool have = false;
+    double bold_top = 0.0, bold_right = 0.0;
+    bool have_bold = false;
+    if (FaceEntry* entry = FindFaceLocked(face);
+        entry != nullptr && FT_IS_SCALABLE(face) && !FT_HAS_MULTIPLE_MASTERS(face)) {
+        // The size resolves out of the caller's own number and the table Gecko
+        // filled when it named this font's face, so it does not depend on
+        // which size the face happens to carry now.
+        const auto size_26_6 = static_cast<FT_Fixed>(ft_size * 64.0 + 0.5);
+        double em_size = ft_size;
+        double exact = 0.0;
+        if (ClaimedSizeFor(face, size_26_6, &exact) || ExactEmSize(size_26_6, &exact) ||
+            ReducedEmSize(size_26_6, &exact)) {
+            em_size = exact;
+        }
+        // Nothing else is tried when this misses. A face whose size Gecko
+        // snapped to a bitmap strike carries a font size its Windows instance
+        // was not built at, and the only thing linking the two is the request
+        // recorded on the face, which by now is whichever font touched it
+        // last. Reading it answers differently on two threads.
+        const WinInstance* instance = FindWinInstanceLocked(entry, em_size);
+        have = instance != nullptr && instance->valid &&
+               WinGlyphInkBox(instance->dwrite_face, instance->funits_conv,
+                              static_cast<UINT16>(glyph), &box);
+        // Where Windows fattens the outline the top and the right come off the
+        // simulated face, which is what ApplyWindowsBoldAdvance put in the
+        // slot; the same two exclusions apply.
+        if (have && embolden != 0 && entry->memory == nullptr && !FaceHasCOLRLocked(entry)) {
+            have_bold = WinBoldGlyphInkLocked(entry, *instance, static_cast<UINT16>(glyph),
+                                              &bold_top, &bold_right);
+        }
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    FT_Pos x = 0, x2 = 0, y = 0, y2 = 0;
+    if (!have || !InkBox26Dot6(box, &x, &x2, &y, &y2)) {
+        return 0;                            // no box, or one the slot refused
+    }
+    out[0] = box.left;
+    out[1] = have_bold ? bold_top : box.top;
+    out[2] = have_bold ? bold_right : box.right;
+    out[3] = box.bottom;
+    return 1;
+#else
+    (void)candidate;
+    (void)ft_size;
+    (void)embolden;
+    (void)glyph;
+    (void)out;
     return 0;
 #endif
 }
@@ -6983,6 +7495,30 @@ thread_local std::vector<CleartypeGlyphPathPoint> g_glyph_path;
 // finished path is left alone instead of half corrected.
 thread_local bool g_glyph_path_usable = false;
 
+// fSkXform, the matrix SkScalerContext_DW::generatePath applies to the
+// finished path. computeMatrices splits the device matrix into a scale and a
+// remainder, kVertical on Windows and kFull on Linux, so the two remainders
+// differ by the pixel aspect alone: sA_vertical == sA_full * diag(x/y, 1).
+// sA_full is fMatrix22Scalar, which reaches this library as the FT_Matrix
+// SkScalerContext_FreeType::setupSize hands FT_Set_Transform.
+struct PathTransform
+{
+    float scale_x = 1.0f;
+    float skew_x = 0.0f;
+    float skew_y = 0.0f;
+    float scale_y = 1.0f;
+};
+
+static PathTransform SkXformFromFTMatrix(const FT_Matrix& m, const float x_over_y)
+{
+    PathTransform out;
+    out.scale_x = static_cast<float>(static_cast<double>(m.xx) / 65536.0) * x_over_y;
+    out.skew_x = static_cast<float>(static_cast<double>(-m.xy) / 65536.0);
+    out.skew_y = static_cast<float>(static_cast<double>(-m.yx) / 65536.0) * x_over_y;
+    out.scale_y = static_cast<float>(static_cast<double>(m.yy) / 65536.0);
+    return out;
+}
+
 // Replays a glyph outline from GetGlyphRunOutline into an FT_Outline_Funcs
 // caller, and records the points the caller's own sink will keep.
 //
@@ -6994,8 +7530,8 @@ thread_local bool g_glyph_path_usable = false;
 class DecomposeSink final : public IDWriteGeometrySink
 {
 public:
-    DecomposeSink(const FT_Outline_Funcs* funcs, void* user, const float x_over_y = 1.0f)
-        : funcs_(funcs), user_(user), x_over_y_(x_over_y) {}
+    DecomposeSink(const FT_Outline_Funcs* funcs, void* user, const PathTransform& xform)
+        : funcs_(funcs), user_(user), xform_(xform) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override
     {
@@ -7088,9 +7624,13 @@ private:
     // so the recorded values are the caller's own.
     FT_Vector Point(const D2D1_POINT_2F p) const
     {
-        const double x = static_cast<double>(p.x) * static_cast<double>(x_over_y_);
+        const double px = static_cast<double>(p.x), py = static_cast<double>(p.y);
+        const double x = px * static_cast<double>(xform_.scale_x) +
+                         py * static_cast<double>(xform_.skew_x);
+        const double y = py * static_cast<double>(xform_.scale_y) +
+                         px * static_cast<double>(xform_.skew_y);
         return FT_Vector{ .x = static_cast<FT_Pos>(llround(x * 64.0)),
-                          .y = static_cast<FT_Pos>(llround(static_cast<double>(-p.y) * 64.0)) };
+                          .y = static_cast<FT_Pos>(llround(-y * 64.0)) };
     }
 
     static bool Same(const FT_Vector& a, const FT_Vector& b) { return a.x == b.x && a.y == b.y; }
@@ -7172,12 +7712,12 @@ private:
     // match is bit for bit what SkFDot6ToScalar produces. The sink negates y
     // on its way in, which undoes the negation Point applied.
     //
-    // x_over_y_ is the horizontal squeeze, applied to the exact coordinate
-    // alone. SkScalerContext_DW::generatePath builds the path from the
-    // untransformed outline and calls builder.transform(fSkXform) on the
-    // finished path, so the squeeze reaches the points and nothing else, and
-    // every decision above it was already made on the same floats Windows
-    // decided on.
+    // xform_ is fSkXform, applied to the exact coordinate alone.
+    // SkScalerContext_DW::generatePath builds the path from the untransformed
+    // outline and calls builder.transform(fSkXform) on the finished path, so
+    // the transform reaches the points and nothing else, and every decision
+    // above it was already made on the same floats Windows decided on. The
+    // multiply order is SkMatrix::Affine_vpts.
     void Record(const FT_Vector& quantized, const D2D1_POINT_2F& exact)
     {
         if (!g_glyph_path_usable) {
@@ -7190,15 +7730,15 @@ private:
         g_glyph_path.push_back(CleartypeGlyphPathPoint{
             .match_x = static_cast<float>(quantized.x) * 0.015625f,
             .match_y = -(static_cast<float>(quantized.y) * 0.015625f),
-            .exact_x = exact.x * x_over_y_,
-            .exact_y = exact.y });
+            .exact_x = exact.x * xform_.scale_x + exact.y * xform_.skew_x,
+            .exact_y = exact.y * xform_.scale_y + exact.x * xform_.skew_y });
     }
 
     static constexpr size_t kMaxGlyphPathPoints = 1u << 16;
 
     const FT_Outline_Funcs* funcs_;
     void* user_;
-    float x_over_y_ = 1.0f;
+    PathTransform xform_;
     int error_ = 0;
     bool started_ = false;
     FT_Vector cur_ = { .x = 0, .y = 0 };
@@ -7210,14 +7750,16 @@ private:
 // the caller falls through to the real walk; true with *cb_error carrying
 // whatever a callback returned, which is what FT_Outline_Decompose returns.
 bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
-                            const FT_Outline_Funcs* funcs, void* user, int* cb_error)
+                            const PendingOutline& pending, const FT_Outline_Funcs* funcs,
+                            void* user, int* cb_error)
 {
     // A pixel aspect other than 1 is a horizontal squeeze and is kept. Skia's
     // FreeType port splits the device matrix with PreMatrixScale::kFull, so
     // the squeeze arrives as an anisotropic char size, while
     // SkScalerContext_DW splits it with kVertical and hands the ratio to
     // builder.transform. Windows draws DirectWrite's outline at the vertical
-    // em and squeezes the finished path, which is what the sink reproduces.
+    // em and transforms the finished path, which is what the sink reproduces.
+    // A rotation reaches the sink the same way, as the rest of fSkXform.
     double em_size = 0.0;
     float x_over_y = 1.0f;
     if (!GetEmSize(face, &em_size, &x_over_y) || !(em_size > 0.0) || !(x_over_y > 0.0f)) {
@@ -7226,7 +7768,28 @@ bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
     WarmSystemCollection();
     pthread_mutex_lock(&g_faces_mutex);
     FaceEntry* entry = FindFaceLocked(face);
-    if (entry == nullptr || !entry->transform_identity) {
+    if (entry == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return false;
+    }
+    constexpr FT_Matrix identity = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
+    const bool face_transformed = !entry->transform_identity;
+    const FT_Matrix face_matrix = face_transformed ? entry->transform_matrix : identity;
+    // FT_Set_Transform's delta moves the outline and is not part of fSkXform.
+    // Skia passes none, so a face carrying one is some other caller's.
+    const bool has_delta = entry->transform_delta.x != 0 || entry->transform_delta.y != 0;
+    if ((face_transformed && MatrixIsSingular(face_matrix)) || has_delta) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return false;
+    }
+    // FreeType applies the face matrix inside FT_Load_Glyph by calling
+    // FT_Outline_Transform, so a transformed face leaves that same matrix on
+    // the outline. Any other pending matrix is a reshape this walk has no
+    // Windows counterpart for.
+    if (pending.has_matrix &&
+        (!face_transformed || pending.matrix.xx != face_matrix.xx ||
+         pending.matrix.xy != face_matrix.xy || pending.matrix.yx != face_matrix.yx ||
+         pending.matrix.yy != face_matrix.yy)) {
         pthread_mutex_unlock(&g_faces_mutex);
         return false;
     }
@@ -7240,7 +7803,7 @@ bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
     pthread_mutex_unlock(&g_faces_mutex);
 
     const auto gid = static_cast<UINT16>(glyph_index);
-    DecomposeSink sink(funcs, user, SnappedPixelAspect(face));
+    DecomposeSink sink(funcs, user, SkXformFromFTMatrix(face_matrix, SnappedPixelAspect(face)));
     const HRESULT hr = dwrite_face->GetGlyphRunOutline(
         static_cast<FLOAT>(em_size), &gid, nullptr, nullptr, 1, FALSE, FALSE, &sink);
     if (FAILED(hr)) {
@@ -7272,10 +7835,11 @@ FT_Error FT_Outline_Decompose(FT_Outline* outline, const FT_Outline_Funcs* func_
             face->glyph != nullptr && &face->glyph->outline == outline &&
             face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
             const PendingOutline pending = PeekOutlineState(outline);
-            if (pending.dx == 0 && pending.dy == 0 && !pending.has_matrix &&
+            if (pending.dx == 0 && pending.dy == 0 &&
                 pending.simulations == DWRITE_FONT_SIMULATIONS_NONE && !pending.unrepresentable) {
                 int cb_error = 0;
-                if (DecomposeThroughDWrite(face, glyph_index, func_interface, user, &cb_error)) {
+                if (DecomposeThroughDWrite(face, glyph_index, pending, func_interface, user,
+                                           &cb_error)) {
                     return cb_error;
                 }
             }
@@ -7286,6 +7850,19 @@ FT_Error FT_Outline_Decompose(FT_Outline* outline, const FT_Outline_Funcs* func_
     }
 #endif
     return real(outline, func_interface, user);
+}
+
+// True when the glyph this thread is about to draw belongs to the one shape
+// that must come from DirectWrite's mask rather than from its outline. Read by
+// the generateMetrics thunk, which holds a Skia scaler and no FreeType face,
+// so the face is the one this thread last loaded a glyph for.
+extern "C" int CleartypeBlobPrefersMask(void)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    return dwcft::ParityActive() && BlobPrefersDWriteMask(g_last_loaded_face) ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 extern "C" int CleartypeOnBlobRaster(void)
@@ -7357,9 +7934,19 @@ FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT
         std::getenv("CLEARTYPE_FORCE_FALLBACK") != nullptr) {
         return real(library, outline, abitmap);
     }
+#if CLEARTYPE_FIREFOX_PARITY
     if (gray_target && OnBlobRasterThread()) {
-        return SkiaScanlineBitmap(real, library, outline, abitmap);
+        FT_Face owner = nullptr;
+        FT_UInt owned_index = 0;
+        bool wants_mask = false;
+        if (FindOutlineOwner(outline, &owner, &owned_index)) {
+            wants_mask = BlobPrefersDWriteMask(owner);
+        }
+        if (!wants_mask) {
+            return SkiaScanlineBitmap(real, library, outline, abitmap);
+        }
     }
+#endif
     if (!lcd_target && !gray_target) {
         return real(library, outline, abitmap);
     }

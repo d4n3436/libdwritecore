@@ -289,6 +289,29 @@ bool BoolAnswer(const char* object, const int n, int* out)
 }
 
 
+using FcChar8 = unsigned char;
+using FcConfig = struct _FcConfig;
+using FcFontSet = struct _FcFontSet;
+
+using FcPatternGetStringFn = FcResult (*)(const FcPattern*, const char*, int, FcChar8**);
+using FcConfigGetFontsFn = FcFontSet* (*)(FcConfig*, int);
+
+// fontconfig.h: FcSetSystem is 0 and FcSetApplication is 1. Only the system
+// set is filtered; the application set is what a caller added itself, and
+// Firefox puts its own bundled faces there.
+constexpr int kFcSetSystem = 0;
+
+// fontconfig.h: struct _FcFontSet, whose header this file does not include.
+// ReSharper disable once CppDeclaratorNeverUsed
+// sfont is the set's capacity, which nothing here asks for. It stays because
+// fonts sits after it.
+struct FontSetLayout
+{
+    int nfont;
+    int sfont;
+    FcPattern** fonts;
+};
+
 #if CLEARTYPE_FIREFOX_PARITY
 
 // ---------------------------------------------------------------------------
@@ -321,44 +344,23 @@ bool BoolAnswer(const char* object, const int n, int* out)
 // request survives.
 // ---------------------------------------------------------------------------
 
-using FcChar8 = unsigned char;
 using FcCharSet = struct _FcCharSet;
-using FcConfig = struct _FcConfig;
-using FcFontSet = struct _FcFontSet;
 
 using FcPatternDuplicateFn = FcPattern* (*)(const FcPattern*);
-using FcPatternGetStringFn = FcResult (*)(const FcPattern*, const char*, int, FcChar8**);
 using FcPatternDelFn = FcBool (*)(FcPattern*, const char*);
 using FcPatternAddStringFn = FcBool (*)(FcPattern*, const char*, const FcChar8*);
 using FcPatternDestroyFn = void (*)(FcPattern*);
 using FcFontSortFn = FcFontSet* (*)(FcConfig*, FcPattern*, FcBool, FcCharSet**, FcResult*);
 using FcFontMatchFn = FcPattern* (*)(FcConfig*, FcPattern*, FcResult*);
 using FcConfigSubstituteFn = FcBool (*)(FcConfig*, FcPattern*, int);
-using FcConfigGetFontsFn = FcFontSet* (*)(FcConfig*, int);
 using FcFontSetCreateFn = FcFontSet* (*)();
 using FcFontSetAddFn = FcBool (*)(FcFontSet*, FcPattern*);
 using FcFontSetDestroyFn = void (*)(FcFontSet*);
-
-// fontconfig.h: FcSetSystem is 0 and FcSetApplication is 1. Only the system
-// set is filtered; the application set is what a caller added itself, and
-// Firefox puts its own bundled faces there.
-constexpr int kFcSetSystem = 0;
 
 // fontconfig.h: FcMatchPattern is 0, FcMatchFont 1, FcMatchScan 2. Only the
 // request is edited here. The other two describe a font that has already been
 // chosen, where deleting "lang" would delete the languages that font covers.
 constexpr int kFcMatchPattern = 0;
-
-// fontconfig.h: struct _FcFontSet, whose header this file does not include.
-// ReSharper disable once CppDeclaratorNeverUsed
-// sfont is the set's capacity, which nothing here asks for. It stays because
-// fonts sits after it.
-struct FontSetLayout
-{
-    int nfont;
-    int sfont;
-    FcPattern** fonts;
-};
 
 // The least a machine can carry and still be filtered. Below this the
 // Windows fonts are not really installed and hiding everything else would
@@ -956,22 +958,6 @@ namespace {
 
 }  // namespace
 
-#if CLEARTYPE_FIREFOX_PARITY
-// Whether this pattern's family also carries a LIGHT face.
-//
-// gfxFcPlatformFontList::MapFcWeight buckets a fontconfig weight into hundreds
-// and DEMILIGHT lands in the same 300 bucket as LIGHT, so a family carrying
-// both has two faces at one weight and the order decides between them.
-// DirectWrite reports the Semilight face's real 350 and reaches it only where
-// Regular does not cover the character. Answering REGULAR for that face gives
-// the same result. LIGHT keeps everything below 400, and at 400 and above
-// Semilight ties with the family's own Regular face and loses the tie, since
-// FindAllFontsForStyle keeps the standard face ahead of it.
-//
-// Only where a LIGHT face exists to be separated from. A family with a
-// Semilight and no Light, such as Leelawadee UI or Nirmala UI, has 350 as the
-// closest face to every weight below 400, and moving it to the 400 bucket
-// would hand those weights to Regular.
 // Whether any face of this pattern's family is bold. Blink on Linux starts
 // synthetic bold at `weight + 200` of the face it selected, where Windows
 // starts it at 600 flat, so a family with no bold face draws regular text at
@@ -1025,6 +1011,23 @@ bool FamilyHasBoldFace(const FcPattern* p)
     pthread_mutex_unlock(&bold_mutex);
     return found;
 }
+
+#if CLEARTYPE_FIREFOX_PARITY
+// Whether this pattern's family also carries a LIGHT face.
+//
+// gfxFcPlatformFontList::MapFcWeight buckets a fontconfig weight into hundreds
+// and DEMILIGHT lands in the same 300 bucket as LIGHT, so a family carrying
+// both has two faces at one weight and the order decides between them.
+// DirectWrite reports the Semilight face's real 350 and reaches it only where
+// Regular does not cover the character. Answering REGULAR for that face gives
+// the same result. LIGHT keeps everything below 400, and at 400 and above
+// Semilight ties with the family's own Regular face and loses the tie, since
+// FindAllFontsForStyle keeps the standard face ahead of it.
+//
+// Only where a LIGHT face exists to be separated from. A family with a
+// Semilight and no Light, such as Leelawadee UI or Nirmala UI, has 350 as the
+// closest face to every weight below 400, and moving it to the 400 bucket
+// would hand those weights to Regular.
 
 bool FamilyHasLightFace(const FcPattern* p)
 {

@@ -461,6 +461,22 @@ if [ "$COMMAND" = "guest" ]; then
         # <host>..." and reads as a font difference wherever the page has ink
         # there. Only the side whose page server is not loopback shows it,
         # which is this one.
+        # Nothing off the page server, on either side. A page that fetches a
+        # script from the public internet renders as a function of how much of
+        # that download the capture waited through, which differs per machine
+        # and per run: css-writing-modes/test-plan/index.html pulls ReSpec from
+        # www.w3.org and builds a table-of-contents sidebar from it, and it
+        # swept at four different percentages in four runs because of it. A
+        # proxy that answers nothing is the Marionette equivalent of the
+        # Network.setBlockedURLs the DevTools sides use. Private ranges stay
+        # direct, since the guest reaches this machine's page server by its
+        # LAN address and only the public side has to be cut.
+        echo 'user_pref("network.proxy.type", 1);'
+        echo 'user_pref("network.proxy.http", "127.0.0.1");'
+        echo 'user_pref("network.proxy.http_port", 1);'
+        echo 'user_pref("network.proxy.ssl", "127.0.0.1");'
+        echo 'user_pref("network.proxy.ssl_port", 1);'
+        echo 'user_pref("network.proxy.no_proxies_on", "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16");'
         echo 'user_pref("browser.chrome.site_icons", false);'
         # Light content on both sides, whatever theme each machine is set to.
         # A page with a prefers-color-scheme rule otherwise reads the guest's
@@ -556,7 +572,13 @@ mkdir -p "$PROFILE"
     echo "user_pref(\"browser.cache.disk.enable\", false);"
     echo "user_pref(\"browser.cache.memory.enable\", false);"
     echo "user_pref(\"browser.cache.check_doc_frequency\", 1);"
-    # Both sides alike; see the guest block above for what it is for.
+    # Both sides alike; see the guest block above for what each is for.
+    echo "user_pref(\"network.proxy.type\", 1);"
+    echo "user_pref(\"network.proxy.http\", \"127.0.0.1\");"
+    echo "user_pref(\"network.proxy.http_port\", 1);"
+    echo "user_pref(\"network.proxy.ssl\", \"127.0.0.1\");"
+    echo "user_pref(\"network.proxy.ssl_port\", 1);"
+    echo "user_pref(\"network.proxy.no_proxies_on\", \"localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16\");"
     echo "user_pref(\"browser.chrome.site_icons\", false);"
     echo "user_pref(\"layout.css.prefers-color-scheme.content-override\", 1);"
     echo "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");"

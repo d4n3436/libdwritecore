@@ -1,0 +1,25 @@
+# css-writing-modes cells whose difference is not the text stack, on Firefox.
+#
+# Companion to widget-chrome.accept, which covers the two engines' shared
+# `forms/` cells. Everything here sits outside that directory and is Gecko's
+# own, so it is kept separate rather than widening that file's scope. Three
+# classes, each attributed rather than assumed.
+#
+# The textarea resize grabber. Every one of these charges its whole difference
+# to a <TEXTAREA> and every one differs by exactly 149 px, whatever the page
+# puts in the control: 24px Hebrew, a 34px webfont, and - the one that settles
+# it - placeholder-sideways-crash, whose textarea is empty and still differs by
+# the same 149 px. A 149 px cluster in the corner of an empty control is the
+# resizer, which GTK draws here and the Windows theme draws there.
+wt/external/wpt/css/css-writing-modes/block-plaintext-005.html
+wt/external/wpt/css/css-writing-modes/placeholder-sideways-crash.html
+wt/external/wpt/css/css-writing-modes/writing-mode-vrl-forms-00[34]-manual.html
+#
+# Dotted borders on a page with no text. A shimmed and an unshimmed Linux
+# differ from Windows identically here, 99.9983% and a max channel difference
+# of 2 either way, so the shim is not what moves them.
+wt/external/wpt/css/css-writing-modes/inline-box-orthogonal-child-with-margins*.html
+#
+# Image resampling. attribute_diff charges all 80000 px to four <IMG> elements
+# at a max channel difference of 1, and the page draws no text.
+wt/external/wpt/css/css-writing-modes/sizing-percentages-replaced-orthogonal-001*.html
