@@ -32,6 +32,7 @@
     FT_Load_Glyph;
     FT_Load_Char;
     FT_Outline_Get_Bitmap;
+    FT_Outline_Decompose;
     FT_Outline_Get_CBox;
     FT_Set_Char_Size;
     FT_Get_Sfnt_Table;

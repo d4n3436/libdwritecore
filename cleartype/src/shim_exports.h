@@ -79,6 +79,33 @@ int CleartypeWindowsCharWidth(double* ave_char_width, double* max_advance,
                               double* em_height, double* max_ascent,
                               double* max_descent);
 
+// One point of a glyph outline as it reaches Skia's path builder. `match` is
+// what the builder receives, a 26.6 coordinate divided by 64, and `exact` is
+// the same coordinate before it was quantized. The pair lets a caller find the
+// finished point array by value and replace it with the unquantized one.
+struct CleartypeGlyphPathPoint
+{
+    float match_x, match_y;
+    float exact_x, exact_y;
+};
+
+// Brackets one SkScalerContext_FreeType::generatePath. Between them
+// FT_Outline_Decompose answers from DirectWrite's outline instead of
+// FreeType's, so the path is built out of the same curves Windows builds it
+// from, and every point handed to the builder is recorded.
+void CleartypeBeginGlyphPath(void);
+
+// Ends the bracket and hands back what was recorded, in the order the builder
+// received it. Zero when nothing was recorded, which is the ordinary case for
+// a glyph this library cannot answer for. The array belongs to the shim and
+// is valid until the next CleartypeBeginGlyphPath on this thread.
+unsigned CleartypeEndGlyphPath(const struct CleartypeGlyphPathPoint** points);
+
+// Whether this thread is one of WebRender's blob rasterizers. Gecko replays a
+// blob image through DrawTargetSkia on those, which is the one place Skia
+// asks its own scan converter for a glyph on both platforms.
+int CleartypeOnBlobRaster(void);
+
 }  // extern "C"
 
 #endif  // CLEARTYPE_SHIM_EXPORTS_H_INCLUDED

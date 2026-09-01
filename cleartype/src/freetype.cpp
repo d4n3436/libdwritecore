@@ -265,6 +265,7 @@ using ft_outline_transform_fn = void (*)(const FT_Outline*, const FT_Matrix*);
 using ft_load_glyph_fn = FT_Error (*)(FT_Face, FT_UInt, FT_Int32);
 using ft_load_char_fn = FT_Error (*)(FT_Face, FT_ULong, FT_Int32);
 using ft_outline_get_bitmap_fn = FT_Error (*)(FT_Library, FT_Outline*, const FT_Bitmap*);
+using ft_outline_decompose_fn = FT_Error (*)(FT_Outline*, const FT_Outline_Funcs*, void*);
 using ft_outline_get_cbox_fn = void (*)(const FT_Outline*, FT_BBox*);
 using ft_set_char_size_fn = FT_Error (*)(FT_Face, FT_F26Dot6, FT_F26Dot6, FT_UInt, FT_UInt);
 using ft_set_pixel_sizes_fn = FT_Error (*)(FT_Face, FT_UInt, FT_UInt);
@@ -363,6 +364,7 @@ DEFINE_REAL(ft_outline_transform_fn, FT_Outline_Transform)
 DEFINE_REAL(ft_load_glyph_fn, FT_Load_Glyph)
 DEFINE_REAL(ft_load_char_fn, FT_Load_Char)
 DEFINE_REAL(ft_outline_get_bitmap_fn, FT_Outline_Get_Bitmap)
+DEFINE_REAL(ft_outline_decompose_fn, FT_Outline_Decompose)
 DEFINE_REAL(ft_outline_get_cbox_fn, FT_Outline_Get_CBox)
 DEFINE_REAL(ft_set_char_size_fn, FT_Set_Char_Size)
 DEFINE_REAL(ft_set_pixel_sizes_fn, FT_Set_Pixel_Sizes)
@@ -1070,6 +1072,9 @@ struct FaceEntry
     bool file_failed = false;
     bool resource_failed = false;
     FT_Matrix transform_matrix = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
+    // FT_Set_Transform's delta, which FreeType applies inside FT_Load_Glyph.
+    // Kept because the translate it makes there is no longer recorded.
+    FT_Vector transform_delta = { .x = 0, .y = 0 };
     DWRITE_FONT_FACE_TYPE dwrite_face_type = DWRITE_FONT_FACE_TYPE_UNKNOWN;
     // Created once and reused by both face paths.
     IDWriteFontFile* dwrite_file = nullptr;
@@ -2516,6 +2521,30 @@ void RecordShift(const FT_Outline* outline, const FT_Pos dx, const FT_Pos dy)
     pthread_mutex_unlock(&g_shifts_mutex);
 }
 
+#if CLEARTYPE_FIREFOX_PARITY
+// FT_Set_Transform's delta, put back onto the glyph just loaded.
+//
+// FreeType applies it by translating the slot outline from inside
+// FT_Load_Glyph, and that translate is no longer recorded, so the value comes
+// from the face instead. It is the origin shift synthetic italics asks for in
+// vertical text, which Windows passes as the DWRITE_MATRIX's dx and dy.
+void RecordTransformDelta(FT_Face face)
+{
+    if (face == nullptr || face->glyph == nullptr) {
+        return;
+    }
+    FT_Vector delta = { .x = 0, .y = 0 };
+    pthread_mutex_lock(&g_faces_mutex);
+    if (const FaceEntry* entry = FindFaceLocked(face)) {
+        delta = entry->transform_delta;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (delta.x != 0 || delta.y != 0) {
+        RecordShift(&face->glyph->outline, delta.x, delta.y);
+    }
+}
+#endif  // CLEARTYPE_FIREFOX_PARITY
+
 // Reads and clears whatever was recorded for `outline`. What is recorded
 // applies to exactly the next render of that outline, or to nothing.
 PendingOutline TakeOutlineState(const FT_Outline* outline)
@@ -2911,6 +2940,131 @@ bool ExactEmSize(const FT_Fixed em_size_26_6, double* exact)
     *exact = px;
     return true;
 }
+
+// The size the caller asked for, as (req_size * scale * 64.0 + 0.5) reaches
+// FT_Set_Char_Size. Rust's `as` truncates toward zero and every size here is
+// positive, so this is the floor.
+FT_Fixed CharSize26_6(const double px)
+{
+    return static_cast<FT_Fixed>(std::trunc(px * 64.0 + 0.5));
+}
+
+// The em size Windows rasterizes a transformed glyph at.
+//
+// platform/windows/font.rs get_glyph_parameters passes
+// `font.size.to_f64_px() * y_scale`, with y_scale from
+// FontTransform::compute_scale, so a rotated glyph is drawn at the requested
+// size times a factor that is rarely 1. The Linux backend spends that same
+// product on FT_Set_Char_Size, which is 26.6, and ExactEmSize then reads it
+// back as though the factor were 1 and answers with the nearest CSS size,
+// which is up to a 128th of a pixel out.
+//
+// Every term of the product is constrained. FontTransform::quantize rounds
+// the transform to 1024ths before the glyph cache, so its first column is a
+// pair of integers over 1024. compute_scale makes x_scale that column's
+// length, and the shape reaches FreeType divided by that length, so the
+// column arrives as a unit vector and the pair follows from an estimate good
+// to a part in a thousand. The requested size is a whole app unit over 60.
+// y_scale is the determinant over x_scale, another integer over 1024 times
+// that same length.
+//
+// Every step is checked against the 26.6 sizes FreeType was asked for, so a
+// transform that did not come from WebRender fails one and keeps the size
+// FreeType reported.
+bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_Fixed y_26_6,
+                            const double seed_px, double* em_size)
+{
+    if (x_26_6 <= 0 || y_26_6 <= 0 || !(seed_px > 0.0)) {
+        return false;
+    }
+    // Column one of the shape, in FontTransform's terms. unix/font.rs negates
+    // skew_y on its way into FT_Matrix, and the synthetic oblique only ever
+    // adds a multiple of this column to the other one, so it arrives untouched
+    // whether or not the glyph is slanted.
+    const double a = static_cast<double>(m.xx) / 65536.0;
+    const double b = -static_cast<double>(m.yx) / 65536.0;
+    // Column two. A slanted glyph carries the oblique shear here, which is a
+    // multiple of column one and leaves the determinant alone but not the
+    // pair of integers, so this recovers an upright transform only.
+    const double c = -static_cast<double>(m.xy) / 65536.0;
+    const double d = static_cast<double>(m.yy) / 65536.0;
+
+    // compute_scale makes x_scale the length of column one, and the shape is
+    // the transform divided by it, so that column arrives as a unit vector.
+    // Any other shape, such as Skia's own or one swap_xy has permuted for
+    // vertical text, is left alone.
+    constexpr double kUnit = 8.0 / 65536.0;
+    if (std::fabs(std::hypot(a, b) - 1.0) > kUnit) {
+        return false;
+    }
+    const double x_px = static_cast<double>(x_26_6) / 64.0;
+    const double y_px = static_cast<double>(y_26_6) / 64.0;
+    const double x_est = x_px / seed_px;
+    const long seed_k1 = lround(1024.0 * a * x_est);
+    const long seed_k2 = lround(1024.0 * b * x_est);
+
+    // The seed is tried before its neighbors. A neighbor can satisfy every
+    // check while naming a different transform, so the estimate wins ties.
+    static const long kNudge[3] = { 0, -1, 1 };
+    for (const long d1 : kNudge) {
+        for (const long d2 : kNudge) {
+            const long k1 = seed_k1 + d1, k2 = seed_k2 + d2;
+            if (k1 == 0 && k2 == 0) {
+                continue;
+            }
+            const double h = std::hypot(static_cast<double>(k1), static_cast<double>(k2));
+            const double x_scale = h / 1024.0;
+            const double req_est = x_px / x_scale;
+            for (const long dn : kNudge) {
+                const long app_units = lround(req_est * 60.0) + dn;
+                if (app_units <= 0) {
+                    continue;
+                }
+                // font.size is an f32 and to_f64_px only widens it.
+                const double req =
+                    static_cast<double>(static_cast<float>(static_cast<double>(app_units) / 60.0));
+                if (CharSize26_6(req * x_scale) != x_26_6) {
+                    continue;
+                }
+                // The vertical size is known only to a 128th of a pixel,
+                // which spans far too many determinants to search. Column two
+                // is put on the 1024th grid instead and the determinant
+                // follows from it.
+                const double y_est = y_px / req;
+                const long seed_k3 = lround(1024.0 * y_est * c);
+                const long seed_k4 = lround(1024.0 * y_est * d);
+                for (const long d3 : kNudge) {
+                    for (const long d4 : kNudge) {
+                        const long k3 = seed_k3 + d3, k4 = seed_k4 + d4;
+                        const long det = k1 * k4 - k2 * k3;
+                        if (det == 0) {
+                            continue;
+                        }
+                        const double y_scale =
+                            std::fabs(static_cast<double>(det)) / (1024.0 * h);
+                        if (CharSize26_6(req * y_scale) != y_26_6) {
+                            continue;
+                        }
+                        // Both columns have to read back as the shape FreeType
+                        // was handed, or these were the wrong integers.
+                        const double back_a = static_cast<double>(k1) / (1024.0 * x_scale);
+                        const double back_b = static_cast<double>(k2) / (1024.0 * x_scale);
+                        const double back_c = static_cast<double>(k3) / (1024.0 * y_scale);
+                        const double back_d = static_cast<double>(k4) / (1024.0 * y_scale);
+                        constexpr double kBack = 3.0 / 65536.0;
+                        if (std::fabs(back_a - a) > kBack || std::fabs(back_b - b) > kBack ||
+                            std::fabs(back_c - c) > kBack || std::fabs(back_d - d) > kBack) {
+                            continue;
+                        }
+                        *em_size = static_cast<double>(static_cast<float>(req * y_scale));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
 #endif  // CLEARTYPE_FIREFOX_PARITY
 
 // The size FreeType is actually scaling outlines by, snapping and all, in 26.6
@@ -2924,6 +3078,32 @@ bool ExactEmSize(const FT_Fixed em_size_26_6, double* exact)
 // FT_MulFix(units_per_EM, x_scale) yields 26.6, not 16.16, despite x_scale
 // being 16.16: it is calibrated to take a design-unit coordinate straight to
 // a 26.6 pixel one. (Using <<16 here disables this on every input.)
+#if CLEARTYPE_FIREFOX_PARITY
+// Put the pixel aspect back on the grid WebRender rounded it to.
+//
+// FontTransform::quantize in wr_glyph_rasterizer/src/rasterizer.rs rounds
+// every term of the glyph transform to a 1024th before the glyph cache is
+// touched, and Windows hands that term to DirectWrite as it stands. The Linux
+// backend spends it on FT_Set_Char_Size instead, which is 26.6, so the ratio
+// of the two axes comes back a rounding of the value Windows kept, exact only
+// where the vertical size is a power of two.
+//
+// The 1024th is taken only when it reproduces the horizontal size that was
+// actually asked for, which is what makes a ratio that never came from
+// WebRender keep the value FreeType reported.
+double SnapPixelAspect(const double raw, const FT_Fixed x_26_6, const FT_Fixed y_26_6)
+{
+    constexpr double quantize_scale = 1024.0;
+    const double snapped = std::floor(raw * quantize_scale + 0.5) / quantize_scale;
+    if (!(snapped > 0.0)) {
+        return raw;
+    }
+    const FT_Fixed reproduced =
+        static_cast<FT_Fixed>(std::floor(static_cast<double>(y_26_6) * snapped + 0.5));
+    return reproduced == x_26_6 ? snapped : raw;
+}
+#endif  // CLEARTYPE_FIREFOX_PARITY
+
 bool GetScaledEmSize(FT_Face face, double* em_size, float* x_over_y)
 {
     if (face->size == nullptr || face->units_per_EM == 0) {
@@ -2938,6 +3118,51 @@ bool GetScaledEmSize(FT_Face face, double* em_size, float* x_over_y)
     *x_over_y = static_cast<float>(x_26_6) / static_cast<float>(y_26_6);
     return true;
 }
+
+#if CLEARTYPE_FIREFOX_PARITY
+// The pixel aspect of `face` on WebRender's 1024th grid, or the ratio
+// FreeType reports when it is not on it. See SnapPixelAspect.
+float SnappedPixelAspect(FT_Face face)
+{
+    if (face->size == nullptr || face->units_per_EM == 0) {
+        return 1.0f;
+    }
+    const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+    const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
+    if (x_26_6 <= 0 || y_26_6 <= 0) {
+        return 1.0f;
+    }
+    const double raw = static_cast<double>(x_26_6) / static_cast<double>(y_26_6);
+    return static_cast<float>(SnapPixelAspect(raw, x_26_6, y_26_6));
+}
+
+// Replaces `em_size` with the one Windows rasterizes at when `face` carries a
+// shape. See ExactTransformedEmSize. Takes g_faces_mutex, so nothing already
+// holding it may call this.
+void ApplyTransformedEmSize(FT_Face face, double* em_size)
+{
+    if (face->size == nullptr || face->units_per_EM == 0) {
+        return;
+    }
+    FT_Matrix shape = {};
+    bool transformed = false;
+    pthread_mutex_lock(&g_faces_mutex);
+    if (const FaceEntry* entry = FindFaceLocked(face)) {
+        transformed = !entry->transform_identity;
+        shape = entry->transform_matrix;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (!transformed) {
+        return;
+    }
+    const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+    const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
+    double exact = 0.0;
+    if (ExactTransformedEmSize(shape, x_26_6, y_26_6, *em_size, &exact)) {
+        *em_size = exact;
+    }
+}
+#endif  // CLEARTYPE_FIREFOX_PARITY
 
 // The size the caller asked for: Firefox's mAdjustedSize, which is what both
 // gfxDWriteFont and platform/windows/font.rs compute from.
@@ -3110,14 +3335,31 @@ double WinSyntheticBoldAdvance(const WinInstance& inst, const double plain_advan
     if (!(inst.metrics.maxAdvance > inst.metrics.aveCharWidth)) {
         return plain_advance;
     }
-    constexpr double app_units_per_px = 60.0;
-    // The tracking goes in as a fraction and Gecko rounds the sum once, in
-    // gfxHarfBuzzShaper::SetGlyphsFromRun. Rounding it to whole app units here
-    // first, which is the order gfxShapedText::ApplyTrackingToClusters reads
-    // as, moves an advance whose app-unit value sits on a half step.
-    const double tracking =
-        NSlround(WinSyntheticBoldOffset(inst.adjusted_size) * app_units_per_px) / app_units_per_px;
-    return plain_advance + tracking;
+    constexpr int64_t app_units_per_px = 60;
+    // Windows rounds twice. SetGlyphsFromRun turns the plain 16.16 advance
+    // into whole app units, and ApplyTrackingToClusters then adds NS_round of
+    // the offset in app units. The offset goes in here as its nearest 16.16
+    // fraction, which keeps the advance kerning sums against intact, then is
+    // nudged by single 16.16 steps until the app-unit conversion lands on the
+    // sum Windows reaches. A plain advance on an exact half app unit rounds
+    // down without the nudge, where Windows rounds it up before the tracking.
+    const int64_t base = llround(plain_advance * 65536.0);
+    const int64_t base_app_units = (base * app_units_per_px + 0x8000) >> 16;
+    if (base_app_units <= 0) {
+        return plain_advance;
+    }
+    const int64_t tracking = NSlround(
+        WinSyntheticBoldOffset(inst.adjusted_size) * static_cast<double>(app_units_per_px));
+    const int64_t want = base_app_units + tracking;
+    int64_t emitted = base + llround(
+        static_cast<double>(tracking) * 65536.0 / static_cast<double>(app_units_per_px));
+    while (((emitted * app_units_per_px + 0x8000) >> 16) < want) {
+        ++emitted;
+    }
+    while (((emitted * app_units_per_px + 0x8000) >> 16) > want) {
+        --emitted;
+    }
+    return static_cast<double>(emitted) / 65536.0;
 }
 
 // The same advance for a face DirectWrite is simulating bold on. The simulation
@@ -5051,6 +5293,16 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
         return false;
     }
     // `fontEmSize: size` with size = font.size.to_f64_px() * y_scale as f32.
+    // y_scale is visible only once the shape is in hand, so a transformed
+    // face has its em recovered here instead of from the 26.6 char size. This
+    // applies to WebRender's own rasterizer alone. A blob glyph comes through
+    // Skia, whose shape is SkScalerContextRec's and never sat on WebRender's
+    // 1024th grid.
+#if CLEARTYPE_FIREFOX_PARITY
+    if (dwcft::ParityActive() && CallerForFace(face) == RasterCaller::WebRender) {
+        ApplyTransformedEmSize(face, &em_size_d);
+    }
+#endif
     const float em_size = static_cast<float>(em_size_d);
 
     const Factories factories = GetFactories();
@@ -5695,6 +5947,7 @@ void FT_Set_Transform(FT_Face face, FT_Matrix* matrix, FT_Vector* delta)
             constexpr FT_Matrix identity = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
             entry->transform_matrix = identity;
         }
+        entry->transform_delta = delta != nullptr ? *delta : FT_Vector{ .x = 0, .y = 0 };
     }
     pthread_mutex_unlock(&g_faces_mutex);
 }
@@ -5709,7 +5962,25 @@ void FT_Outline_Translate(const FT_Outline* outline, const FT_Pos xOffset, const
         return;
     }
     real(outline, xOffset, yOffset);
-    if (outline != nullptr && (xOffset != 0 || yOffset != 0) && !ForeignToCaller(outline)) {
+    // A translate FreeType makes on the slot outline while loading it is
+    // FreeType's own work and has nothing to do with the caller's subpixel
+    // phase. It moves the outline to suit the bitmap about to be built, such
+    // as the hinted left phantom point or the light autohinter's grid fit,
+    // and DirectWrite grid-fits its own outline, so carrying it across shifts
+    // the glyph twice. The one in-load translate that does belong to the
+    // caller is FT_Set_Transform's delta, which FT_Load_Glyph puts back from
+    // the face entry.
+    //
+    // Firefox parity only, so the Chromium hosts keep the translate they
+    // have.
+#if CLEARTYPE_FIREFOX_PARITY
+    const bool freetypes_own =
+        dwcft::ParityActive() && g_in_real_freetype > 0 && outline == g_loading_outline;
+#else
+    constexpr bool freetypes_own = false;
+#endif
+    if (outline != nullptr && (xOffset != 0 || yOffset != 0) && !freetypes_own &&
+        !ForeignToCaller(outline)) {
         RecordShift(outline, xOffset, yOffset);
     }
 }
@@ -5950,6 +6221,11 @@ FT_Error FT_Load_Glyph(FT_Face face, const FT_UInt glyph_index, const FT_Int32 l
     if (error == 0) {
         if (face != nullptr && face->glyph != nullptr) {
             SetPendingOutlineFace(&face->glyph->outline, face);
+#if CLEARTYPE_FIREFOX_PARITY
+            if (dwcft::ParityActive()) {
+                RecordTransformDelta(face);
+            }
+#endif
         }
         RecordOutlineOwner(face, glyph_index);
         ApplyWindowsAdvance(face);
@@ -5975,6 +6251,11 @@ FT_Error FT_Load_Char(FT_Face face, const FT_ULong char_code, const FT_Int32 loa
     if (error == 0 && g_load_applied == applied_before && face != nullptr &&
         face->glyph != nullptr) {
         SetPendingOutlineFace(&face->glyph->outline, face);
+#if CLEARTYPE_FIREFOX_PARITY
+        if (dwcft::ParityActive()) {
+            RecordTransformDelta(face);
+        }
+#endif
         RecordOutlineOwner(face, face->glyph->glyph_index);
         ApplyWindowsAdvance(face);
     }
@@ -6627,6 +6908,418 @@ static FT_Error SkiaScanlineBitmap(ft_outline_get_bitmap_fn real, FT_Library lib
     return err;
 }
 #endif
+
+#if CLEARTYPE_FIREFOX_PARITY
+
+// ---------------------------------------------------------------------------
+// The glyph outline Skia builds a path from.
+//
+// gfx/skia/skia/src/ports/SkFontHost_FreeType.cpp
+// SkScalerContext_FreeType::generatePath walks the loaded outline with
+// FT_Outline_Decompose and SkFTGeometrySink's callbacks. On Windows the same
+// path comes from SkScalerContext_win_dw walking DirectWrite's outline. A
+// stroked glyph, a COLR layer under a gradient and text past the size Skia
+// keeps in an atlas are all drawn from that path, so wherever the two walks
+// disagree those pixels do too.
+//
+// The curves themselves agree. GetGlyphRunOutline elevates the font's
+// quadratics to cubics and
+// SkDWriteGeometrySink::AddBeziers puts them back with check_quadratic, so
+// Windows builds the path from the same quadratics FreeType holds. What is
+// left is the coordinates. FT_Outline_Funcs carries FT_Vector, so a callback
+// receives 26.6 whatever the outline holds, and SkFTGeometrySink divides by
+// 64. That caps this route at 1/64 px, which is why the exact coordinate is
+// recorded here and written into the finished path afterwards; see the
+// generatePath thunk in libxul_patch.cpp.
+// ---------------------------------------------------------------------------
+
+// ID2D1SimplifiedGeometrySink, reconstructed. dwrite.h forward-declares it and
+// defines IDWriteGeometrySink as an alias, and no header here completes it.
+typedef enum D2D1_FILL_MODE
+{
+    D2D1_FILL_MODE_ALTERNATE = 0,
+    D2D1_FILL_MODE_WINDING = 1,
+} D2D1_FILL_MODE;
+
+typedef enum D2D1_PATH_SEGMENT
+{
+    D2D1_PATH_SEGMENT_NONE = 0,
+} D2D1_PATH_SEGMENT;
+
+typedef enum D2D1_FIGURE_BEGIN
+{
+    D2D1_FIGURE_BEGIN_FILLED = 0,
+    D2D1_FIGURE_BEGIN_HOLLOW = 1,
+} D2D1_FIGURE_BEGIN;
+
+typedef enum D2D1_FIGURE_END
+{
+    D2D1_FIGURE_END_OPEN = 0,
+    D2D1_FIGURE_END_CLOSED = 1,
+} D2D1_FIGURE_END;
+
+typedef struct D2D1_BEZIER_SEGMENT
+{
+    D2D1_POINT_2F point1;
+    D2D1_POINT_2F point2;
+    D2D1_POINT_2F point3;
+} D2D1_BEZIER_SEGMENT;
+
+interface ID2D1SimplifiedGeometrySink : IUnknown
+{
+    STDMETHOD_(void, SetFillMode)(D2D1_FILL_MODE fillMode) PURE;
+    STDMETHOD_(void, SetSegmentFlags)(D2D1_PATH_SEGMENT vertexFlags) PURE;
+    STDMETHOD_(void, BeginFigure)(D2D1_POINT_2F startPoint, D2D1_FIGURE_BEGIN figureBegin) PURE;
+    STDMETHOD_(void, AddLines)(const D2D1_POINT_2F* points, UINT32 pointsCount) PURE;
+    STDMETHOD_(void, AddBeziers)(const D2D1_BEZIER_SEGMENT* beziers, UINT32 beziersCount) PURE;
+    STDMETHOD_(void, EndFigure)(D2D1_FIGURE_END figureEnd) PURE;
+    STDMETHOD(Close)() PURE;
+};
+
+// Armed for the length of one generatePath, by the thunk over it.
+thread_local bool g_in_glyph_path = false;
+thread_local std::vector<CleartypeGlyphPathPoint> g_glyph_path;
+// Cleared as soon as anything about the walk stops being reproducible, so the
+// finished path is left alone instead of half corrected.
+thread_local bool g_glyph_path_usable = false;
+
+// Replays a glyph outline from GetGlyphRunOutline into an FT_Outline_Funcs
+// caller, and records the points the caller's own sink will keep.
+//
+// SkFTGeometrySink drops a segment whose every point is where the pen already
+// is, and emits the moveTo of a contour lazily, at the first segment that
+// survives that test. Both decisions are made on the values this passes, so
+// replaying them here gives the sequence the finished path holds, which is
+// what lets the repair find it.
+class DecomposeSink final : public IDWriteGeometrySink
+{
+public:
+    DecomposeSink(const FT_Outline_Funcs* funcs, void* user, const float x_over_y = 1.0f)
+        : funcs_(funcs), user_(user), x_over_y_(x_over_y) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override
+    {
+        *out = this;
+        AddRef();
+        return S_OK;
+    }
+    // Stack-allocated for the length of one call, so the count is a formality.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    void STDMETHODCALLTYPE SetFillMode(D2D1_FILL_MODE) override {}
+    void STDMETHODCALLTYPE SetSegmentFlags(D2D1_PATH_SEGMENT) override {}
+
+    void STDMETHODCALLTYPE BeginFigure(D2D1_POINT_2F start, D2D1_FIGURE_BEGIN) override
+    {
+        if (error_ != 0 || funcs_->move_to == nullptr) {
+            return;
+        }
+        started_ = false;
+        cur_ = Point(start);
+        cur_exact_ = start;
+        error_ = funcs_->move_to(&cur_, user_);
+    }
+
+    void STDMETHODCALLTYPE AddLines(const D2D1_POINT_2F* points, const UINT32 count) override
+    {
+        if (funcs_->line_to == nullptr) {
+            error_ = FT_Err_Invalid_Argument;
+        }
+        for (UINT32 i = 0; error_ == 0 && i < count; ++i) {
+            if (!Differs(points[i])) {
+                continue;                    // SkDWriteGeometrySink::AddLines drops it
+            }
+            FT_Vector to = Point(points[i]);
+            Separate(&to);
+            OpenContour();
+            Record(to, points[i]);
+            cur_ = to;
+            cur_exact_ = points[i];
+            error_ = funcs_->line_to(&to, user_);
+        }
+    }
+
+    // SkDWriteGeometrySink::AddBeziers, which is the walk Windows builds this
+    // path with. A cubic that is an elevated quadratic goes to the builder as
+    // the quadratic it came from, so the verbs are the font's own either way.
+    void STDMETHODCALLTYPE AddBeziers(const D2D1_BEZIER_SEGMENT* segments, const UINT32 count) override
+    {
+        if (funcs_->cubic_to == nullptr || funcs_->conic_to == nullptr) {
+            error_ = FT_Err_Invalid_Argument;
+        }
+        for (UINT32 i = 0; error_ == 0 && i < count; ++i) {
+            const D2D1_BEZIER_SEGMENT& seg = segments[i];
+            if (!Differs(seg.point1) && !Differs(seg.point2) && !Differs(seg.point3)) {
+                continue;
+            }
+            D2D1_POINT_2F control{};
+            const bool quadratic = CheckQuadratic(seg, &control);
+            OpenContour();
+            FT_Vector to = Point(seg.point3);
+            if (quadratic) {
+                FT_Vector c = Point(control);
+                Separate(&c, &to);
+                    Record(c, control);
+                Record(to, seg.point3);
+                error_ = funcs_->conic_to(&c, &to, user_);
+            } else {
+                FT_Vector c1 = Point(seg.point1);
+                FT_Vector c2 = Point(seg.point2);
+                Separate(&c1, &c2, &to);
+                    Record(c1, seg.point1);
+                Record(c2, seg.point2);
+                Record(to, seg.point3);
+                error_ = funcs_->cubic_to(&c1, &c2, &to, user_);
+            }
+            cur_ = to;
+            cur_exact_ = seg.point3;
+        }
+    }
+
+    void STDMETHODCALLTYPE EndFigure(D2D1_FIGURE_END) override {}
+    HRESULT STDMETHODCALLTYPE Close() override { return S_OK; }
+
+    int error() const { return error_; }
+
+private:
+    // ftoutln.c walks the outline as SCALED(x) = (x << shift) - delta. Only
+    // the zero case is answered for, which is what SkFTGeometrySink asks for,
+    // so the recorded values are the caller's own.
+    FT_Vector Point(const D2D1_POINT_2F p) const
+    {
+        const double x = static_cast<double>(p.x) * static_cast<double>(x_over_y_);
+        return FT_Vector{ .x = static_cast<FT_Pos>(llround(x * 64.0)),
+                          .y = static_cast<FT_Pos>(llround(static_cast<double>(-p.y) * 64.0)) };
+    }
+
+    static bool Same(const FT_Vector& a, const FT_Vector& b) { return a.x == b.x && a.y == b.y; }
+
+    // SkDWriteGeometrySink::currentIsNot, which compares DirectWrite's own
+    // coordinates, unrounded.
+    bool Differs(const D2D1_POINT_2F& p) const
+    {
+        return p.x != cur_exact_.x || p.y != cur_exact_.y;
+    }
+
+    // src/utils/SkFloatUtils.h SkFloatingPoint<float, 10>::AlmostEquals, the
+    // comparison check_quadratic reduces with.
+    static bool ApproximatelyEqual(const float a, const float b)
+    {
+        if (std::isnan(a) || std::isnan(b)) {
+            return false;
+        }
+        uint32_t left = 0, right = 0;
+        std::memcpy(&left, &a, sizeof(left));
+        std::memcpy(&right, &b, sizeof(right));
+        auto biased = [](const uint32_t sam) {
+            constexpr uint32_t sign_bit = 1u << 31;
+            return (sam & sign_bit) != 0 ? ~sam + 1 : sign_bit | sam;
+        };
+        const uint32_t x = biased(left), y = biased(right);
+        return (x >= y ? x - y : y - x) <= 10;
+    }
+
+    // SkDWriteGeometrySink.cpp check_quadratic. A cubic whose control points
+    // sit two thirds of the way to one point is that quadratic elevated, and
+    // the point is where both thirds meet.
+    bool CheckQuadratic(const D2D1_BEZIER_SEGMENT& seg, D2D1_POINT_2F* control) const
+    {
+        const float dx10 = seg.point1.x - cur_exact_.x;
+        const float dx23 = seg.point2.x - seg.point3.x;
+        const float mid_x = cur_exact_.x + dx10 * 3 / 2;
+        if (!ApproximatelyEqual(mid_x, dx23 * 3 / 2 + seg.point3.x)) {
+            return false;
+        }
+        const float dy10 = seg.point1.y - cur_exact_.y;
+        const float dy23 = seg.point2.y - seg.point3.y;
+        const float mid_y = cur_exact_.y + dy10 * 3 / 2;
+        if (!ApproximatelyEqual(mid_y, dy23 * 3 / 2 + seg.point3.y)) {
+            return false;
+        }
+        control->x = mid_x;
+        control->y = mid_y;
+        return true;
+    }
+
+    // Windows decides what to keep from the exact coordinates and this walk
+    // from the rounded ones, so a segment Windows keeps can collapse onto the
+    // pen here and be dropped, leaving the two platforms different verbs. A
+    // segment in that position is moved off the pen by one 64th, which the
+    // exact coordinate written into the finished path takes back out.
+    void Separate(FT_Vector* a, FT_Vector* b = nullptr, FT_Vector* c = nullptr) const
+    {
+        if (!Same(*a, cur_) || (b != nullptr && !Same(*b, cur_)) ||
+            (c != nullptr && !Same(*c, cur_))) {
+            return;
+        }
+        FT_Vector* last = c != nullptr ? c : (b != nullptr ? b : a);
+        last->x += 1;
+    }
+
+    // The moveTo SkFTGeometrySink::goingTo emits at the first surviving
+    // segment, carrying the point the pen was already at.
+    void OpenContour()
+    {
+        if (started_) {
+            return;
+        }
+        started_ = true;
+        Record(cur_, cur_exact_);
+    }
+
+    // 1/64 is a power of two, so float(x) / 64 is exact and the recorded
+    // match is bit for bit what SkFDot6ToScalar produces. The sink negates y
+    // on its way in, which undoes the negation Point applied.
+    //
+    // x_over_y_ is the horizontal squeeze, applied to the exact coordinate
+    // alone. SkScalerContext_DW::generatePath builds the path from the
+    // untransformed outline and calls builder.transform(fSkXform) on the
+    // finished path, so the squeeze reaches the points and nothing else, and
+    // every decision above it was already made on the same floats Windows
+    // decided on.
+    void Record(const FT_Vector& quantized, const D2D1_POINT_2F& exact)
+    {
+        if (!g_glyph_path_usable) {
+            return;
+        }
+        if (g_glyph_path.size() >= kMaxGlyphPathPoints) {
+            g_glyph_path_usable = false;
+            return;
+        }
+        g_glyph_path.push_back(CleartypeGlyphPathPoint{
+            .match_x = static_cast<float>(quantized.x) * 0.015625f,
+            .match_y = -(static_cast<float>(quantized.y) * 0.015625f),
+            .exact_x = exact.x * x_over_y_,
+            .exact_y = exact.y });
+    }
+
+    static constexpr size_t kMaxGlyphPathPoints = 1u << 16;
+
+    const FT_Outline_Funcs* funcs_;
+    void* user_;
+    float x_over_y_ = 1.0f;
+    int error_ = 0;
+    bool started_ = false;
+    FT_Vector cur_ = { .x = 0, .y = 0 };
+    D2D1_POINT_2F cur_exact_ = { .x = 0.0f, .y = 0.0f };
+};
+
+// Emits `glyph_index`'s outline through `funcs` from DirectWrite instead of
+// from the FreeType outline. False when this face cannot answer, in which case
+// the caller falls through to the real walk; true with *cb_error carrying
+// whatever a callback returned, which is what FT_Outline_Decompose returns.
+bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
+                            const FT_Outline_Funcs* funcs, void* user, int* cb_error)
+{
+    // A pixel aspect other than 1 is a horizontal squeeze and is kept. Skia's
+    // FreeType port splits the device matrix with PreMatrixScale::kFull, so
+    // the squeeze arrives as an anisotropic char size, while
+    // SkScalerContext_DW splits it with kVertical and hands the ratio to
+    // builder.transform. Windows draws DirectWrite's outline at the vertical
+    // em and squeezes the finished path, which is what the sink reproduces.
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (!GetEmSize(face, &em_size, &x_over_y) || !(em_size > 0.0) || !(x_over_y > 0.0f)) {
+        return false;
+    }
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    if (entry == nullptr || !entry->transform_identity) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return false;
+    }
+    const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
+    if (inst == nullptr || !inst->valid || inst->dwrite_face == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return false;
+    }
+    IDWriteFontFace* dwrite_face = inst->dwrite_face;
+    const HoldFace hold(dwrite_face);
+    pthread_mutex_unlock(&g_faces_mutex);
+
+    const auto gid = static_cast<UINT16>(glyph_index);
+    DecomposeSink sink(funcs, user, SnappedPixelAspect(face));
+    const HRESULT hr = dwrite_face->GetGlyphRunOutline(
+        static_cast<FLOAT>(em_size), &gid, nullptr, nullptr, 1, FALSE, FALSE, &sink);
+    if (FAILED(hr)) {
+        return false;
+    }
+    *cb_error = sink.error();
+    return true;
+}
+
+#endif  // CLEARTYPE_FIREFOX_PARITY
+
+// The outline-to-path walk, answered from DirectWrite while the thunk over
+// SkScalerContext_FreeType::generatePath has this thread armed. An outline
+// carrying a pending shift, matrix or simulation is left to the real walk, as
+// is any outline this library cannot name a glyph for.
+extern "C" __attribute__((visibility("default")))
+FT_Error FT_Outline_Decompose(FT_Outline* outline, const FT_Outline_Funcs* func_interface, void* user)
+{
+    ft_outline_decompose_fn real = real_FT_Outline_Decompose();
+    if (real == nullptr) {
+        return FT_Err_Invalid_Library_Handle;
+    }
+#if CLEARTYPE_FIREFOX_PARITY
+    if (g_in_glyph_path && dwcft::ParityActive() && InterposerWanted() && outline != nullptr &&
+        func_interface != nullptr && func_interface->shift == 0 && func_interface->delta == 0) {
+        FT_Face face = nullptr;
+        FT_UInt glyph_index = 0;
+        if (FindOutlineOwner(outline, &face, &glyph_index) && face != nullptr &&
+            face->glyph != nullptr && &face->glyph->outline == outline &&
+            face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+            const PendingOutline pending = PeekOutlineState(outline);
+            if (pending.dx == 0 && pending.dy == 0 && !pending.has_matrix &&
+                pending.simulations == DWRITE_FONT_SIMULATIONS_NONE && !pending.unrepresentable) {
+                int cb_error = 0;
+                if (DecomposeThroughDWrite(face, glyph_index, func_interface, user, &cb_error)) {
+                    return cb_error;
+                }
+            }
+        }
+        // Only one walk per armed generatePath can be answered for; a second
+        // one, or one this declined, means the path is not the one recorded.
+        g_glyph_path_usable = false;
+    }
+#endif
+    return real(outline, func_interface, user);
+}
+
+extern "C" int CleartypeOnBlobRaster(void)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    return OnBlobRasterThread() ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+extern "C" void CleartypeBeginGlyphPath(void)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    g_glyph_path.clear();
+    g_glyph_path_usable = true;
+    g_in_glyph_path = true;
+#endif
+}
+
+extern "C" unsigned CleartypeEndGlyphPath(const CleartypeGlyphPathPoint** points)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    g_in_glyph_path = false;
+    if (!g_glyph_path_usable || g_glyph_path.empty()) {
+        return 0;
+    }
+    *points = g_glyph_path.data();
+    return static_cast<unsigned>(g_glyph_path.size());
+#else
+    (void)points;
+    return 0;
+#endif
+}
 
 FT_Error FT_Outline_Get_Bitmap(FT_Library library, FT_Outline* outline, const FT_Bitmap* abitmap)
 {

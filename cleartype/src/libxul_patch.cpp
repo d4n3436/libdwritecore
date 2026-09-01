@@ -1080,8 +1080,13 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
     static std::atomic known{kMetricsNotFound};
     const size_t cached = known.load(std::memory_order_relaxed);
     if (cached != kMetricsNotFound) {
+        // Read directly, since the offset was verified on this build's
+        // layout and these bytes are inside the object the caller holds.
+        // ReadWithoutFaulting's content-process fallback would refuse a read
+        // that crosses the page boundary even though the object spans it.
         double one[kMetricsFields];
-        if (ReadWithoutFaulting(base + cached, one, sizeof(one)) && matches(one)) {
+        std::memcpy(one, base + cached, sizeof(one));
+        if (matches(one)) {
             return reinterpret_cast<double*>(base + cached);
         }
     }
@@ -1983,6 +1988,423 @@ bool PatchUnderline(const Image& image, const FunctionStarts& starts)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// The glyph path.
+//
+// SkScalerContext_FreeType::generatePath builds the SkPath that everything
+// drawn from an outline goes through: a stroked glyph, a COLR layer under a
+// gradient, text past the size Skia keeps in its atlas. Windows builds the
+// same path from DirectWrite's outline, so replacing this walk is what puts
+// the two platforms on one set of curves; see FT_Outline_Decompose in
+// freetype.cpp for the substitution itself and for why the coordinates cannot
+// come through it.
+//
+// Nothing here names the function. It is found by shape, as the one virtual
+// function that walks an outline, sits in a vtable beside two others that
+// load a glyph the same way, and touches nothing a rasterizer would.
+// ---------------------------------------------------------------------------
+
+// std::optional<GeneratedPath> generatePath(const SkGlyph&) returns a type
+// with a destructor, so it comes back through a hidden pointer.
+using GeneratePathFn = void* (*)(void* sret, void* self, const void* glyph);
+GeneratePathFn g_generate_path = nullptr;
+
+// A handful either way, since the vtable holds one walker and only a few
+// functions share a loader.
+constexpr unsigned kMaxGlyphFns = 12;
+
+struct DirectCallers
+{
+    uintptr_t target = 0;
+    uintptr_t callers[kMaxGlyphFns] = {};
+    unsigned count = 0;
+    bool overflowed = false;
+};
+
+// Every function making a direct call to any of `n` targets, in one pass over
+// the text. Separate passes would each walk the whole section again.
+void CollectDirectCallers(const Image& image, const FunctionStarts& starts,
+                          DirectCallers* set, const unsigned n)
+{
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        for (const unsigned char* p = r.begin; p + 5 <= r.end; ++p) {
+            if (p[0] != 0xE8) {
+                continue;
+            }
+            int32_t disp;
+            std::memcpy(&disp, p + 1, sizeof(disp));
+            const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+            const uintptr_t to = at + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(disp));
+            for (unsigned k = 0; k < n; ++k) {
+                if (set[k].target != to) {
+                    continue;
+                }
+                const uintptr_t owner = starts.Enclosing(at);
+                if (owner == 0) {
+                    break;
+                }
+                bool seen = false;
+                for (unsigned j = 0; j < set[k].count; ++j) {
+                    seen = seen || set[k].callers[j] == owner;
+                }
+                if (!seen) {
+                    if (set[k].count == kMaxGlyphFns) {
+                        set[k].overflowed = true;
+                    } else {
+                        set[k].callers[set[k].count++] = owner;
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+bool Holds(const uintptr_t* list, const unsigned count, const uintptr_t value)
+{
+    for (unsigned i = 0; i < count; ++i) {
+        if (list[i] == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool InText(const Image& image, const uintptr_t addr)
+{
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        if (addr >= reinterpret_cast<uintptr_t>(image.text[i].begin) &&
+            addr < reinterpret_cast<uintptr_t>(image.text[i].end)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// SkScalerContext declares seven virtual functions, and the two slots before
+// generatePath hold generateImage and generateMetrics. All three load a glyph
+// through the same helper. So the shape to look for is a walker in a vtable
+// whose two preceding slots share its loader.
+uintptr_t FindGeneratePath(const Image& image, const FunctionStarts& starts, void*** out_slot)
+{
+    void** const decompose = GotSlot(image, "FT_Outline_Decompose");
+    void** const load = GotSlot(image, "FT_Load_Glyph");
+    if (decompose == nullptr || load == nullptr) {
+        Report("libxul: no outline walk or glyph load to find generatePath by");
+        return 0;
+    }
+
+    uintptr_t walkers[kMaxGlyphFns];
+    uintptr_t loaders[kMaxGlyphFns];
+    unsigned n_walkers = 0, n_loaders = 0;
+    if (!FunctionsCalling(image, starts, decompose, walkers, &n_walkers, kMaxGlyphFns) ||
+        !FunctionsCalling(image, starts, load, loaders, &n_loaders, kMaxGlyphFns)) {
+        Report("libxul: more functions walk an outline or load a glyph than can be "
+               "accounted for, so generatePath cannot be identified");
+        return 0;
+    }
+
+    // Callers that disqualify a candidate. A rasterizer walks an outline too,
+    // so a function reached from one is not the path walker.
+    uintptr_t rasterizers[kMaxGlyphFns * 2];
+    unsigned n_rasterizers = 0;
+    static const char* const kRasterEntries[] = { "FT_Render_Glyph", "FT_Outline_Get_Bitmap" };
+    for (const char* const name : kRasterEntries) {
+        void** const slot = GotSlot(image, name);
+        uintptr_t found[kMaxGlyphFns];
+        unsigned n = 0;
+        if (slot == nullptr || !FunctionsCalling(image, starts, slot, found, &n, kMaxGlyphFns)) {
+            continue;
+        }
+        for (unsigned i = 0; i < n && n_rasterizers < kMaxGlyphFns * 2; ++i) {
+            rasterizers[n_rasterizers++] = found[i];
+        }
+    }
+
+    DirectCallers set[kMaxGlyphFns * 2];
+    unsigned n_set = 0;
+    for (unsigned i = 0; i < n_walkers; ++i) {
+        set[n_set++].target = walkers[i];
+    }
+    for (unsigned i = 0; i < n_loaders; ++i) {
+        set[n_set++].target = loaders[i];
+    }
+    CollectDirectCallers(image, starts, set, n_set);
+
+    uintptr_t found = 0;
+    void** found_slot = nullptr;
+    for (unsigned w = 0; w < n_walkers; ++w) {
+        const DirectCallers& walker = set[w];
+        for (unsigned c = 0; c < walker.count; ++c) {
+            const uintptr_t candidate = walker.callers[c];
+            if (Holds(rasterizers, n_rasterizers, candidate)) {
+                continue;                    // that one is generateImage
+            }
+            for (unsigned l = 0; l < n_loaders; ++l) {
+                const DirectCallers& loader = set[n_walkers + l];
+                if (loader.overflowed || !Holds(loader.callers, loader.count, candidate)) {
+                    continue;
+                }
+                void** const slot = FindVtableSlot(image, candidate);
+                if (slot == nullptr ||
+                    reinterpret_cast<const unsigned char*>(slot - 2) < image.relro.begin) {
+                    continue;
+                }
+                const auto image_fn = reinterpret_cast<uintptr_t>(slot[-1]);
+                const auto metrics_fn = reinterpret_cast<uintptr_t>(slot[-2]);
+                if (!InText(image, image_fn) || !InText(image, metrics_fn) ||
+                    !Holds(loader.callers, loader.count, image_fn) ||
+                    !Holds(loader.callers, loader.count, metrics_fn)) {
+                    continue;
+                }
+                if (found != 0 && found != candidate) {
+                    Report("libxul: more than one outline walk sits in a vtable beside two "
+                           "glyph loads; leaving generatePath alone");
+                    return 0;
+                }
+                found = candidate;
+                found_slot = slot;
+            }
+        }
+    }
+    if (found == 0) {
+        Report("libxul: no outline walk has the shape generatePath has");
+        return 0;
+    }
+    *out_slot = found_slot;
+    return found;
+}
+
+// The walk predicts these values exactly, so floats are compared here by bit
+// pattern.
+bool SameBits(const float a, const float b)
+{
+    uint32_t left = 0, right = 0;
+    std::memcpy(&left, &a, sizeof(left));
+    std::memcpy(&right, &b, sizeof(right));
+    return left == right;
+}
+
+// How far into SkPathData the point span can sit. The object is a refcount, a
+// listener list and four spans, so this reaches well past it.
+constexpr size_t kPathDataSearchBytes = 256;
+
+// Puts the unquantized coordinates into the finished path.
+//
+// Nothing here knows SkPathData's layout. The span is found by its contents.
+// The walk recorded what every point would read as once SkFDot6ToScalar had
+// divided it by 64, and 1/64 is a power of two, so those floats are bit for
+// bit what the builder stored. A run of them as long as the walk, reached
+// through a pointer and a count sitting side by side, is the point array.
+void RepairGlyphPath(void* sret, const CleartypeGlyphPathPoint* points, const unsigned count)
+{
+    void* data = nullptr;
+    if (!ReadWithoutFaulting(sret, &data, sizeof(data)) || data == nullptr ||
+        (reinterpret_cast<uintptr_t>(data) & 7u) != 0) {
+        return;
+    }
+
+    unsigned char window[kPathDataSearchBytes];
+    size_t have = kPathDataSearchBytes;
+    while (have >= 2 * sizeof(void*) && !ReadWithoutFaulting(data, window, have)) {
+        have /= 2;
+    }
+    if (have < 2 * sizeof(void*)) {
+        return;
+    }
+
+    float* stored = nullptr;
+    for (size_t at = 0; at + 2 * sizeof(void*) <= have; at += sizeof(void*)) {
+        void* ptr = nullptr;
+        size_t size = 0;
+        std::memcpy(&ptr, window + at, sizeof(ptr));
+        std::memcpy(&size, window + at + sizeof(void*), sizeof(size));
+        if (size != count || ptr == nullptr ||
+            (reinterpret_cast<uintptr_t>(ptr) & 3u) != 0) {
+            continue;
+        }
+        // Two floats a point, and every one of them has to be the value the
+        // walk predicted. A run this long agreeing exactly is the array.
+        auto* candidate = static_cast<float*>(ptr);
+        float seen[2];
+        bool matches = true;
+        for (size_t i = 0; matches && i < count; ++i) {
+            if (!ReadWithoutFaulting(candidate + 2 * i, seen, sizeof(seen))) {
+                matches = false;
+                break;
+            }
+            matches = SameBits(seen[0], points[i].match_x) &&
+                      SameBits(seen[1], points[i].match_y);
+        }
+        if (!matches) {
+            continue;
+        }
+        if (stored != nullptr) {
+            return;                    // two arrays read alike; write neither
+        }
+        stored = candidate;
+    }
+    if (stored == nullptr) {
+        return;
+    }
+
+    float left = points[0].exact_x, right = points[0].exact_x;
+    float top = points[0].exact_y, bottom = points[0].exact_y;
+    for (size_t i = 0; i < count; ++i) {
+        stored[2 * i] = points[i].exact_x;
+        stored[2 * i + 1] = points[i].exact_y;
+        left = std::fmin(left, points[i].exact_x);
+        right = std::fmax(right, points[i].exact_x);
+        top = std::fmin(top, points[i].exact_y);
+        bottom = std::fmax(bottom, points[i].exact_y);
+    }
+
+    // The bounds cached beside the points were computed from the quantized
+    // ones, so they are up to a 64th of a pixel out. They are found the same
+    // way the array was, as four floats reading as the box it used to make.
+    float was[4] = { points[0].match_x, points[0].match_y,
+                     points[0].match_x, points[0].match_y };
+    for (unsigned i = 0; i < count; ++i) {
+        was[0] = std::fmin(was[0], points[i].match_x);
+        was[1] = std::fmin(was[1], points[i].match_y);
+        was[2] = std::fmax(was[2], points[i].match_x);
+        was[3] = std::fmax(was[3], points[i].match_y);
+    }
+    // The box is matched by value. SkFTGeometrySink negates every y on its
+    // way to the builder, so a point on the baseline arrives as -0.0 and the
+    // box built here carries that sign, while the one Skia built may carry
+    // either. The two zeroes are the same number and compare equal.
+    const float now[4] = { left, top, right, bottom };
+    for (size_t at = 0; at + sizeof(was) <= have; at += sizeof(float)) {
+        float seen_box[4];
+        std::memcpy(seen_box, window + at, sizeof(seen_box));
+        if (seen_box[0] == was[0] && seen_box[1] == was[1] &&
+            seen_box[2] == was[2] && seen_box[3] == was[3]) {
+            std::memcpy(static_cast<unsigned char*>(data) + at, now, sizeof(now));
+            return;
+        }
+    }
+}
+
+// GlyphMetrics generateMetrics(const SkGlyph&, SkArenaAlloc*), the vtable slot
+// two before generatePath. Same shape as the walk, with a type that has a
+// destructor coming back through a hidden pointer.
+using GenerateMetricsFn = void* (*)(void* sret, void* self, const void* glyph, void* alloc);
+GenerateMetricsFn g_generate_metrics = nullptr;
+
+// Asks Skia to draw this scaler's glyphs from their outlines.
+//
+// SkScalerContext_DW::generateMetrics falls through to ScalerContextBits::PATH
+// whenever generateDWMetrics cannot get texture bounds, and its generateImage
+// then takes SkScalerContext::generateImageFromPath, so Windows draws the
+// glyph with Skia's own scan converter over DirectWrite's outline.
+// SkScalerContext_FreeType has no such fallback, and the route is not chosen
+// per glyph. SkScalerContext::internalGetImage reads fGenerateImageFromPath,
+// so setting that field puts this scaler on the same route.
+//
+// The field is found by its neighbors, a live typeface reference followed by
+// the two optional objects, which are null for text carrying neither a path
+// effect nor a mask filter. Applied on a blob rasterizer only.
+// SkScalerContext's layout, which the fields below check before anything is
+// written:
+//
+//     vtable                              0
+//     const SkScalerContextRec fRec;      8   56 bytes, ending at 63
+//     SkTypeface& fTypeface;             64
+//     sk_sp<SkPathEffect> fPathEffect;   72   null without a path effect
+//     sk_sp<SkMaskFilter> fMaskFilter;   80   null without a mask filter
+//     const bool fGenerateImageFromPath; 88
+//
+// fRec is a uint32 id, nine floats, two uint32 and eight bytes of small
+// fields, so the text size sits at 12 and says whether this is the object at
+// all.
+constexpr size_t kRecTextSizeAt = 12;
+constexpr size_t kTypefaceAt = 64;
+constexpr size_t kPathEffectAt = 72;
+constexpr size_t kMaskFilterAt = 80;
+constexpr size_t kImageFromPathAt = 88;
+constexpr size_t kScalerProbeBytes = 96;
+
+void DrawGlyphsFromPath(void* self)
+{
+    if (self == nullptr || CleartypeOnBlobRaster() == 0) {
+        return;
+    }
+    unsigned char probe[kScalerProbeBytes];
+    if (!ReadWithoutFaulting(self, probe, sizeof(probe))) {
+        return;
+    }
+    float text_size = 0.0f;
+    std::memcpy(&text_size, probe + kRecTextSizeAt, sizeof(text_size));
+    if (!std::isfinite(text_size) || text_size <= 0.0f || text_size > 4096.0f) {
+        return;
+    }
+    uintptr_t typeface = 0, effect = 1, filter = 1;
+    std::memcpy(&typeface, probe + kTypefaceAt, sizeof(typeface));
+    std::memcpy(&effect, probe + kPathEffectAt, sizeof(effect));
+    std::memcpy(&filter, probe + kMaskFilterAt, sizeof(filter));
+    if (typeface < 0x10000 || (typeface & 7u) != 0 || effect != 0 || filter != 0) {
+        return;                              // not the shape this expects
+    }
+    if (probe[kImageFromPathAt] != 0) {
+        return;                              // already set, or not a boolean
+    }
+    static_cast<unsigned char*>(self)[kImageFromPathAt] = 1;
+}
+
+extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, void* alloc);
+
+extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, void* alloc)
+{
+    DrawGlyphsFromPath(self);
+    return g_generate_metrics(sret, self, glyph, alloc);
+}
+
+extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph);
+
+extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph)
+{
+    CleartypeBeginGlyphPath();
+    void* const result = g_generate_path(sret, self, glyph);
+    const CleartypeGlyphPathPoint* points = nullptr;
+    const unsigned count = CleartypeEndGlyphPath(&points);
+    if (count != 0 && result != nullptr) {
+        RepairGlyphPath(sret, points, count);
+    }
+    return result;
+}
+
+bool PatchGlyphPath(const Image& image, const FunctionStarts& starts)
+{
+    void** slot = nullptr;
+    const uintptr_t found = FindGeneratePath(image, starts, &slot);
+    if (found == 0 || slot == nullptr) {
+        return false;
+    }
+    g_generate_path = reinterpret_cast<GeneratePathFn>(found);
+    if (!WriteSlot(slot, reinterpret_cast<void*>(&DwcGeneratePath))) {
+        g_generate_path = nullptr;
+        return false;
+    }
+    Report("libxul: generatePath %#lx now returns through this library "
+           "(vtable slot %p)", found, static_cast<void*>(slot));
+
+    // The walk is worth having on its own, so a metrics slot that will not
+    // take leaves it in place.
+    const auto metrics = reinterpret_cast<uintptr_t>(slot[-2]);
+    if (metrics != 0) {
+        g_generate_metrics = reinterpret_cast<GenerateMetricsFn>(metrics);
+        if (WriteSlot(slot - 2, reinterpret_cast<void*>(&DwcGenerateMetrics))) {
+            Report("libxul: generateMetrics %#lx now returns through this library",
+                   metrics);
+        } else {
+            g_generate_metrics = nullptr;
+        }
+    }
+    return true;
+}
+
 void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(Half) const phnum)
 {
     if (g_done.exchange(true)) {
@@ -2049,6 +2471,7 @@ void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(
     // Independent of the above, since one refusing says nothing about the
     // other.
     PatchUnderline(image, starts);
+    PatchGlyphPath(image, starts);
 }
 
 // What the callback brings back. dlpi_name points into the link map and stays
