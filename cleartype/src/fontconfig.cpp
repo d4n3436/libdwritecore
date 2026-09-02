@@ -180,8 +180,8 @@ bool IsOff(const char* v)
 
 // Whether this library answers these questions or passes them on.
 //
-// Answering is right for a parity build: the questions are about what
-// DirectWrite does on Windows, and the machine's own configuration is not the
+// Answering is right for a parity build. The questions are about what the
+// DirectWrite stack decides, and the host's own configuration is not the
 // subject. It is wrong outside one, because there they are the user's settings
 // - and "rgba" in particular is a statement about their panel.
 //

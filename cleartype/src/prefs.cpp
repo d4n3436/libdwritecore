@@ -5,8 +5,9 @@
 //  Firefox parity needs about 150 preferences that Firefox on Windows has and
 //  Firefox on Linux does not: the per-language font.name-list values, the
 //  monospace sizes, the chrome ui.font.* families, the two FreeType gamma
-//  settings that stand in for DirectWrite's, and the widget accent color, which
-//  Windows takes from Firefox and every other platform from the desktop.
+//  settings that stand in for DirectWrite's, the WebRender picture tile width,
+//  and the widget accent color, which Windows takes from Firefox and every
+//  other platform from the desktop.
 //
 //  MOZ_DEFAULT_PREFS carries them. Preferences::GetInstanceForService passes
 //  it to parsePrefData, which takes pref *data* and not a file name, so the

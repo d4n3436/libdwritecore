@@ -15,8 +15,12 @@ extern "C" {
 void CleartypeLogLine(const char* message);
 
 // Windows' underline geometry for the face last measured, or 0 when there is
-// none. em, ascent and descent come back as the values Firefox itself
-// computed, so the caller can locate the metrics struct by matching them.
+// none. Answers for every face. gfxDWriteFont::ComputeMetrics scales the post
+// table by mFUnitsConvFactor where gfxFT2FontBase::InitMetrics takes
+// FreeType's own scaled values, and only Windows lowers the underline of a
+// family on the bad-underline list. em, ascent and descent come back as the
+// values Firefox itself computed, so the caller can locate the metrics struct
+// by matching them.
 //
 // descent_fold is the half pixel ApplyWindowsMetrics moved from the ascent to
 // the descent, or zero. Adding it back to max_ascent and taking it off
@@ -27,6 +31,27 @@ void CleartypeLogLine(const char* message);
 int CleartypeWindowsUnderline(double* underline_offset, double* underline_size,
                               double* em_height, double* max_ascent,
                               double* max_descent, double* descent_fold);
+
+// Windows' strikeout geometry for the face last measured, or 0 when there is
+// none. Answers for every face. gfxFT2FontBase::InitMetrics ends its strikeout
+// block with SnapLineToPixels, which rounds the thickness to whole pixels and
+// moves the offset to keep the line centered, and gfxDWriteFont::ComputeMetrics
+// has no such step. em, ascent and descent come back the same way they do for
+// the underline, so the caller can locate the metrics struct by matching them.
+int CleartypeWindowsStrikeout(double* strikeout_offset, double* strikeout_size,
+                              double* em_height, double* max_ascent,
+                              double* max_descent);
+
+// The font-units-to-pixels factor for the face last measured, or 0 when there
+// is none. linux_factor is what gfxFT2FontBase::InitMetrics writes into
+// gfxFont::mFUnitsConvFactor, FreeType's 16.16 x_scale taken to a float, and
+// windows_factor is the mAdjustedSize / designUnitsPerEm that
+// gfxDWriteFont::ComputeMetrics writes there. FreeType's scale comes from a
+// size rounded to 1/64 px, so the two differ for any size that is not a
+// multiple of it. The first is exact enough to name the field.
+int CleartypeWindowsUnitsPerPixel(double* linux_factor, double* windows_factor,
+                                  double* em_height, double* max_ascent,
+                                  double* max_descent);
 
 // Windows' two leadings for the face last measured, or 0 when there is none.
 // Answers for every face, not only the bad-underline ones: InitMetrics derives
@@ -97,9 +122,10 @@ struct CleartypeGlyphPathPoint
 };
 
 // Brackets one SkScalerContext_FreeType::generatePath. Between them
-// FT_Outline_Decompose answers from DirectWrite's outline instead of
-// FreeType's, so the path is built out of the same curves Windows builds it
-// from, and every point handed to the builder is recorded.
+// FT_Outline_Decompose answers from the outline DirectWrite returns instead
+// of FreeType's, so the path is built out of the same curves
+// SkScalerContext_DW builds it from, and every point handed to the builder is
+// recorded.
 void CleartypeBeginGlyphPath(void);
 
 // Ends the bracket and hands back what was recorded, in the order the builder

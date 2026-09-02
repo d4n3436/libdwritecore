@@ -1029,6 +1029,11 @@ struct WinInstance
     bool bitmap_font;               // IsCJKFont() && HasBitmapStrikeForSize()
     bool bad_underline;             // gfxFontEntry::mIsBadUnderlineFont
     bool descent_fold;              // see ApplyWindowsMetrics
+    // FreeType's 16.16 x_scale while this size was the one set on the face,
+    // which is what gfxFT2FontBase::InitMetrics turns into mFUnitsConvFactor.
+    // Recorded here because the face carries one size at a time and the next
+    // font to ask for a different one overwrites it. Zero until seen.
+    FT_Fixed ft_x_scale;
     // mFontFace, held as a counted reference. The face cache below is
     // bounded and releases its oldest entry, while this cache is
     // bounded separately and larger, so an instance can outlive the cache
@@ -2033,8 +2038,9 @@ bool AxesSwapped(const DWRITE_MATRIX& m)
 }
 
 // FIREFOX PARITY. Recover the exact synthetic-oblique skew from the 16.16 one
-// FreeType was given. Firefox reaches DirectWrite with a float on Windows and
-// with a fixed-point matrix here, and the two are not the same number:
+// FreeType was given. Gecko's Windows code passes the skew through the
+// DirectWrite API as a float and reaches this shim as a fixed-point matrix,
+// and the two are not the same number:
 //
 //   webrender_api/src/font.rs   SyntheticItalics::to_skew()
 //       self.to_radians().tan()                  // f32, angle in 1/256 degree
@@ -3270,6 +3276,14 @@ bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_
     if (x_26_6 <= 0 || y_26_6 <= 0 || !(seed_px > 0.0)) {
         return false;
     }
+    // A synthetic oblique on its own leaves font.transform the identity, so
+    // compute_scale answers a pair of ones and the em is the size FreeType was
+    // asked for. The skew takes column two off the 1024th grid, and the search
+    // below then moves column one and names a size a fraction of a pixel from
+    // the one WebRender sent.
+    if (float oblique = 0.0f; ExactObliqueSkew(m, &oblique)) {
+        return false;
+    }
     // Column one of the shape, in FontTransform's terms. unix/font.rs negates
     // skew_y on its way into FT_Matrix, and the synthetic oblique only ever
     // adds a multiple of this column to the other one, so it arrives untouched
@@ -3411,13 +3425,28 @@ float SnappedPixelAspect(FT_Face face)
     return static_cast<float>(SnapPixelAspect(raw, x_26_6, y_26_6));
 }
 
+// head.flags bit 3, "force ppem to integer values for all internal scaler
+// math". Windows rasterizes a face that sets it at a whole number of pixels
+// per em and one that leaves it clear at the size it was asked for, so a
+// glyph at 12.5px is the 12.5px glyph for the second and the 13px glyph for
+// the first. The layout size is the fractional one either way.
+bool FaceForcesIntegerPpem(FT_Face face)
+{
+    const ft_get_sfnt_table_fn real = real_FT_Get_Sfnt_Table();
+    if (real == nullptr) {
+        return false;
+    }
+    const auto* head = static_cast<const TT_Header*>(real(face, FT_SFNT_HEAD));
+    return head != nullptr && (head->Flags & 0x0008) != 0;
+}
+
 // Replaces `em_size` with the one Windows rasterizes at when `face` carries a
-// shape. See ExactTransformedEmSize. Takes g_faces_mutex, so nothing already
-// holding it may call this.
-void ApplyTransformedEmSize(FT_Face face, double* em_size)
+// shape, and says whether it carried one. See ExactTransformedEmSize. Takes
+// g_faces_mutex, so nothing already holding it may call this.
+bool ApplyTransformedEmSize(FT_Face face, double* em_size)
 {
     if (face->size == nullptr || face->units_per_EM == 0) {
-        return;
+        return false;
     }
     FT_Matrix shape = {};
     bool transformed = false;
@@ -3428,7 +3457,7 @@ void ApplyTransformedEmSize(FT_Face face, double* em_size)
     }
     pthread_mutex_unlock(&g_faces_mutex);
     if (!transformed) {
-        return;
+        return false;
     }
     const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
     const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
@@ -3436,6 +3465,7 @@ void ApplyTransformedEmSize(FT_Face face, double* em_size)
     if (ExactTransformedEmSize(shape, x_26_6, y_26_6, *em_size, &recovered)) {
         *em_size = recovered.em_size;
     }
+    return true;
 }
 
 // FT_Set_Transform's delta, put back onto the glyph just loaded.
@@ -4246,6 +4276,9 @@ void ApplyWindowsMetrics(FT_Face face, const char* via)
     }
     const WinMetrics& m = inst->metrics;
     FT_Size_Metrics& sm = face->size->metrics;
+    // The size on the face is this instance's, so the scale is the one
+    // InitMetrics will read for it.
+    inst->ft_x_scale = sm.x_scale;
     FT_Pos ascender = static_cast<FT_Pos>(llround(m.maxAscent)) << 6;
     FT_Pos descender = static_cast<FT_Pos>(llround(m.maxDescent)) << 6;
 
@@ -4984,7 +5017,21 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
 {
     FT_Face face = g_pending_advance.face;
     g_pending_advance.face = nullptr;
-    if (face == nullptr || face->glyph == nullptr || face->size == nullptr ||
+    if (face == nullptr) {
+        return;
+    }
+    // Nothing below may dereference `face` until it is known to still be one
+    // of ours. The record belongs to this thread, and nothing clears it when
+    // FT_Done_Face destroys the face it names. The next FT_MulFix here can
+    // arrive much later and belong to another face, which
+    // gfxFT2FontBase::InitMetrics does through ScaleRoundDesignUnits on every
+    // thread that measures a font, so the fields read below would be freed
+    // memory. The face table is the authority on liveness, and FindFaceLocked
+    // compares pointers without following them.
+    pthread_mutex_lock(&g_faces_mutex);
+    const bool face_is_live = FindFaceLocked(face) != nullptr;
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (!face_is_live || face->glyph == nullptr || face->size == nullptr ||
         face->glyph->glyph_index != g_pending_advance.glyph_index ||
         a != static_cast<FT_Long>(face->units_per_EM) || b != face->size->metrics.y_scale) {
         return;
@@ -5264,6 +5311,14 @@ bool OnBlobRasterThread()
 // Slots rather than a map, since a process has one library per rasterizer and
 // this is read on every glyph. An unclaimed library leaves the answer to the
 // thread name, which is where it was before.
+//
+// A library is claimed only once a glyph has been drawn through it. Until then
+// a blob rasterized on one of WebRender's own workers answers WebRender, and
+// for a CJK face carrying an embedded strike at the size in use that draws the
+// strike where SkScalerContext_win_dw draws the outline, so the run comes out
+// bilevel where Windows antialiases it. A color glyph in the same text run is
+// what sends the run through a blob at all, so a plain CJK run is unaffected.
+// Each process claims its own libraries.
 constexpr int kSkiaLibrarySlots = 4;
 std::atomic<void*> g_skia_libraries[kSkiaLibrarySlots];
 
@@ -5683,7 +5738,15 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     // 1024th grid.
 #if CLEARTYPE_FIREFOX_PARITY
     if (dwcft::ParityActive() && CallerForFace(face) == RasterCaller::WebRender) {
-        ApplyTransformedEmSize(face, &em_size_d);
+        // See FaceForcesIntegerPpem. A shape folds its own scale into the em
+        // and Windows rasterizes that product as it stands, so only an em no
+        // shape touched is taken to whole pixels. Skia rasterizes at the size
+        // it was given whatever the face says, so this is WebRender's route
+        // alone either way.
+        const bool shaped = ApplyTransformedEmSize(face, &em_size_d);
+        if (!shaped && FaceForcesIntegerPpem(face)) {
+            em_size_d = std::floor(em_size_d + 0.5);
+        }
     }
 #endif
     const float em_size = static_cast<float>(em_size_d);
@@ -6772,12 +6835,15 @@ FT_Error FT_Set_Char_Size(FT_Face face, const FT_F26Dot6 char_width, const FT_F2
 // shaping uses, FT_Load_Sfnt_Table, still sees the real OS/2.
 
 // What Windows would have put in gfxFont::Metrics for that face, for the two
-// underline fields and the three that identify the struct. Answers only for a
-// family on Firefox's bad-underline list, which is the one case
-// gfxFT2FontBase cannot reach: it calls SanitizeMetrics with a literal false,
-// so the branch that lowers the underline for these families is not even
-// compiled into a Linux build. See cleartype/src/shim_exports.h for what the
-// out-parameters mean.
+// underline fields and the three that identify the struct.
+//
+// gfxDWriteFont::ComputeMetrics writes underlinePosition and underlineThickness
+// times mFUnitsConvFactor; gfxFT2FontBase::InitMetrics derives both from
+// FreeType's own scaled post table, and calls SanitizeMetrics with a literal
+// false, so the branch that lowers the underline for a family on Firefox's
+// bad-underline list is not even compiled into a Linux build. Both differences
+// are answered here, for every face. See cleartype/src/shim_exports.h for what
+// the out-parameters mean.
 extern "C" void CleartypeEndInitMetrics(void)
 {
 #if CLEARTYPE_FIREFOX_PARITY
@@ -6819,7 +6885,7 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
     }
     const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
     int answered = 0;
-    if (inst != nullptr && inst->valid && inst->bad_underline) {
+    if (inst != nullptr && inst->valid) {
         const WinMetrics& m = inst->metrics;
         const double fold = inst->descent_fold ? 0.5 : 0.0;
         *underline_offset = m.underlineOffset;
@@ -6835,6 +6901,137 @@ extern "C" int CleartypeWindowsUnderline(double* underline_offset, double* under
 #else
     (void)underline_offset; (void)underline_size; (void)em_height;
     (void)max_ascent; (void)max_descent; (void)descent_fold;
+    return 0;
+#endif
+}
+
+// What Windows would have put in gfxFont::Metrics for the two strikeout
+// fields, with the three that identify the struct.
+//
+// gfxFT2FontBase::InitMetrics finishes its strikeout block with
+// SnapLineToPixels, which takes the thickness to a whole number of pixels and
+// moves the offset by half the change to keep the line centered, then rounds
+// that too. gfxDWriteFont::ComputeMetrics writes
+// strikethroughPosition * mFUnitsConvFactor and
+// strikethroughThickness * mFUnitsConvFactor and leaves them fractional, so a
+// line-through at a size whose thickness lands between one and two pixels is a
+// pixel thicker here, and one whose snapped offset crosses a pixel boundary
+// sits a row away.
+//
+// Answers for every face, since nothing about the snap is per-family.
+extern "C" int CleartypeWindowsStrikeout(double* strikeout_offset, double* strikeout_size,
+                                         double* em_height, double* max_ascent,
+                                         double* max_descent)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    FT_Face face = g_last_sfnt_face;
+    if (face == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    if (entry == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (face->size == nullptr ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !(em_size > 0.0)) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
+    int answered = 0;
+    if (inst != nullptr && inst->valid) {
+        const WinMetrics& m = inst->metrics;
+        const double fold = inst->descent_fold ? 0.5 : 0.0;
+        *strikeout_offset = m.strikeoutOffset;
+        *strikeout_size = m.strikeoutSize;
+        *em_height = m.emHeight;
+        *max_ascent = m.maxAscent - fold;
+        *max_descent = m.maxDescent + fold;
+        answered = 1;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return answered;
+#else
+    (void)strikeout_offset; (void)strikeout_size; (void)em_height;
+    (void)max_ascent; (void)max_descent;
+    return 0;
+#endif
+}
+
+// The font-units-to-pixels factor, as each platform sets it.
+//
+// gfxFT2FontBase::InitMetrics writes
+// FLOAT_FROM_26_6(FLOAT_FROM_16_16(ftMetrics.x_scale)), and FreeType built
+// that scale from the size rounded to 1/64 px, so it carries the rounding.
+// gfxDWriteFont::ComputeMetrics writes mAdjustedSize / designUnitsPerEm and
+// carries none. The field is a COLR glyph's font-unit scale, so the difference
+// puts a gradient stop a fraction of a pixel away and moves the levels either
+// side of it.
+//
+// The FreeType value is returned as well, since the caller finds the field by
+// matching it. It comes from the instance, since the face carries whatever
+// size was set on it last.
+extern "C" int CleartypeWindowsUnitsPerPixel(double* linux_factor, double* windows_factor,
+                                             double* em_height, double* max_ascent,
+                                             double* max_descent)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    FT_Face face = g_last_sfnt_face;
+    if (face == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    if (entry == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (face->size == nullptr ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !(em_size > 0.0)) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
+    // ApplyWindowsMetrics records the scale when it runs at this size, and it
+    // does not run for every instance. The face still carries a scale, but only
+    // for whatever size was set on it last, so it is used only when that size
+    // is this instance's.
+    FT_Fixed x_scale_26_6 = inst != nullptr ? inst->ft_x_scale : 0;
+    if (x_scale_26_6 == 0 && inst != nullptr) {
+        double live_size = 0.0;
+        float live_ratio = 1.0f;
+        if (GetEmSize(face, &live_size, &live_ratio) && live_size > 0.0 &&
+            static_cast<FT_Fixed>(std::floor(live_size * 64.0 + 0.5)) == inst->size_26_6) {
+            x_scale_26_6 = face->size->metrics.x_scale;
+        }
+    }
+    int answered = 0;
+    if (inst != nullptr && inst->valid && x_scale_26_6 != 0) {
+        const WinMetrics& m = inst->metrics;
+        const double fold = inst->descent_fold ? 0.5 : 0.0;
+        const double x_scale = static_cast<double>(x_scale_26_6);
+        *linux_factor = static_cast<float>(x_scale / 65536.0 / 64.0);
+        *windows_factor = inst->funits_conv;
+        *em_height = m.emHeight;
+        *max_ascent = m.maxAscent - fold;
+        *max_descent = m.maxDescent + fold;
+        answered = 1;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return answered;
+#else
+    (void)linux_factor; (void)windows_factor; (void)em_height;
+    (void)max_ascent; (void)max_descent;
     return 0;
 #endif
 }
@@ -7757,8 +7954,9 @@ bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
     // FreeType port splits the device matrix with PreMatrixScale::kFull, so
     // the squeeze arrives as an anisotropic char size, while
     // SkScalerContext_DW splits it with kVertical and hands the ratio to
-    // builder.transform. Windows draws DirectWrite's outline at the vertical
-    // em and transforms the finished path, which is what the sink reproduces.
+    // builder.transform. SkScalerContext_DW asks for the outline at the
+    // vertical em and transforms the finished path, which is what the sink
+    // reproduces.
     // A rotation reaches the sink the same way, as the rest of fSkXform.
     double em_size = 0.0;
     float x_over_y = 1.0f;

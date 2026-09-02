@@ -3,7 +3,7 @@
 //  libxul_patch.cpp - the interception points outside FreeType.
 //
 //  Some of what Firefox on Windows does never reaches FreeType, because Gecko
-//  answers it itself. Three such things are intercepted here.
+//  answers it itself. Those things are intercepted here.
 //
 //  Font fallback. gfxWindowsPlatform::GetCommonFallbackFonts names the
 //  families to try for a script and gfxPlatformGtk::GetCommonFallbackFonts
@@ -25,12 +25,32 @@
 //  right spacing is the struct. It acts on one match and otherwise does
 //  nothing.
 //
+//  The font-units-to-pixels factor. gfxFT2FontBase::InitMetrics takes it from
+//  FreeType's x_scale, which was built from a size rounded to 1/64 px;
+//  gfxDWriteFont::ComputeMetrics divides the unrounded size by the design
+//  units per em. COLRFonts scales a paint graph by it and
+//  gfxFont::CreateVerticalMetrics scales the OS/2 and vhea fields by it, so
+//  the field is put back beside the metrics.
+//
+//  The strikeout line. gfxFT2FontBase::InitMetrics ends its strikeout block
+//  with SnapLineToPixels, which takes the thickness to a whole number of
+//  pixels and rounds the offset with it; gfxDWriteFont::ComputeMetrics leaves
+//  both fractional. The two fields are put back unsnapped beside the underline
+//  ones.
+//
 //  The bad-underline bit itself. gfxDWriteFontList marks a family from the
 //  same list; gfxFcPlatformFontList passes a literal false, so on Linux
 //  gfxFontGroup::GetUnderlineOffset never takes the minimum across the group
 //  the way Windows does. The bit lives in the shared font list, which the
 //  parent process maps writable, so it is set there directly. See the comment
 //  above MarkBadUnderlineFamiliesOnce.
+//
+//  The platform a media query answers with. The UA stylesheet puts
+//  font-variant-east-asian: ruby on rt and rtc inside
+//  `@media not (-moz-platform: windows)`, so everywhere but Windows a ruby
+//  annotation is shaped with the font's ruby glyph designs. The feature
+//  reaches the shaper long before any font call, so the answer is moved where
+//  the query is evaluated. See the comment above FindPlatformCompare.
 //
 //  Translated from:
 //    gfx/thebes/gfxWindowsPlatform.cpp  gfxWindowsPlatform::GetCommonFallbackFonts
@@ -41,6 +61,9 @@
 //    gfx/thebes/gfxFont.cpp             gfxFont::SanitizeMetrics
 //    gfx/thebes/gfxTextRun.cpp          gfxFontGroup::GetUnderlineOffset
 //    gfx/thebes/gfxFcPlatformFontList.cpp  the two InitData call sites
+//    layout/style/res/html.css          the rt and rtc rule for ruby glyphs
+//    layout/style/nsMediaFeatures.cpp   Gecko_MediaFeatures_MatchesPlatform
+//    servo/components/style/gecko/media_features.rs  enum Platform
 //    gfx/thebes/SharedFontList.h        fontlist::Pointer, String, Family
 //    gfx/thebes/SharedFontList-impl.h   FontList::Header and BlockHeader
 //    gfx/thebes/gfxPlatform.h           FontPresentation, PrefersColor
@@ -86,6 +109,8 @@
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -446,6 +471,8 @@ using InitMetricsFn = void (*)(void* self);
 InitMetricsFn g_init_metrics = nullptr;
 
 // gfx/thebes/gfxFont.h: struct Metrics, nineteen gfxFloats in this order.
+constexpr unsigned kMetricsStrikeoutSize = 2;
+constexpr unsigned kMetricsStrikeoutOffset = 3;
 constexpr unsigned kMetricsUnderlineSize = 4;
 constexpr unsigned kMetricsUnderlineOffset = 5;
 constexpr unsigned kMetricsInternalLeading = 6;
@@ -565,48 +592,102 @@ struct ShmBlock
     size_t size;
 };
 
+// Bytes one call may move through the probe pipe. A write of at most PIPE_BUF
+// into an empty pipe moves the whole request or none of it, and the largest
+// request made here is a thousand bytes.
+constexpr size_t kProbeBytes = 4096;
+
+int g_probe_pipe[2] = {-1, -1};
+bool g_probe_pipe_failed = false;
+pthread_mutex_t g_probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Reads by handing the address to the kernel to copy from. write() answers
+// EFAULT for memory this process cannot read, where a load of the same address
+// would fault. Gecko's seccomp policy allows pipe2 with these two flags and
+// allows write, so this route is open in a content process.
+//
+// Every write is drained by the read after it, leaving the pipe empty for the
+// next call, so a short write is the tail of the request being unreadable.
+bool ReadThroughPipe(const void* addr, void* out, const size_t len)
+{
+    if (len == 0 || len > kProbeBytes) {
+        return false;
+    }
+    pthread_mutex_lock(&g_probe_mutex);
+    if (g_probe_pipe[1] < 0 && !g_probe_pipe_failed) {
+        if (pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+            g_probe_pipe[0] = -1;
+            g_probe_pipe[1] = -1;
+            g_probe_pipe_failed = true;
+        }
+    }
+    ssize_t wrote = -1;
+    if (g_probe_pipe[1] >= 0) {
+        do {
+            wrote = write(g_probe_pipe[1], addr, len);
+        } while (wrote < 0 && errno == EINTR);
+    }
+    size_t have = 0;
+    while (wrote > 0 && have < static_cast<size_t>(wrote)) {
+        const ssize_t got = read(g_probe_pipe[0],
+                                 static_cast<unsigned char*>(out) + have,
+                                 static_cast<size_t>(wrote) - have);
+        if (got > 0) {
+            have += static_cast<size_t>(got);
+        } else if (got < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    // Anything a short read left behind would be handed to the next caller as
+    // its own answer.
+    if (wrote > 0 && have != static_cast<size_t>(wrote)) {
+        unsigned char scrap[256];
+        while (read(g_probe_pipe[0], scrap, sizeof(scrap)) > 0) {
+        }
+    }
+    pthread_mutex_unlock(&g_probe_mutex);
+    return have == len;
+}
+
+// Whether this process has had process_vm_readv refused by the sandbox.
+std::atomic<bool> g_vm_readv_blocked{false};
+
 // Reads `len` bytes from this process without dereferencing the address.
 //
 // Every address below comes from /proc/self/maps, which describes what was
 // mapped when it was read and not what is mapped now. A shared mapping torn
 // down in between leaves an address that looks fine and faults on the first
 // load, which is a crash inside a host this library promises never to crash.
-// process_vm_readv answers EFAULT for that instead, and needs no privilege
-// against the calling process itself.
+// Both routes here have the kernel do the reading, so an address this process
+// cannot read comes back as an error.
+//
+// process_vm_readv is one syscall and needs no lock, and Gecko's seccomp
+// policy (security/sandbox/linux/SandboxFilter.cpp) gives it to the parent
+// alone. A content process traps on every call and each trap is logged, so the
+// refusal is remembered and the pipe answers from then on.
 // The length is the caller's to give.
 // ReSharper disable once CppDFAConstantParameter
 bool ReadWithoutFaulting(const void* addr, void* out, const size_t len)
 {
+    if (addr == nullptr || len == 0) {
+        return false;
+    }
+    if (g_vm_readv_blocked.load(std::memory_order_relaxed)) {
+        return ReadThroughPipe(addr, out, len);
+    }
     const iovec local = { .iov_base = out, .iov_len = len };
     const iovec remote = { .iov_base = const_cast<void*>(addr), .iov_len = len };
     const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    if (got == static_cast<ssize_t>(len)) {
-        return true;
-    }
     if (got >= 0) {
-        return false;                        // the object ends inside the range
+        return got == static_cast<ssize_t>(len);   // short is the object ending inside the range
     }
-    // Gecko's seccomp policy (security/sandbox/linux/SandboxFilter.cpp) gives
-    // process_vm_readv to the parent alone, so in a content process the call
-    // never runs and says nothing about the mapping. The copy is made directly
-    // and stops at the end of the page the address sits in, which is mapped
-    // because the caller is holding an object in it.
     if (errno != EPERM && errno != ENOSYS && errno != EACCES) {
         return false;
     }
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return false;
-    }
-    const auto start = reinterpret_cast<uintptr_t>(addr);
-    // ReSharper disable once CppRedundantParentheses
-    const uintptr_t page_end = (start + static_cast<uintptr_t>(page)) &
-                               ~static_cast<uintptr_t>(page - 1);
-    if (len > page_end - start) {
-        return false;                        // the caller halves it and asks again
-    }
-    std::memcpy(out, addr, len);
-    return true;
+    g_vm_readv_blocked.store(true, std::memory_order_relaxed);
+    return ReadThroughPipe(addr, out, len);
 }
 
 // The ceiling belongs to whoever supplied the array, for the same reason.
@@ -1065,12 +1146,18 @@ double* FindMetrics(void* self, const double em, const double asc, const double 
     // on some other run of doubles. InitMetrics sets maxHeight from the sum,
     // and SanitizeMetrics, which runs after it, recomputes maxHeight on both of
     // the paths where it moves an ascent or a descent.
+    //
+    // InitMetrics rounds units_per_EM * yScale and not the size itself, and
+    // yScale carries FreeType's 16.16 scale, which reconstructs the size a
+    // fraction low. A size that ends in half a pixel therefore floors to the
+    // pixel below the one the size rounds to, so that value is accepted too.
     const double rounded = std::floor(em + 0.5);
+    const double under = std::ceil(em - 0.5);
     auto* base = static_cast<unsigned char*>(self);
 
     auto matches = [&](const double* c) {
         const double got = c[kMetricsEmHeight];
-        return (SameDouble(got, em) || SameDouble(got, rounded)) &&
+        return (SameDouble(got, em) || SameDouble(got, rounded) || SameDouble(got, under)) &&
                SameDouble(c[kMetricsMaxAscent], asc) && SameDouble(c[kMetricsMaxDescent], desc) &&
                SameDouble(c[kMetricsMaxHeight], asc + desc);
     };
@@ -1182,6 +1269,36 @@ std::atomic<size_t> g_ftface_word{0};
 // struct, the int and the bool sharing that word.
 constexpr size_t kFTSizeWord = kMetricsFields + 1;
 
+bool SameBits(float a, float b);
+
+// gfxFont::mFUnitsConvFactor, the one float between the object's start and its
+// metrics that holds the value gfxFT2FontBase::InitMetrics just wrote there.
+// gfxFont declares it and gfxFT2FontBase declares the metrics, so it lies at a
+// lower address, and the bits are an exact fingerprint, so a second float
+// reading alike leaves neither one nameable and nothing is written.
+float* FindUnitsPerPixel(void* self, const double* metrics, const double linux_factor)
+{
+    const auto stop = reinterpret_cast<const unsigned char*>(metrics);
+    auto* from = static_cast<unsigned char*>(self);
+    if (stop <= from) {
+        return nullptr;
+    }
+    const auto want = static_cast<float>(linux_factor);
+    float* found = nullptr;
+    for (unsigned char* at = from; at + sizeof(float) <= stop; at += sizeof(float)) {
+        float seen = 0.0f;
+        std::memcpy(&seen, at, sizeof(seen));
+        if (!SameBits(seen, want)) {
+            continue;
+        }
+        if (found != nullptr) {
+            return nullptr;
+        }
+        found = reinterpret_cast<float*>(at);
+    }
+    return found;
+}
+
 void ClaimOwnFace(void* self)
 {
     const size_t at = g_ftface_word.load(std::memory_order_relaxed);
@@ -1219,32 +1336,126 @@ void ClaimOwnFace(void* self)
 // and the water ideograph are measured at the same size as everything after
 // them; claiming afterwards leaves those three off by a rounding. Nothing is
 // claimed until an earlier font has taught the two offsets.
-void PreClaimOwnSize(void* self)
+// True once the size has been claimed, which takes a face this library knows
+// and a scalable one.
+bool PreClaimOwnSize(void* self)
+{
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    const size_t back = g_adjusted_size_delta.load(std::memory_order_relaxed);
+    if (self == nullptr || at == 0 || back == 0 || back > at) {
+        return false;
+    }
+    auto* const shared = static_cast<void* const*>(self)[at - 1];
+    if (shared == nullptr) {
+        return false;
+    }
+    double size = 0.0;
+    std::memcpy(&size, static_cast<double*>(self) + (at - back), sizeof(size));
+    if (!(size > 0.0) || !(size < 65536.0)) {
+        return false;                        // still the -1.0 it starts at
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (CleartypeClaimSize(static_cast<void* const*>(shared)[i], size) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// mAdjustedSize back to the -1.0 a gfxFont starts with, so GetAdjustedSize()
+// works the size out from mStyle again.
+//
+// gfxFontconfigFontEntry::CreateFontInstance settles font-size-adjust before
+// the font exists, from an aspect gfxFontconfigFontEntry::GetAspect measures on
+// a separate 256px font, and gfxFontconfigFont's constructor stores the result
+// as mAdjustedSize. gfxDWriteFont has no such step. Its font is born at
+// mStyle.size and gfxDWriteFont::ComputeMetrics does the whole adjustment
+// itself. The two agree on the size they finish at, since the block inside
+// InitMetrics recomputes the adjustment from this font's own metrics and an
+// aspect is a ratio, but they disagree on the size the font is carrying while
+// that block runs. gfxFont::CreateVerticalMetrics takes emHeight from
+// GetAdjustedSize() and is published once for the life of the font, and the
+// ic-height basis is the one basis that asks for a vertical advance, so Windows
+// keeps the vertical metrics of the unadjusted size where Linux keeps the
+// adjusted one.
+//
+// Only for a font that has not been measured yet, which is the same condition
+// InitMetrics puts on the adjustment block, and only for a scalable face, since
+// ChooseFontSize departs from the style's own size for no other kind.
+void ResetAdjustedSize(void* self)
 {
     const size_t at = g_ftface_word.load(std::memory_order_relaxed);
     const size_t back = g_adjusted_size_delta.load(std::memory_order_relaxed);
     if (self == nullptr || at == 0 || back == 0 || back > at) {
         return;
     }
-    auto* const shared = static_cast<void* const*>(self)[at - 1];
-    if (shared == nullptr) {
+    double ft_size = 0.0;
+    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord,
+                sizeof(ft_size));
+    if (!SameDouble(ft_size, 0.0)) {
         return;
     }
-    double size = 0.0;
-    std::memcpy(&size, static_cast<double*>(self) + (at - back), sizeof(size));
-    if (!(size > 0.0) || !(size < 65536.0)) {
-        return;                              // still the -1.0 it starts at
+    constexpr double unset = -1.0;
+    std::memcpy(static_cast<double*>(self) + (at - back), &unset, sizeof(unset));
+}
+
+// The mFTSize a font carried before the strike rewrite below replaced it.
+//
+// That rewrite puts the rounded strike size into both size fields, which is
+// what leaves GetFTGlyphExtents scaling by one. It also drops the only value
+// naming the Windows instance the font's glyphs were loaded through, and
+// SubstituteInkBox needs that instance to recover the exact ink box. Keeping
+// it here costs one slot per font and is read by address.
+struct PriorFTSize
+{
+    void* self;
+    double px;
+};
+
+PriorFTSize g_prior_ft_sizes[64] = {};
+size_t g_prior_ft_next = 0;
+pthread_mutex_t g_prior_ft_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void RecordPriorFTSize(void* self, const double px)
+{
+    if (self == nullptr || !(px > 0.0) || !(px < 65536.0)) {
+        return;
     }
-    for (size_t i = 0; i < 4; ++i) {
-        if (CleartypeClaimSize(static_cast<void* const*>(shared)[i], size) != 0) {
+    pthread_mutex_lock(&g_prior_ft_mutex);
+    for (PriorFTSize& slot : g_prior_ft_sizes) {
+        if (slot.self == self) {
+            slot.px = px;
+            pthread_mutex_unlock(&g_prior_ft_mutex);
             return;
         }
     }
+    g_prior_ft_sizes[g_prior_ft_next] = PriorFTSize{.self = self, .px = px};
+    g_prior_ft_next = (g_prior_ft_next + 1) | 0;
+    if (g_prior_ft_next >= sizeof(g_prior_ft_sizes) / sizeof(g_prior_ft_sizes[0])) {
+        g_prior_ft_next = 0;
+    }
+    pthread_mutex_unlock(&g_prior_ft_mutex);
+}
+
+double PriorFTSizeFor(void* self)
+{
+    double px = 0.0;
+    pthread_mutex_lock(&g_prior_ft_mutex);
+    for (const PriorFTSize& slot : g_prior_ft_sizes) {
+        if (slot.self == self) {
+            px = slot.px;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_prior_ft_mutex);
+    return px;
 }
 
 extern "C" void DwcInitMetrics(void* self)
 {
-    PreClaimOwnSize(self);
+    if (PreClaimOwnSize(self)) {
+        ResetAdjustedSize(self);
+    }
     g_init_metrics(self);
     ClaimOwnFace(self);
 
@@ -1265,6 +1476,10 @@ extern "C" void DwcInitMetrics(void* self)
     const bool leading = CleartypeWindowsLeading(&il, &el, &em, &asc, &desc, &linux_el) != 0;
     double uo = 0.0, us = 0.0, fold = 0.0;
     const bool underline = CleartypeWindowsUnderline(&uo, &us, &em, &asc, &desc, &fold) != 0;
+    double so = 0.0, ss = 0.0;
+    const bool strikeout = CleartypeWindowsStrikeout(&so, &ss, &em, &asc, &desc) != 0;
+    double linux_upp = 0.0, win_upp = 0.0;
+    const bool upp = CleartypeWindowsUnitsPerPixel(&linux_upp, &win_upp, &em, &asc, &desc) != 0;
     double ave = 0.0, adv = 0.0, cw_em = 0.0, cw_asc = 0.0, cw_desc = 0.0;
     const bool char_width = CleartypeWindowsCharWidth(&ave, &adv, &cw_em, &cw_asc, &cw_desc) != 0;
     double rounded = 0.0, unrounded = 0.0, sk_space = 0.0, sk_zero = 0.0, sk_ideo = 0.0;
@@ -1275,7 +1490,7 @@ extern "C" void DwcInitMetrics(void* self)
     // belong to this call alone, and a later InitMetrics that returns before
     // reading OS/2 would otherwise be handed this face's numbers.
     CleartypeEndInitMetrics();
-    if (!leading && !underline) {
+    if (!leading && !underline && !strikeout && !upp) {
         return;
     }
 
@@ -1319,6 +1534,10 @@ extern "C" void DwcInitMetrics(void* self)
         double* const adjusted =
             at != 0 ? FindAdjustedSize(self, found, unrounded) : nullptr;
         if (adjusted != nullptr) {
+            double prior = 0.0;
+            std::memcpy(&prior, static_cast<void* const*>(self) + at + kFTSizeWord,
+                        sizeof(prior));
+            RecordPriorFTSize(self, prior);
             *adjusted = rounded;
             std::memcpy(static_cast<void**>(self) + at + kFTSizeWord, &rounded,
                         sizeof(rounded));
@@ -1374,6 +1593,24 @@ extern "C" void DwcInitMetrics(void* self)
         found[kMetricsEmHeight] = em;
         found[kMetricsInternalLeading] = il;
         found[kMetricsExternalLeading] = el;
+    }
+    if (upp && !SameDouble(linux_upp, win_upp)) {
+        // COLRFonts scales a paint graph's font units by this, and
+        // gfxFont::CreateVerticalMetrics multiplies the OS/2 and vhea fields by
+        // it, so the rounding FreeType's scale carries reaches a color glyph's
+        // gradients and a vertical line box alike.
+        if (float* factor = FindUnitsPerPixel(self, found, linux_upp)) {
+            *factor = static_cast<float>(win_upp);
+        }
+    }
+    if (strikeout) {
+        // gfxFT2FontBase::InitMetrics snaps the strikeout to whole pixels and
+        // gfxDWriteFont::ComputeMetrics leaves it fractional, so the pair goes
+        // back unsnapped. nsCSSRendering::GetTextDecorationRectInternal takes
+        // both as they stand, the thickness as the line-through's height and
+        // the offset as where its middle sits.
+        found[kMetricsStrikeoutOffset] = so;
+        found[kMetricsStrikeoutSize] = ss;
     }
     if (underline) {
         found[kMetricsUnderlineOffset] = uo;
@@ -2043,11 +2280,11 @@ bool PatchUnderline(const Image& image, const FunctionStarts& starts)
 //
 // SkScalerContext_FreeType::generatePath builds the SkPath that everything
 // drawn from an outline goes through: a stroked glyph, a COLR layer under a
-// gradient, text past the size Skia keeps in its atlas. Windows builds the
-// same path from DirectWrite's outline, so replacing this walk is what puts
-// the two platforms on one set of curves; see FT_Outline_Decompose in
-// freetype.cpp for the substitution itself and for why the coordinates cannot
-// come through it.
+// gradient, text past the size Skia keeps in its atlas. SkScalerContext_DW
+// builds the same path from the outline DirectWrite returns, so replacing this
+// walk is what puts the two sides on one set of curves; see
+// FT_Outline_Decompose in freetype.cpp for the substitution itself and for why
+// the coordinates cannot come through it.
 //
 // Nothing here names the function. It is found by shape, as the one virtual
 // function that walks an outline, sits in a vtable beside two others that
@@ -2347,8 +2584,8 @@ GenerateMetricsFn g_generate_metrics = nullptr;
 //
 // SkScalerContext_DW::generateMetrics falls through to ScalerContextBits::PATH
 // whenever generateDWMetrics cannot get texture bounds, and its generateImage
-// then takes SkScalerContext::generateImageFromPath, so Windows draws the
-// glyph with Skia's own scan converter over DirectWrite's outline.
+// then takes SkScalerContext::generateImageFromPath, so that scaler draws the
+// glyph with Skia's own scan converter over the outline DirectWrite returns.
 // SkScalerContext_FreeType has no such fallback, and the route is not chosen
 // per glyph. SkScalerContext::internalGetImage reads fGenerateImageFromPath,
 // so setting that field puts this scaler on the same route.
@@ -2669,10 +2906,15 @@ void SubstituteInkBox(void* self, const uint16_t gid, double* bounds)
         return;                              // not a boolean where one should be
     }
     const int embolden = flags_word[sizeof(int)];
+    // The rewrite above replaced mFTSize with the strike size, and the glyphs
+    // in the slot were loaded through the instance the font carried before
+    // that. Asking at the current size looks for an instance never built.
+    const double prior = PriorFTSizeFor(self);
+    const double ask = prior > 0.0 ? prior : ft_size;
     double box[4] = {};
     bool have = false;
     for (size_t i = 0; i < 4 && !have; ++i) {
-        have = CleartypeGlyphInkBox(static_cast<void* const*>(shared)[i], ft_size, embolden,
+        have = CleartypeGlyphInkBox(static_cast<void* const*>(shared)[i], ask, embolden,
                                     gid, box) != 0;
     }
     if (!have) {
@@ -2735,6 +2977,100 @@ bool PatchGlyphBounds(const Image& image, const FunctionStarts& starts)
     }
     Report("libxul: GetGlyphBounds %#lx now returns through this library "
            "(%u of %u vtable slots)", found, written, n_slots);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The platform a media query answers with.
+//
+// Gecko_MediaFeatures_MatchesPlatform compares its argument against the one
+// platform the build was made for and returns whether they are the same, so
+// the whole function is an endbr64, a compare against that platform's
+// ordinal, a sete and a ret. Those eleven bytes are its own anchor, appearing
+// once in the image and starting a function. The ordinals are servo's Platform
+// enum in declaration order.
+//
+// Rust calls it directly, so the dynamic symbol table offers nothing to
+// interpose and the byte it compares against is what changes.
+// ---------------------------------------------------------------------------
+
+// servo/components/style/gecko/media_features.rs, enum Platform.
+constexpr unsigned char kPlatformLinux = 1;
+constexpr unsigned char kPlatformWindows = 4;
+
+// endbr64; cmp edi, kPlatformLinux; sete al; ret
+constexpr unsigned char kPlatformCompare[] = {0xF3, 0x0F, 0x1E, 0xFA, 0x83, 0xFF,
+                                              kPlatformLinux, 0x0F, 0x94, 0xC0, 0xC3};
+constexpr size_t kPlatformCompareImmediate = 6;
+
+unsigned char* FindPlatformCompare(const Image& image, const FunctionStarts& starts)
+{
+    unsigned char* found = nullptr;
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        const unsigned char* at = r.begin;
+        while (at + sizeof(kPlatformCompare) <= r.end) {
+            const void* hit = memmem(at, static_cast<size_t>(r.end - at), kPlatformCompare,
+                                     sizeof(kPlatformCompare));
+            if (hit == nullptr) {
+                break;
+            }
+            at = static_cast<const unsigned char*>(hit) + 1;
+            const auto address = reinterpret_cast<uintptr_t>(hit);
+            if (starts.Enclosing(address) != address) {
+                continue;                    // the same bytes inside a longer function
+            }
+            if (found != nullptr) {
+                return nullptr;              // two of them, so neither is the anchor
+            }
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+            found = const_cast<unsigned char*>(static_cast<const unsigned char*>(hit));
+        }
+    }
+    return found;
+}
+
+// One byte of the instruction stream, opened and closed around the write.
+bool WriteCode(unsigned char* at, const unsigned char value)
+{
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return false;
+    }
+    const uintptr_t first = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
+    auto* start = reinterpret_cast<void*>(first);
+    const auto len = static_cast<size_t>(page);
+    // Writable and executable at once, as the InitMetrics sites are. This
+    // patches live text, and dropping PROT_EXEC for the duration would fault
+    // any thread that entered the page while it was non-executable.
+    // NOLINTNEXTLINE(clang-analyzer-security.MmapWriteExec)
+    if (mprotect(start, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        Report("libxul: the text page would not open for writing");
+        return false;
+    }
+    // One byte, so no reader can see a half-written instruction.
+    *at = value;
+    if (mprotect(start, len, PROT_READ | PROT_EXEC) != 0) {
+        Report("libxul: the text page would not close again");
+        // The byte is written and correct. The page keeps write permission it
+        // did not have before, which weakens it without changing what it holds.
+    }
+    return true;
+}
+
+bool PatchPlatformMediaFeature(const Image& image, const FunctionStarts& starts)
+{
+    unsigned char* body = FindPlatformCompare(image, starts);
+    if (body == nullptr) {
+        Report("libxul: no single platform comparison to move, so a ruby "
+               "annotation keeps the ruby glyph designs Windows leaves alone");
+        return false;
+    }
+    if (!WriteCode(body + kPlatformCompareImmediate, kPlatformWindows)) {
+        return false;
+    }
+    Report("libxul: -moz-platform at %#lx answers windows rather than linux",
+           reinterpret_cast<uintptr_t>(body));
     return true;
 }
 
@@ -2806,6 +3142,7 @@ void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(
     PatchUnderline(image, starts);
     PatchGlyphPath(image, starts);
     PatchGlyphBounds(image, starts);
+    PatchPlatformMediaFeature(image, starts);
 }
 
 // What the callback brings back. dlpi_name points into the link map and stays

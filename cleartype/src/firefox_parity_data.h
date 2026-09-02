@@ -364,6 +364,11 @@ struct CommonFallbackRule
 [[maybe_unused]] const auto* const kWindowsPrefs =
     "pref(\"gfx.font_rendering.freetype.gamma\", 180);\n"
     "pref(\"gfx.font_rendering.freetype.enhanced_contrast\", 100);\n"
+    // StaticPrefList.yaml gives the picture cache 512-wide tiles under XP_WIN
+    // and 1024-wide ones everywhere else. Text on a tile seam blends a level
+    // away from the same text inside a tile, so the seams have to fall in the
+    // same columns.
+    "pref(\"gfx.webrender.picture-tile-width\", 512);\n"
     "pref(\"widget.non-native-theme.use-theme-accent\", false);\n"
     "pref(\"font.name-list.serif.x-math\", \"Latin Modern Math, STIX Two Math, XITS Math, Cambria Math, Libertinus Math, DejaVu Math TeX Gyre, TeX Gyre Bonum Math, TeX Gyre Pagella Math, TeX Gyre Schola, TeX Gyre Termes Math, STIX Math, Asana Math, STIXGeneral, DejaVu Serif, DejaVu Sans, Times New Roman\");\n"
     "pref(\"font.name-list.sans-serif.x-math\", \"Arial\");\n"
