@@ -1,0 +1,12 @@
+# Differences from the renderer's own per-character fallback cache, not from
+# anything the shim decides.
+#
+# child_process_sandbox_support_impl_linux.h keys unicode_font_families_ on the
+# character alone, with no locale in the key, so the first language to ask a
+# character fixes the answer for every later one in that renderer.
+#
+# writing-system-line-break-001 asks for U+301C under lang=en first, so its
+# lang=ja and lang=ja-Hang divs inherit that answer. The `_janghang` page is the
+# control: identical in a fresh renderer.
+wt/external/wpt/css/css-text/writing-system/writing-system-line-break-001.html
+wt/external/wpt/css/css-text/writing-system/reference/writing-system-line-break-001-ref.html

@@ -1,0 +1,9 @@
+# Differences from a character fontconfig will not put in a charset, so no font
+# on this side can be matched for it.
+#
+# fontconfig builds a charset from the cmap but starts it at 0x20, dropping the
+# explicit 001D segment Sans Serif Collection carries, so
+# CachedFontSet::GetFallbackFontForChar can never reach that family however the
+# set is ordered. The Windows side reads the cmap and answers it. U+001D is the
+# only character in the BMP where the two disagree.
+wt/external/wpt/css/css-text/white-space/control-chars-01D.html

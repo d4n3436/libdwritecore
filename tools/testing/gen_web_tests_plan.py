@@ -18,7 +18,8 @@ lines only, one per test file, so:
         external/wpt/css/css-fonts external/wpt/css/css-text >> wpt.plan
 
 Skipped outright: -expected files, and the tests that render differently on
-purpose from one run to the next, which are listed in SKIP with the reason.
+purpose from one run to the next, which are listed in SKIP and SKIP_NAMES
+with the reason.
 
 An `accept` line is emitted ahead of the pages, naming the file of paths whose
 difference is the toolkit drawing its own widgets. Those cells are still swept
@@ -36,6 +37,18 @@ SKIP = {
     "font-display/",
     # Animations sample whatever frame the capture reaches.
     "animations/",
+}
+
+# The same, for tests a directory does not gather. Matched against the file
+# name, so a substring covers a whole family of them.
+SKIP_NAMES = {
+    # <marquee> scrolls on a timer of its own, so one capture catches the text
+    # part way across and the other at the start.
+    "marquee",
+    # A <progress> with no value is indeterminate, and the theme animates the
+    # pulse across it. This page draws two, and the pair lands at a different
+    # phase in every capture.
+    "pseudo-replaced-elements",
 }
 
 
@@ -56,6 +69,8 @@ def main():
                 continue
             for name in sorted(names):
                 if not name.endswith(".html") or "expected" in name:
+                    continue
+                if any(s in name for s in SKIP_NAMES):
                     continue
                 print("page wt/%s 0" % os.path.join(rel_base, name))
     return 0

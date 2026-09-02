@@ -107,7 +107,9 @@ def parse(path):
 
 
 def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else "/home/d4n/repos/electron/src"
+    if len(sys.argv) < 2:
+        sys.exit("usage: gen_script_rows.py <chromium-src> > rows.inc")
+    root = sys.argv[1]
     scripts, blocks, emoji = parse(
         root + "/third_party/icu/source/data/unidata/ppucd.txt")
 

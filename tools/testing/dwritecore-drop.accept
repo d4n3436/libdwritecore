@@ -1,0 +1,12 @@
+# Differences from the two sides running different DWriteCore builds, not from
+# anything the shim decides. Linux forwards to the Office drop in
+# third_party/office-android; Windows loads the app-dir DWriteCore.dll from
+# Windows App SDK 2.1.1.2605.
+#
+# avar2 design-space warping: the Office drop applies it, App SDK does not.
+#
+# Delete an entry once both sides run the same drop. A cell going quiet is not
+# that condition: from milestone 148 Blink routes avar2 fonts to Fontations, so
+# these match on Chromium 148 and up while still differing on CEF 144.
+wt/external/wpt/css/css-fonts/variations/variable-avar2-warp.html
+wt/external/wpt/css/css-fonts/variations/variable-avar2-rvrn.html

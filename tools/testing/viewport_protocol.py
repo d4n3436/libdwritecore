@@ -55,6 +55,35 @@ return document.fonts.status === 'loaded' &&
        Math.abs(window.scrollY - arguments[0]) <= 1;
 """
 
+# The page's own word that it is finished, where it has one. A wpt reftest
+# holds class="reftest-wait" on its root until it has drawn what it means to;
+# a testharness.js page prints its results into the document once every test
+# has run, and a capture before that shows the page without them. The
+# testharness check reads the report script's own last line, and looks into
+# same-origin frames, since a frame's harness prints into the frame. The
+# page's globals are behind wrappedJSObject under Marionette and bare under
+# DevTools.
+PAGE_DONE = """
+const done = w => {
+  try {
+    if (w.document.documentElement.classList.contains('reftest-wait')) {
+      return false;
+    }
+    const page = w.wrappedJSObject || w;
+    if (typeof page.add_completion_callback === 'function' &&
+        !(w.document.body && w.document.body.textContent.includes(
+            'Harness: the test ran to completion.'))) {
+      return false;
+    }
+    for (const f of w.frames) {
+      if (!done(f)) { return false; }
+    }
+  } catch (e) {}
+  return true;
+};
+return done(window);
+"""
+
 SHAPE = ("return document.documentElement.scrollHeight + 'x' +"
          "       document.documentElement.scrollWidth;")
 
@@ -111,9 +140,22 @@ return 1;
 # then the frames.
 PAINTED = """
 const done = arguments[arguments.length - 1];
+// An image deferred by loading="lazy" holds its decode promise pending until
+// the load starts, and one below the viewport never starts. Only what the
+// capture can show is awaited, and the wait is bounded for an image whose
+// load is still in flight.
+const inView = (i) => {
+  const box = i.getBoundingClientRect();
+  return box.bottom > 0 && box.top < innerHeight
+      && box.right > 0 && box.left < innerWidth;
+};
 const decoded = Array.from(document.images)
-    .filter(i => i.currentSrc)
+    .filter(i => i.currentSrc && (i.complete || inView(i)))
     .map(i => i.decode().catch(() => {}));
+const settle = Promise.race([
+    Promise.all(decoded),
+    new Promise(r => setTimeout(r, 2000)),
+]);
 // A background image decodes off the main thread and is not in
 // document.images, so there is nothing to await for it. Its first painted
 // frame can land after a two-frame settle, which reads as a blank patch on
@@ -126,7 +168,7 @@ const decoded = Array.from(document.images)
 // never ahead of performance.now(), so comparing the two against each other
 // gives a value that is at best zero and the wait never ends; a machine busy
 // enough to miss the 12 ms mark forever is exactly when the escape is needed.
-Promise.all(decoded).then(() => {
+settle.then(() => {
   const start = performance.now();
   let quiet = 0;
   let last = start;
@@ -147,8 +189,19 @@ Promise.all(decoded).then(() => {
 """
 
 POLL = 0.02
+
+# How long a window is given to reach a size it was asked for before the
+# request counts as missed.
+RESIZE_WAIT = 1.0
 SETUP_TIMEOUT = 20.0
 WORK_TIMEOUT = 240.0
+
+# How long a page is given to say it is done, by the signals PAGE_DONE reads,
+# before it is captured as it is. Only a page that never says so waits the
+# whole budget, so this is priced by the harness that hangs and not by the one
+# that takes its time. A testharness page has been measured finishing 1.8 s
+# after its load completed, and the ones marked `meta timeout=long` are slower.
+DONE_TIMEOUT = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +322,7 @@ class Browser(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def script_async(self, body):
+    def script_async(self, body, args=()):
         """Run a body whose last argument is a completion callback."""
         raise NotImplementedError
 
@@ -303,8 +356,8 @@ class MarionetteBrowser(Browser):
     def script(self, body, args=()):
         return self.m.script(body, list(args))
 
-    def script_async(self, body):
-        return self.m.script_async(body)
+    def script_async(self, body, args=()):
+        return self.m.script_async(body, list(args))
 
     def set_window_rect(self, width, height):
         self.m.call("WebDriver:SetWindowRect",
@@ -429,11 +482,11 @@ class CdpBrowser(Browser):
             "(function(){%s}).apply(null, %s)" % (body, json.dumps(list(args))),
             False)
 
-    def script_async(self, body):
+    def script_async(self, body, args=()):
         return self._evaluate(
             "new Promise(function(resolve){"
-            "  (function(){%s}).apply(null, [resolve]);"
-            "})" % body, True)
+            "  (function(){%s}).apply(null, %s.concat([resolve]));"
+            "})" % (body, json.dumps(list(args))), True)
 
     def set_window_rect(self, width, height):
         if self.window_id is None:
@@ -463,16 +516,50 @@ def await_condition(browser, body, deadline, what, args=()):
         time.sleep(POLL)
 
 
+def wait_condition(browser, body, budget, args=()):
+    """await_condition for a condition worth waiting for but not failing on.
+
+    True once the condition held, False when the budget ran out first.
+    """
+    end = time.time() + budget
+    while True:
+        if browser.script(body, args):
+            return True
+        if time.time() > end:
+            return False
+        time.sleep(POLL)
+
+
+def force_viewport(browser, want_w, want_h):
+    """Override the layout viewport where the window will not give the size.
+
+    The screenshot is then taken of the override, and the canvas it comes
+    back on is transparent; a page that paints no background of its own
+    would compare as black once the alpha is dropped. So the background is
+    overridden to opaque white in the same breath.
+    """
+    browser.call("Emulation.setDeviceMetricsOverride",
+                 {"width": want_w, "height": want_h,
+                  "deviceScaleFactor": 1, "mobile": False})
+    browser.call("Emulation.setDefaultBackgroundColorOverride",
+                 {"color": {"r": 255, "g": 255, "b": 255, "a": 1}})
+
+
 def converge_inner_size(browser, want_w, want_h, deadline):
     """Set the window until the *inner* size holds at exactly want_w x want_h.
 
     This converges instead of computing. The difference between outer and
     inner is not known until the window exists, and some window managers
-    change it once more after the first resize. Re-reading the size is itself
-    the wait: each read is a round trip through the browser's main thread, so
-    it drains queued resize events. The answer has to come back right several
-    times running, because arriving at a size once and holding it are
-    different things.
+    change it once more after the first resize. The answer has to come back
+    right several times running, because arriving at a size once and holding
+    it are different things.
+
+    A resize call returns before the size reaches the page, by hundreds of
+    milliseconds on some browsers, so after each request the size is re-read
+    until it moves or RESIZE_WAIT runs out. Without that wait the next
+    request adds the chrome to an outer size that has already grown, and the
+    window runs away until the override below is taken for a window that was
+    resizing fine.
     """
     end = time.time() + deadline
     agreed = 0
@@ -487,19 +574,21 @@ def converge_inner_size(browser, want_w, want_h, deadline):
         if time.time() > end:
             sys.exit("window never held %dx%d inner (last %dx%d)"
                      % (want_w, want_h, iw, ih))
+        if forced:
+            time.sleep(POLL)
+            continue
         # A resize call that is accepted but never lands, which is what a
         # window without a cooperating manager does, forces the layout
         # viewport the same way a refused one does.
         misses += 1
-        if misses > 6 and not forced and hasattr(browser, "call"):
-            browser.call("Emulation.setDeviceMetricsOverride",
-                         {"width": want_w, "height": want_h,
-                          "deviceScaleFactor": 1, "mobile": False})
+        if misses > 6 and hasattr(browser, "call"):
+            force_viewport(browser, want_w, want_h)
             forced = True
             continue
-        if forced:
-            time.sleep(POLL)
-            continue
+        # Clamped: a window that is not yet mapped reports placeholder outer
+        # values, and the subtraction would then ask for a negative size.
+        # Asking for the inner size itself is wrong by exactly the chrome and
+        # is corrected on the next turn of this loop.
         if browser.set_window_rect(want_w + max(ow - iw, 0),
                                    want_h + max(oh - ih, 0)) is False:
             # An app that sizes its own window answers False. Electron's does
@@ -508,18 +597,17 @@ def converge_inner_size(browser, want_w, want_h, deadline):
             # and comparing those compares two different pages. The layout
             # viewport is overridden instead, which is what the screenshot is
             # taken of.
-            if forced or not hasattr(browser, "call"):
+            if not hasattr(browser, "call"):
                 time.sleep(POLL)
                 continue
-            browser.call("Emulation.setDeviceMetricsOverride",
-                         {"width": want_w, "height": want_h,
-                          "deviceScaleFactor": 1, "mobile": False})
+            force_viewport(browser, want_w, want_h)
             forced = True
             continue
-        # Clamped: a window that is not yet mapped reports placeholder outer
-        # values, and the subtraction would then ask for a negative size.
-        # Asking for the inner size itself is wrong by exactly the chrome and
-        # is corrected on the next turn of this loop.
+        landed = time.time() + RESIZE_WAIT
+        while time.time() < landed:
+            if tuple(browser.script(INNER)[:2]) != (iw, ih):
+                break
+            time.sleep(POLL)
 
 
 def wait_for_removal(path, deadline=WORK_TIMEOUT):
@@ -603,13 +691,17 @@ def pin_color_scheme(browser):
     Which one an app reports is a property of the app and its desktop, not of
     the font stack: cefsimple on a bare X server answers dark and cefclient on
     the guest answers light, which makes every pixel of every page differ.
-    Light is pinned because that is what both Electrons already report. Only
-    the CDP driver can do this.
+    Light is pinned because that is what both Electrons already report, and
+    DWC_COLOR_SCHEME pins dark instead for a run that wants the other one on
+    both sides. Only the CDP driver can do this.
     """
     if not hasattr(browser, "call"):
         return
+    want = os.environ.get("DWC_COLOR_SCHEME", "light")
+    if want not in ("light", "dark"):
+        want = "light"
     browser.call("Emulation.setEmulatedMedia",
-                 {"features": [{"name": "prefers-color-scheme", "value": "light"}]})
+                 {"features": [{"name": "prefers-color-scheme", "value": want}]})
 
 
 # The scroll part of MARK, without the marker. Scrollbars are already hidden
@@ -647,6 +739,10 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
                            % (scroll, max_scroll))
     await_condition(browser, VIEWPORT_READY, deadline,
                     "the viewport never settled after scrolling", [scroll])
+    # A harness that prints its results after the load paints nothing while it
+    # runs, so the frame settle below is already satisfied when the results are
+    # still missing, and the two sides differ by that text alone.
+    wait_condition(browser, PAGE_DONE, DONE_TIMEOUT)
     # A navigation re-derives :hover from where the machine's own pointer
     # sits, and whatever is under it renders hovered until the pointer is
     # moved again, so the park is per page.
@@ -672,8 +768,14 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
             data = fresh
             break
         data = fresh
-    with open(out_png, "wb") as handle:
+    # Through a temporary name, so a reader waiting for this file never sees
+    # a partial one. The sweep compares cells as soon as both sides' shots
+    # appear, and several comparisons run at once, so the window between
+    # creating the file and filling it is one a reader does reach.
+    part = out_png + ".part"
+    with open(part, "wb") as handle:
         handle.write(data)
+    os.replace(part, out_png)
 
 
 def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT,

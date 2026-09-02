@@ -1,0 +1,5 @@
+# Differences from a wpt server pipe this harness does not implement: a
+# `?pipe=trickle(dN)` delay never happens, so the test measures fetch timing
+# instead and the two sides report differently. The glyphs match, and Firefox
+# shows no difference on either page in the corpus that uses a pipe.
+wt/external/wpt/css/css-fonts/fallback-remote-to-data-url.html

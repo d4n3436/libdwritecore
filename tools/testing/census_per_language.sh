@@ -49,18 +49,37 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -n "$OUT" ] && mkdir -p "$OUT"
 
-# The port a spec names, which is what says whether the side came back.
+# The port a spec names, which is what says whether the side came back, and the
+# driver, which says how to ask.
 port_of() { printf '%s\n' "$1" | sed -E 's/.*:([0-9]+)$/\1/'; }
-host_of() { printf '%s\n' "$1" | sed -E 's|^(cdp:)?([^:]+):[0-9]+$|\2|'; }
-
-answers() {                               # answers <host> <port>
-    curl -s -m 3 "http://$1:$2/json/version" 2>/dev/null | grep -q Browser
+host_of() { printf '%s\n' "$1" | sed -E 's|^([a-z]+:)?([^:]+):[0-9]+$|\2|'; }
+driver_of() {
+    case "$1" in
+        marionette:*) echo marionette ;;
+        *) echo cdp ;;
+    esac
 }
 
-wait_for() {                              # wait_for <host> <port> <seconds>
+# Whether a browser is up. DevTools answers an HTTP request and Marionette does
+# not: it is a raw socket that sends its handshake as soon as one connects, so
+# reading a byte of that is the same question asked the other way.
+answers() {                               # answers <driver> <host> <port>
+    if [ "$1" = "marionette" ]; then
+        exec 3<>"/dev/tcp/$2/$3" 2>/dev/null || return 1
+        local head=""
+        read -r -t 3 -n 1 head <&3 2>/dev/null
+        exec 3<&- 2>/dev/null
+        exec 3>&- 2>/dev/null
+        [ -n "$head" ]
+    else
+        curl -s -m 3 "http://$2:$3/json/version" 2>/dev/null | grep -q Browser
+    fi
+}
+
+wait_for() {                              # wait_for <driver> <host> <port> <seconds>
     local i=0
-    while [ "$i" -lt "$3" ]; do
-        answers "$1" "$2" && return 0
+    while [ "$i" -lt "$4" ]; do
+        answers "$1" "$2" "$3" && return 0
         sleep 1; i=$((i + 1))
     done
     return 1
@@ -70,17 +89,22 @@ total=0; diverge=0; accepted=0; failed=""
 for lang in $LANGS; do
     # Local side: down, then up, and only then is it this language's browser.
     eval "$RESTART" > /dev/null 2>&1
-    if ! wait_for "$(host_of "$SIDE_A")" "$(port_of "$SIDE_A")" 40; then
+    if ! wait_for "$(driver_of "$SIDE_A")" "$(host_of "$SIDE_A")" "$(port_of "$SIDE_A")" 40; then
         echo "$lang: local side never answered"; failed="$failed $lang"; continue
     fi
     [ -n "$RESTART_B" ] && eval "$RESTART_B" > /dev/null 2>&1
-    if ! wait_for "$(host_of "$SIDE_B")" "$(port_of "$SIDE_B")" 90; then
+    if ! wait_for "$(driver_of "$SIDE_B")" "$(host_of "$SIDE_B")" "$(port_of "$SIDE_B")" 90; then
         echo "$lang: far side never answered"; failed="$failed $lang"; continue
     fi
 
     set -- "$MODE" "$SIDE_A" "$SIDE_B" --lang "$lang"
     for file in $ACCEPT; do set -- "$@" --accept "$file"; done
     [ -n "$VIEWPORT" ] && set -- "$@" --viewport "$VIEWPORT"
+    # A throwaway pass first; the second one is the measurement. A side that
+    # has drawn other pages answers the first ask for a character out of the
+    # cache those pages filled. This matters for a side with no restart
+    # command, which is never new.
+    timeout 900 python3 "$HERE/font_census.py" "$@" > /dev/null 2>&1
     out=$(timeout 900 python3 "$HERE/font_census.py" "$@" 2>&1)
     [ -n "$OUT" ] && printf '%s\n' "$out" > "$OUT/$MODE-$lang.txt"
 

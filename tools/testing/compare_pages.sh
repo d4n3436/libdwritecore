@@ -35,14 +35,19 @@
 # A side's sixth field is its browser driver, `marionette` for Firefox or
 # `cdp` for Chromium and Electron, and it defaults to marionette.
 #
+# Either kind of side may list several ports comma-separated, one browser
+# instance each; the cells are dealt out across them and a port that does not
+# answer is dropped with a warning. A Marionette side is photographed from its
+# screen, so each of its instances needs a screen of its own. List one backend
+# per port, comma-separated in the same order, or name a guest as
+# guest:<host>, and each instance's capture server is found on its own port
+# plus one, which is where run_parity_firefox.sh guest puts it.
+#
 # When both sides are cdp the sweep takes the direct route, one DevTools
 # connection per browser for the whole plan and one Page.captureScreenshot
 # per cell. The shot is the viewport itself, so there is no marker, no
-# whole-screen photograph and no crop. A cdp side's port field may list
-# several ports comma-separated, one browser instance each; the cells are
-# dealt out across them and a port that does not answer is dropped with a
-# warning. Start the extra instances with run_electron_side.sh under their
-# own DWC_ELECTRON_STATE.
+# whole-screen photograph and no crop. Start extra cdp instances with
+# run_electron_side.sh under their own DWC_ELECTRON_STATE.
 #
 # When any cell differs, a summary after the totals groups the differing
 # clusters whose bounding boxes nearly coincide across cells, since many
@@ -190,6 +195,10 @@ is_accepted() {
     return 1
 }
 
+# Comparisons running at once. One cell is independent of every other, so
+# this is what puts the machine's cores on the slowest part of a sweep.
+COMPARE_WORKERS="${DWC_COMPARE_WORKERS:-16}"
+
 # How long one cell may go undelivered while some sweeper is still alive. A
 # slow page on a loaded machine is ordinary, so only a side that has stopped
 # delivering should reach it.
@@ -300,7 +309,11 @@ if [ "$DIRECT" = 1 ]; then
     # only the first one running.
     SWEEPERS=()
     for i in 0 1; do
-        live=()
+        # The backend field may list one backend per port, in the same order,
+        # for a Marionette side whose instances each need their own screen; a
+        # single backend serves every port.
+        read -ra backends <<< "${BACKENDS[$i]//,/ }"
+        live=(); livebk=(); j=0
         for port in ${PORTS[$i]//,/ }; do
             # DevTools answers an HTTP probe; Marionette is a bare socket.
             if [ "${DRIVERS[$i]}" = cdp ]; then
@@ -310,9 +323,11 @@ if [ "$DIRECT" = 1 ]; then
             fi
             if probe; then
                 live+=("$port")
+                livebk+=("${backends[$j]:-${backends[0]}}")
             else
                 echo "side ${LABELS[$i]}: nothing answers on port $port; sweeping without it" >&2
             fi
+            j=$((j + 1))
         done
         if [ "${#live[@]}" -eq 0 ]; then
             echo "side ${LABELS[$i]}: no port answers" >&2
@@ -326,7 +341,7 @@ if [ "$DIRECT" = 1 ]; then
             if [ "${DRIVERS[$i]}" = cdp ]; then
                 SWEEP=("$HERE/sweep_pages_cdp.py")
             else
-                SWEEP=("$HERE/sweep_pages_marionette.py" "${BACKENDS[$i]}")
+                SWEEP=("$HERE/sweep_pages_marionette.py" "${livebk[$k]}")
             fi
             python3 "${SWEEP[@]}" "${HOSTS[$i]}" "${live[$k]}" \
                     "${PREFIXES[$i]}" "$WIDTH" "$HEIGHT" "${LABELS[$i]}" \
@@ -337,44 +352,83 @@ if [ "$DIRECT" = 1 ]; then
     done
     trap 'kill "${SWEEPERS[@]}" 2>/dev/null; [ "$KEEP" = 1 ] || rm -rf "$SHOTS"' EXIT
 
+    # Comparing is most of a sweep's wall time and one cell says nothing about
+    # another, so it runs in a pool that outlives the loop instead of a fresh
+    # interpreter per cell. Waiting and printing stay here: the dispatcher
+    # feeds cells to the pool as their shots land, and the loop below prints
+    # them in plan order as the pool finishes them.
+    mkfifo "$SHOTS/jobs"
+    python3 "$HERE/compare_viewport.py" --serve "$COMPARE_WORKERS" \
+            < "$SHOTS/jobs" >"$SHOTS/serve.log" 2>&1 &
+    COMPARER=$!
+    exec {JOBFD}>"$SHOTS/jobs"
+    want_clusters=0
+    [ -n "$CLUSTERS" ] && want_clusters="${CLUSTERS##* }"
+
+    (
+        stalled=0
+        for n in $(seq 1 "$CELLS"); do
+            cell="$SHOTS/cell$n"
+            a="$cell/${LABELS[0]}_clean.png"; b="$cell/${LABELS[1]}_clean.png"
+            # A cell needs both sides. Sweepers exit at different times when a
+            # side shards, so one being gone does not mean the sweep is over;
+            # the deadline is what ends the wait when nothing arrives at all.
+            waited=0
+            while [ ! -f "$a" ] || [ ! -f "$b" ]; do
+                alive=0
+                for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+                if [ "$alive" = 0 ]; then break; fi
+                if [ "$waited" -ge "$STALL_TICKS" ]; then
+                    echo "no capture for cell $n in ${STALL_SECONDS}s while a sweeper is still running; treating it as failed" >&2
+                    stalled=$((stalled + 1))
+                    break
+                fi
+                waited=$((waited + 1))
+                sleep 0.05
+            done
+            if [ ! -f "$a" ] || [ ! -f "$b" ]; then
+                : > "$cell/failed"
+                # A side that stopped delivering fails every cell after this
+                # one too, each at the full stall wait, so two in a row ends
+                # the plan.
+                if [ "$stalled" -ge 2 ]; then
+                    echo "$n" > "$SHOTS/lastcell"
+                    break
+                fi
+                continue
+            fi
+            stalled=0
+            printf '%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\n' \
+                   "$n" "$WIDTH" "$HEIGHT" "$a" "$b" "$cell/out" \
+                   "$cell/clusters.tsv" \
+                   "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
+                   "$want_clusters" >&$JOBFD
+        done
+        [ -f "$SHOTS/lastcell" ] || echo "$CELLS" > "$SHOTS/lastcell"
+    ) &
+    DISPATCH=$!
+
     for n in $(seq 1 "$CELLS"); do
         cell="$SHOTS/cell$n"
-        a="$cell/${LABELS[0]}_clean.png"; b="$cell/${LABELS[1]}_clean.png"
-        # A cell needs both sides. Sweepers exit at different times when a
-        # side shards, so one being gone does not mean the sweep is over; the
-        # deadline is what ends the wait when nothing arrives at all.
-        waited=0
-        while [ ! -f "$a" ] || [ ! -f "$b" ]; do
-            alive=0
-            for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
-            if [ "$alive" = 0 ]; then break; fi
-            if [ "$waited" -ge "$STALL_TICKS" ]; then
-                echo "no capture for cell $n in ${STALL_SECONDS}s while a sweeper is still running; treating it as failed" >&2
-                STALLED=$((STALLED + 1))
+        # The dispatcher records where it stopped, so a plan cut short here
+        # stops printing at the same cell.
+        while [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; do
+            if [ -f "$SHOTS/lastcell" ] && [ "$n" -gt "$(cat "$SHOTS/lastcell")" ]; then
                 break
             fi
-            waited=$((waited + 1))
-            sleep 0.05
+            sleep 0.02
         done
-        if [ ! -f "$a" ] || [ ! -f "$b" ]; then
+        if [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; then
+            break
+        fi
+        if [ -f "$cell/failed" ]; then
             printf '%-38s %8s  %10s\n' "${ALL_PATHS[$((n-1))]}" \
                    "${ALL_SCROLLS[$((n-1))]}" "CAPTURE FAILED"
             grep "^fail $n " "$SHOTS/${LABELS[0]}".*.log \
                  "$SHOTS/${LABELS[1]}".*.log 2>/dev/null | sed 's/^/    /' >&2
             FAILED=$((FAILED + 1))
-            # A side that stopped delivering fails every cell after this one
-            # too, each at the full stall wait, so two in a row ends the plan.
-            if [ "$STALLED" -ge 2 ]; then
-                echo "two cells in a row waited out the capture, so one side is not delivering; the rest of the plan is skipped" >&2
-                break
-            fi
             continue
         fi
-        STALLED=0
-        python3 "$HERE/compare_viewport.py" "$WIDTH" "$HEIGHT" "$a" "$b" \
-                --cluster-log "$SHOTS/clusters.tsv" \
-                --cluster-tag "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
-                $CLUSTERS >"$cell/out" 2>&1
         out="$(cat "$cell/out")"
         pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
         max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
@@ -394,7 +448,14 @@ if [ "$DIRECT" = 1 ]; then
             printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
         fi
     done
+    wait "$DISPATCH" 2>/dev/null
+    # Closing the write end is what tells the pool no more cells are coming.
+    exec {JOBFD}>&-
+    wait "$COMPARER" 2>/dev/null
     wait "${SWEEPERS[@]}" 2>/dev/null
+    # Each worker logs its clusters beside its own cell, since several
+    # appending to one file would interleave their rows.
+    cat "$SHOTS"/cell*/clusters.tsv > "$SHOTS/clusters.tsv" 2>/dev/null
     [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
     printf '\n%d of %d identical%s\n' "$EXACT" "$CELLS" \

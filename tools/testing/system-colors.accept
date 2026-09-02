@@ -1,0 +1,12 @@
+# Differences from CSS system color keywords, which resolve to the desktop's
+# own theme and reach no font decision.
+#
+#                 linux              windows
+#     LinkText    rgb(0, 0, 238)     rgb(0, 102, 204)
+#     ButtonFace  rgb(239, 239, 239) rgb(240, 240, 240)
+#
+# text-decoration-color strokes its last line with LinkText.
+# word-spacing-large-value draws a <button>, whose face is ButtonFace.
+wt/external/wpt/css/css-text/crashtests/word-spacing-large-value.html
+wt/external/wpt/css/css-text-decor/text-decoration-color.html
+wt/external/wpt/css/css-text-decor/reference/text-decoration-color-ref.html

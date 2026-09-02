@@ -71,6 +71,7 @@ changes is where the layout diverged.
 Needs pillow and numpy.
 """
 
+import io
 import os
 import struct
 import sys
@@ -145,8 +146,23 @@ def marker_state(path):
     return "marker %d %d %d" % (int(xs.min()), int(ys.min()), len(xs))
 
 
+# The absolute difference of two uint8 images without widening either. The
+# larger minus the smaller never underflows, so the result is exact in uint8.
+def absdiff(a, b):
+    return np.maximum(a, b) - np.minimum(a, b)
+
+
 def crop(path, x, y, w, h):
-    a = np.asarray(Image.open(path).convert("RGB")).astype(int)
+    # Over white, because a capture can carry alpha. Page.captureScreenshot
+    # returns a transparent canvas wherever the page painted no background of
+    # its own, and converting straight to RGB keeps the color under the
+    # transparency, which is black. A page with no background of its own then
+    # reads as differing everywhere against the side that captured opaque.
+    shot = Image.open(path)
+    if shot.mode in ("RGBA", "LA") or "transparency" in shot.info:
+        ground = Image.new("RGBA", shot.size, (255, 255, 255, 255))
+        shot = Image.alpha_composite(ground, shot.convert("RGBA"))
+    a = np.asarray(shot.convert("RGB"))
     out = a[y:y + h, x:x + w]
     if out.shape[0] != h or out.shape[1] != w:
         sys.exit("%s: viewport runs off the screenshot at (%d,%d)" % (path, x, y))
@@ -163,10 +179,10 @@ def bands(a, b, height, count=12, limit=3):
         for dy in range(-limit, limit + 1):
             if lo + dy < 0 or hi + dy > height:
                 continue
-            score = (np.abs(a[lo:hi] - b[lo + dy:hi + dy]).max(axis=2) == 0).mean()
+            score = (absdiff(a[lo:hi], b[lo + dy:hi + dy]).max(axis=2) == 0).mean()
             if best is None or score > best[1]:
                 best = (dy, score)
-        flat = (np.abs(a[lo:hi] - b[lo:hi]).max(axis=2) == 0).mean()
+        flat = (absdiff(a[lo:hi], b[lo:hi]).max(axis=2) == 0).mean()
         note = "" if best[0] == 0 else "   <- content is offset here"
         print("     %5d..%-5d  %+3d      %8.3f%%   %8.3f%%%s"
               % (lo, hi, best[0], 100 * best[1], 100 * flat, note))
@@ -311,8 +327,93 @@ def read_font_version(path):
         revision = struct.unpack_from(">i", data, tables["head"][0] + 4)[0] / 65536.0
     return version, revision
 
+# What a comparison prints. Shared by the command line and the pool, so a
+# cell reads the same either way.
+def report(a, b, cluster_log=None, cluster_tag=None, want_clusters=False,
+           cluster_count=0, want_bands=False, band_count=0, height=0,
+           diff_path=None):
+    d = absdiff(a, b)
+    per_pixel = d.max(axis=2)
+    total = per_pixel.size
+    same = int((per_pixel == 0).sum())
+    print("identical pixels %d/%d = %.4f%%" % (same, total, 100.0 * same / total))
+    print("mean |diff| %.4f   max |diff| %d" % (d.mean(), int(d.max())))
+
+    if same != total:
+        rows = np.nonzero(per_pixel.max(axis=1))[0]
+        cols = np.nonzero(per_pixel.max(axis=0))[0]
+        print("differing rows %d (first %s)" % (len(rows), rows[:6].tolist()))
+        print("differing cols %d" % len(cols))
+        hist = np.bincount(per_pixel[per_pixel > 0].ravel())
+        print("diff histogram:",
+              [(i, int(c)) for i, c in enumerate(hist) if c][:12])
+        if want_bands:
+            bands(a, b, height, band_count)
+        if want_clusters or cluster_log:
+            scored = cluster_runs(per_pixel)
+            if want_clusters:
+                clusters(scored, cluster_count)
+            if cluster_log:
+                log_clusters(cluster_log, cluster_tag or "-", scored)
+        if diff_path:
+            Image.fromarray((per_pixel.astype(np.int16) * 8)
+                            .clip(0, 255).astype(np.uint8)).save(diff_path)
+            print("wrote", diff_path)
+    return same, total
+
+
+# One cell of a sweep, compared in a worker. The result text goes beside the
+# shots as the per-cell `out` file the sweep reads, written through a
+# temporary name so the sweep never sees a partial one. Cluster rows go to a
+# per-cell file, since several workers would otherwise interleave their
+# appends into one log.
+def compare_cell(job):
+    number, width, height, a_path, b_path, out_path, cluster_log, tag, wanted = job
+    buf = io.StringIO()
+    stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        a = crop(a_path, 0, 0, width, height)
+        b = crop(b_path, 0, 0, width, height)
+        print("direct capture %dx%d" % (width, height))
+        report(a, b, cluster_log, tag, wanted > 0, wanted)
+    except BaseException as exc:                     # noqa: BLE001
+        print("compare failed: %s" % exc)
+    finally:
+        sys.stdout = stdout
+    tmp = out_path + ".part"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(buf.getvalue())
+    os.replace(tmp, out_path)
+    return number
+
+
+# Compare the cells named on stdin, several at once. A sweep spends most of
+# its wall time here, and one cell is independent of every other, so the pool
+# is what turns the machine's cores on the problem. One line per cell:
+#   <number> <width> <height> <a.png> <b.png> <out> <cluster-log> <tag> <clusters>
+def serve(workers):
+    import multiprocessing
+    pending = []
+    with multiprocessing.Pool(workers) as pool:
+        for line in sys.stdin:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+            job = (int(parts[0]), int(parts[1]), int(parts[2]), parts[3],
+                   parts[4], parts[5], parts[6] or None, parts[7], int(parts[8]))
+            pending.append(pool.apply_async(compare_cell, (job,)))
+        pool.close()
+        pool.join()
+    for slot in pending:
+        slot.get()
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--serve":
+        return serve(int(args[1]))
     if len(args) == 2 and args[0] == "--aggregate":
         return aggregate_clusters(args[1])
     if len(args) == 2 and args[0] == "--fonts":
@@ -386,33 +487,8 @@ def main():
         print("comparing rows %d..%d only" % (lo, hi))
         a, b = a[lo:hi], b[lo:hi]
 
-    d = np.abs(a - b)
-    per_pixel = d.max(axis=2)
-    total = per_pixel.size
-    same = int((per_pixel == 0).sum())
-    print("identical pixels %d/%d = %.4f%%" % (same, total, 100.0 * same / total))
-    print("mean |diff| %.4f   max |diff| %d" % (d.mean(), int(d.max())))
-
-    if same != total:
-        rows = np.nonzero(per_pixel.max(axis=1))[0]
-        cols = np.nonzero(per_pixel.max(axis=0))[0]
-        print("differing rows %d (first %s)" % (len(rows), rows[:6].tolist()))
-        print("differing cols %d" % len(cols))
-        hist = np.bincount(per_pixel[per_pixel > 0].ravel())
-        print("diff histogram:",
-              [(i, int(c)) for i, c in enumerate(hist) if c][:12])
-        if want_bands:
-            bands(a, b, h, band_count)
-        if want_clusters or cluster_log:
-            scored = cluster_runs(per_pixel)
-            if want_clusters:
-                clusters(scored, cluster_count)
-            if cluster_log:
-                log_clusters(cluster_log, cluster_tag or "-", scored)
-        if diff_path:
-            Image.fromarray((per_pixel * 8).clip(0, 255).astype(np.uint8)).save(diff_path)
-            print("wrote", diff_path)
-
+    same, total = report(a, b, cluster_log, cluster_tag, want_clusters,
+                         cluster_count, want_bands, band_count, h, diff_path)
     return 0 if same == total else 1
 
 

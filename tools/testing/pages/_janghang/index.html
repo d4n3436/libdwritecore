@@ -1,0 +1,13 @@
+<!doctype html><meta charset=utf-8>
+<title>ja-Hang alone</title>
+<style>
+  /* The same div css-text/writing-system/writing-system-line-break-001
+     draws, with nothing before it that asks for the same character
+     under another language. The renderer caches a fallback answer
+     against the character alone, so prose in the page's own language
+     ahead of the div is what decides the answer the div gets. */
+  body { margin: 0; background: #fff; }
+  div { font-family: monospace; font-size: 32px; width: 2em; line-break: loose; }
+</style>
+<body>
+<div lang=ja-Hang>도쿄〜오사카</div>

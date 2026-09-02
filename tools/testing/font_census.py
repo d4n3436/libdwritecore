@@ -169,7 +169,7 @@ def renderable(limit):
     for cp in range(0x21, limit):
         if 0xD800 <= cp <= 0xDFFF:
             continue
-        if unicodedata.category(chr(cp))[0] in "LNSP":
+        if unicodedata.category(chr(cp))[0] in kCategories:
             out.append(cp)
     return out
 
@@ -177,6 +177,13 @@ def renderable(limit):
 # Set from --lang: the content languages a run is restricted to, or None for
 # all of them.
 kOnlyLangs = None
+# The Unicode category letters a census draws. Letters, numbers, symbols and
+# punctuation are the default set; control and format characters are opt-in,
+# since whether a font claims one decides whether a fallback happens at all.
+kCategories = "LNSP"
+# Which text-on-ground pairs raster mode draws its grid in. Light alone is the
+# default; the others are opt-in.
+kSchemes = ("light",)
 
 
 # Set from --configs: (index, count), or None for the whole list.
@@ -984,9 +991,9 @@ def mode_shape(sides, full):
 
 
 GRID = """
-const [chars, lang, generic, size] = JSON.parse(arguments[0]);
+const [chars, lang, generic, size, bg, fg] = JSON.parse(arguments[0]);
 document.body.textContent = '';
-document.body.style.cssText = 'margin:0;background:#fff';
+document.body.style.cssText = 'margin:0;background:' + bg + ';color:' + fg;
 const d = document.createElement('div');
 if (lang) d.lang = lang;
 d.style.cssText = 'display:grid;grid-template-columns:repeat(40, 44px);' +
@@ -1022,6 +1029,12 @@ def mode_raster(sides, full):
                  "not what it paints. Sweep the page set with compare_pages.sh "
                  "instead, whose capture photographs the real window.")
 
+    # Text color decides the mask gamma a glyph is corrected with, through the
+    # luminance the rec carries, so light text on a dark ground is a different
+    # rasterizer decision from the same glyphs the other way round and not the
+    # same picture inverted.
+    schemes = {"light": ("#fff", "#000"), "dark": ("#000", "#fff"),
+               "gray": ("#808080", "#fff")}
     cps = renderable(0x30000) if full else renderable(0x10000)[::16]
     # The quick run keeps to the no-language set. A --lang or --full run
     # takes the per-language rows through keep_lang, the same way fallback
@@ -1033,16 +1046,22 @@ def mode_raster(sides, full):
     if full:
         configs += [("", "serif", 16), ("", "monospace", 16)]
     configs = [row for row in configs if keep_lang(row[0])]
+    configs = [(scheme,) + row for scheme in kSchemes for row in configs]
     cols, cell_w, cell_h = 40, 44, 36
     rows_per_page = 1080 // cell_h
     per_page = cols * rows_per_page
 
     out = {}
     total = 0
-    for lang, generic, size in configs:
+    for scheme, lang, generic, size in configs:
+        bg, fg = schemes[scheme]
+        # Light keeps the unqualified key, so accept entries stay valid; the
+        # other schemes name themselves in the key.
+        tail = "" if scheme == "light" else "|" + scheme
         for start in range(0, len(cps), per_page):
             chunk = cps[start:start + per_page]
-            drawn = json.dumps([[chr(cp) for cp in chunk], lang, generic, size])
+            drawn = json.dumps([[chr(cp) for cp in chunk], lang, generic, size,
+                                bg, fg])
 
             def paint(side):
                 side.evaluate(GRID, [drawn])
@@ -1052,7 +1071,7 @@ def mode_raster(sides, full):
 
             a, b = both_sides(paint, sides)
             if a.shape != b.shape:
-                out["page@%d|%s|%s" % (start, lang or "-", generic)] = \
+                out["page@%d|%s|%s%s" % (start, lang or "-", generic, tail)] = \
                     ("shape %s" % (a.shape,), "shape %s" % (b.shape,))
                 continue
             diff = np.abs(a - b).max(axis=2)
@@ -1074,12 +1093,13 @@ def mode_raster(sides, full):
                     spread = box.max(axis=2) - box.min(axis=2)
                     lit = ((spread > 60) & (box.max(axis=2) > 128)).sum()
                     kind = "color" if lit > box.shape[0] * box.shape[1] * 0.02 else "mono"
-                    out["U+%04X|%s|%s|%d" % (cp, lang or "-", generic, size)] = \
+                    out["U+%04X|%s|%s|%d%s" % (cp, lang or "-", generic, size,
+                                                 tail)] = \
                         ("%d px differ (%s)" % (int((cell > 0).sum()), kind),
                          "max %d" % int(cell.max()))
             total += len(chunk)
-        print("  raster %s/%s: %d codepoints" % (lang or "-", generic, total),
-              file=sys.stderr)
+        print("  raster %s/%s/%s: %d codepoints" % (scheme, lang or "-", generic,
+                                                    total), file=sys.stderr)
     return out, total * 1
 
 
@@ -1147,6 +1167,18 @@ def main():
                     help="take every Nth fallback or raster config, starting at "
                          "I (0-based), so one run can be split across several "
                          "browser pairs. Composes with --lang.")
+    ap.add_argument("--categories", default="LNSP", metavar="LETTERS",
+                    help="the first letters of the Unicode general categories "
+                         "to draw, default LNSP. C adds the control, format "
+                         "and unassigned characters, which no earlier run "
+                         "covered and where a fallback that fires at all is "
+                         "already a divergence")
+    ap.add_argument("--scheme", default="light", metavar="LIST",
+                    help="which text-on-ground pairs raster mode draws in, "
+                         "comma separated from light, dark and gray. The mask "
+                         "gamma a glyph is corrected with follows the text "
+                         "color, so dark is a rasterizer decision of its own "
+                         "and not the light run inverted")
     ap.add_argument("--viewport", default=None, metavar="WxH",
                     help="pin both sides to this viewport, for raster mode on a "
                          "browser whose window size the platforms disagree on")
@@ -1191,6 +1223,13 @@ def main():
             side.mirrors.append(mirror)
     if args.lang is not None:
         globals()["kOnlyLangs"] = set(args.lang.split(","))
+    wanted = tuple(x for x in args.scheme.split(",") if x)
+    for name in wanted:
+        if name not in ("light", "dark", "gray"):
+            sys.exit("unknown --scheme %r; light, dark and gray are the ones "
+                     "raster mode draws" % name)
+    globals()["kSchemes"] = wanted or ("light",)
+    globals()["kCategories"] = args.categories or "LNSP"
     if args.configs is not None:
         index, _, count = args.configs.partition("/")
         if not count or not index.isdigit() or not count.isdigit() or int(count) == 0:
