@@ -47,6 +47,9 @@ bool HasEbdt(const std::vector<uint8_t>& font, uint32_t face_index = 0);
 // parity substitutions have to stand aside and let plain Fontations answer,
 // which is what both platforms then run. Segoe UI Emoji is the one COLRv1
 // face the Windows install itself carries, and it stays on DirectWrite.
+//
+// The avar2 rule is the one that depends on which Chromium is running, so
+// the answer is not a function of the bytes alone; see ChromiumMilestone.
 bool FontationsPreferred(const std::vector<uint8_t>& font, uint32_t face_index = 0);
 
 // Everything the Windows decision tree wants to know about this font, at the

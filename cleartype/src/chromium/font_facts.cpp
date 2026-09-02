@@ -19,6 +19,8 @@
 
 #include "font_facts.h"
 
+#include "parity_gate.h"
+
 #include "../windows_fonts.h"
 
 #include <cstring>
@@ -294,13 +296,24 @@ static std::string WindowsFamilyName(const std::vector<uint8_t>& font,
     return {};
 }
 
+// Whether this Chromium's WebFontTypefaceFactory routes an avar version 2
+// font to Fontations. The rule arrived in milestone 148; before it such a
+// font matches no rule of its own and takes the ordinary variable path
+// through DWriteCore. A host that names no version keeps the newer behavior.
+static bool HasAvar2Rule()
+{
+    constexpr int kAvar2Milestone = 148;
+    const int milestone = chromium_patch::ChromiumMilestone();
+    return milestone == 0 || milestone >= kAvar2Milestone;
+}
+
 bool FontationsPreferred(const std::vector<uint8_t>& font, const uint32_t face_index)
 {
     if (font.empty()) {
         return false;
     }
     const Span avar = FindTable(font, Tag('a', 'v', 'a', 'r'), face_index);
-    if (avar.data != nullptr && avar.size >= 2 && Be16(avar.data) >= 2) {
+    if (avar.data != nullptr && avar.size >= 2 && Be16(avar.data) >= 2 && HasAvar2Rule()) {
         return true;
     }
     if (FindTable(font, Tag('C', 'F', 'F', '2'), face_index).data != nullptr) {

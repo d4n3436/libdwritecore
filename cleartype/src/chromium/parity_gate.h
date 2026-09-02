@@ -1,6 +1,7 @@
 //+--------------------------------------------------------------------------
 //
-//  parity_gate.h - whether this process wants the Windows behavior.
+//  parity_gate.h - whether this process wants the Windows behavior, and
+//  which Chromium it is.
 //
 //  Off unless asked for. With it off nothing here touches a typeface,
 //  answers a fontconfig query or reorders fallback.
@@ -24,10 +25,17 @@ namespace chromium_patch {
 // off.
 bool ParityWanted();
 
+// The Chromium milestone the host was built from, or 0 when no loaded image
+// names one. Blink's web font routing differs between the milestones in use,
+// so a rule that mirrors it has to know which one is running. A release
+// build is stripped, so the answer comes from the image's own strings.
+int ChromiumMilestone();
+
 #else
 
 // Built without the Chromium patch, so nothing of it applies.
 inline bool ParityWanted() { return false; }
+inline int ChromiumMilestone() { return 0; }
 
 #endif
 
