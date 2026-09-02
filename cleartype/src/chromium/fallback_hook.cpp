@@ -183,6 +183,15 @@ bool Hook(const int marked, const void* locale, void* out)
     if (!chromium_patch::ParityWanted()) {
         return g_original(c, locale, out);
     }
+    // No font claims the C1 controls, so the run keeps its own font and draws
+    // its .notdef box. Declining here says that: font_cache_linux.cc's
+    // PlatformFallbackFontForCharacter returns null as soon as
+    // GetFontForCharacter fails, and the fallback iterator carries on with the
+    // family already in hand. Without this, fontconfig answers Webdings, whose
+    // charset claims the range.
+    if (c >= 0x0080 && c <= 0x009F) {
+        return false;
+    }
     // A measured DirectWrite row is asked first, because the pass-through
     // below relies on a sorted set this build never makes. FcFontSort is what
     // puts Times New Roman and the run's Han family in front, and a static

@@ -72,14 +72,11 @@ T Sym(const char* name)
 }
 
 // The scripts that actually differ. Latin and the rest already agree, because
-// fontconfig and the table reach the same family for them.
-struct ScriptFonts
-{
-    unsigned first;
-    unsigned last;
-    const char* const* families;
-    unsigned count;
-};
+// fontconfig and the table reach the same family for them. The row is the
+// header's own type, so the table can be handed out without a cast: two
+// layout-identical types are still distinct to the aliasing rules, and the
+// reads a caller makes through the wrong one are undefined.
+using ScriptFonts = fallback_order::ScriptRow;
 
 // A candidate only counts if a stock Windows 11 would have it. Chromium's
 // lists name fonts that may or may not be present on any given machine, and
@@ -653,18 +650,31 @@ struct HanChoice
 // has_script_for_han_ clear, and LocaleForHan tests that flag.
 const char* const* HanForLocale(const char* locale, unsigned* count)
 {
-    // ScriptCodeForHanFromRegion, plus the four-letter script names
-    // IsUnambiguousHanScript accepts.
+    // The script names ToSkFontMgrLocale answers, which layout_locale.cc
+    // resolves before anything else:
+    //
+    //     USCRIPT_KATAKANA_OR_HIRAGANA -> "ja"   USCRIPT_HANGUL -> "ko"
+    //     USCRIPT_SIMPLIFIED_HAN -> "zh-Hans"    USCRIPT_TRADITIONAL_HAN -> "zh-Hant"
+    //
+    // The Windows fallback is handed that string; Linux is handed the locale as
+    // written, so ja-Hang has to resolve its script subtag here.
+    static const HanChoice kScriptChoices[] = {
+        {"hant", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
+        {"hans", kSimplifiedHan, DWC_COUNT(kSimplifiedHan)},
+        {"jpan", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+        {"kana", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+        {"hira", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
+        {"kore", kHangul, DWC_COUNT(kHangul)},
+        {"hang", kHangul, DWC_COUNT(kHangul)},
+    };
+    // ScriptCodeForHanFromRegion. A region names a script only when the
+    // language did not, so it is consulted after the language.
     static const HanChoice kChoices[] = {
         {"hk", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
         {"mo", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
         {"tw", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
         {"jp", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
         {"kr", kHangul, DWC_COUNT(kHangul)},
-        {"hant", kTraditionalHan, DWC_COUNT(kTraditionalHan)},
-        {"hans", kSimplifiedHan, DWC_COUNT(kSimplifiedHan)},
-        {"jpan", kKatakanaOrHiragana, DWC_COUNT(kKatakanaOrHiragana)},
-        {"kore", kHangul, DWC_COUNT(kHangul)},
     };
     if (locale == nullptr) {
         return nullptr;
@@ -678,6 +688,29 @@ const char* const* HanForLocale(const char* locale, unsigned* count)
            locale[n] != '_' && locale[n] != '.' && locale[n] != '@') {
         head[n] = static_cast<char>(tolower(static_cast<unsigned char>(locale[n])));
         ++n;
+    }
+    // The script subtag first, wherever it sits, because that is the order
+    // layout_locale.cc reads them in.
+    for (const char* p = locale; *p != '\0' && *p != '.' && *p != '@';) {
+        if (*p != '-' && *p != '_') {
+            ++p;
+            continue;
+        }
+        ++p;
+        char sub[8] = {};
+        unsigned k = 0;
+        while (k + 1 < sizeof(sub) && p[k] != '\0' && p[k] != '-' &&
+               p[k] != '_' && p[k] != '.' && p[k] != '@') {
+            sub[k] = static_cast<char>(tolower(static_cast<unsigned char>(p[k])));
+            ++k;
+        }
+        for (const HanChoice& c : kScriptChoices) {
+            if (std::strcmp(sub, c.subtag) == 0) {
+                *count = c.count;
+                return c.families;
+            }
+        }
+        p += k;
     }
     if (std::strcmp(head, "ja") == 0) {
         *count = DWC_COUNT(kKatakanaOrHiragana);
@@ -820,9 +853,22 @@ struct DWriteFallback
     // the family an unsettled run takes; each route finds the run's own. Rows
     // without it are answered by the per-character walk alone.
     const char* front;
+    // Set where DirectWrite answers with `family` even though the pan-Unicode
+    // list also covers the character; the family is then walked ahead of the
+    // list. The halfwidth katakana marks answer from MS PGothic, which Yu
+    // Gothic in the list also covers.
+    bool ahead;
 };
 
 constexpr DWriteFallback kDWriteFallback[] = {
+    // Vertical and halfwidth forms no language family claims. Under ja, zh-CN
+    // and zh-TW the run's own family answers these; these rows are what the
+    // walk reaches otherwise.
+    {0xFE32, 0xFE32, "Microsoft JhengHei UI", nullptr},  // two em dash
+    {0xFE47, 0xFE48, "Microsoft JhengHei UI", nullptr},  // vertical brackets
+    {0xFF65, 0xFF65, "MS PGothic", nullptr, true},       // halfwidth middle dot
+    {0xFF70, 0xFF70, "MS PGothic", nullptr, true},       // prolonged sound mark
+    {0xFF9E, 0xFF9F, "MS PGothic", nullptr, true},       // sound marks
     // Mtavruli, which arrived in Unicode 11 and which Sylfaen never gained.
     {0x1C90, 0x1CBF, "Segoe UI", nullptr},
     {0x1CD0, 0x1CFF, "Nirmala UI", nullptr},    // Vedic extensions
@@ -1195,16 +1241,13 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
 namespace fallback_order {
 
 // The script table, for a caller that has to state the order up front.
-// ScriptRow and ScriptFonts are the same shape; the header declares the one
-// the callers see so they need nothing else out of this file.
+// The table's own rows, which are the header's type already.
 const ScriptRow* Scripts(unsigned* count)
 {
-    static_assert(sizeof(ScriptRow) == sizeof(ScriptFonts),
-                  "the exported row must match the table's own");
     if (count != nullptr) {
         *count = static_cast<unsigned>(sizeof(kScripts) / sizeof(kScripts[0]));
     }
-    return reinterpret_cast<const ScriptRow*>(kScripts);
+    return kScripts;
 }
 
 // The Han candidates one language names, for a caller that has to state the
@@ -1252,6 +1295,14 @@ const char* DWriteRowFamily(const int row)
 }
 
 unsigned DWriteRowCount() { return DWC_COUNT(kDWriteFallback); }
+
+bool DWriteRowAhead(const int row)
+{
+    if (row < 0 || static_cast<unsigned>(row) >= DWC_COUNT(kDWriteFallback)) {
+        return false;
+    }
+    return kDWriteFallback[row].ahead;
+}
 
 const char* DWriteRowFront(const int row)
 {

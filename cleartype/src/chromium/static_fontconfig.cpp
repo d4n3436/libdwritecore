@@ -645,6 +645,12 @@ std::string RulesBlock()
         // names, then the list, then DirectWrite's own answer, which is the
         // order Windows reads them in.
         std::string body;
+        // A row that answers ahead of the list answers ahead of the script's
+        // families too, since those carry the family the list would have used.
+        const bool ahead = fallback_order::DWriteRowAhead(static_cast<int>(row));
+        if (ahead && named != nullptr) {
+            body += edit(named);
+        }
         unsigned script_count = 0;
         const char* const* script = fallback_order::FamiliesFor(
             fallback_order::DWriteRowFirst(static_cast<int>(row)), &script_count);
@@ -655,7 +661,7 @@ std::string RulesBlock()
             }
         }
         body += pan;
-        if (named != nullptr) {
+        if (!ahead && named != nullptr) {
             body += edit(named);
         }
         const auto block = [&out](const char* tag, const std::string& text) {
@@ -877,10 +883,55 @@ int TagFor(const char* family)
     return -1;
 }
 
+// The locale layout_locale.cc's ToSkFontMgrLocale answers for a script subtag,
+// which it reads before the language. Null where the locale carries none of
+// the four scripts it names.
+const char* ScriptLocale(const char* locale)
+{
+    struct Named
+    {
+        const char* subtag;
+        const char* locale;
+    };
+    static const Named kNamed[] = {
+        {"hant", "zh-hant"}, {"hans", "zh-hans"}, {"jpan", "ja"},
+        {"kana", "ja"},      {"hira", "ja"},      {"kore", "ko"},
+        {"hang", "ko"},
+    };
+    for (const char* p = locale; *p != '\0' && *p != '.' && *p != '@';) {
+        if (*p != '-' && *p != '_') {
+            ++p;
+            continue;
+        }
+        ++p;
+        char sub[8] = {};
+        unsigned k = 0;
+        while (k + 1 < sizeof(sub) && p[k] != '\0' && p[k] != '-' && p[k] != '_' &&
+               p[k] != '.' && p[k] != '@') {
+            sub[k] = static_cast<char>(tolower(static_cast<unsigned char>(p[k])));
+            ++k;
+        }
+        for (const Named& n : kNamed) {
+            if (::strcmp(sub, n.subtag) == 0) {
+                return n.locale;
+            }
+        }
+        p += k;
+    }
+    return nullptr;
+}
+
 int HanLocaleIndex(const char* locale)
 {
     if (locale == nullptr || *locale == '\0') {
         return -1;
+    }
+    if (const char* named = ScriptLocale(locale); named != nullptr) {
+        for (size_t i = 0; i < kLangHanCount; ++i) {
+            if (::strcasecmp(named, kLangHan[i].locale) == 0) {
+                return static_cast<int>(i);
+            }
+        }
     }
     // Longest first, so zh-hant is not read as a bare zh and zh-tw not as one
     // of the zh-hans rows.

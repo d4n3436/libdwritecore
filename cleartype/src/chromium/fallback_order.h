@@ -60,6 +60,10 @@ unsigned DWriteRowCount();
 // build with no sorted set to watch reads it.
 const char* DWriteRowFront(int row);
 
+// Whether the row's family is walked ahead of the pan-Unicode list, for
+// characters that list already covers with another family.
+bool DWriteRowAhead(int row);
+
 // The first codepoint the row covers, which names the script families that
 // come before it.
 unsigned DWriteRowFirst(int row);
@@ -106,6 +110,7 @@ inline int DWriteRowFor(unsigned) { return -1; }
 inline const char* DWriteRowFamily(int) { return nullptr; }
 inline unsigned DWriteRowCount() { return 0; }
 inline const char* DWriteRowFront(int) { return nullptr; }
+inline bool DWriteRowAhead(int) { return false; }
 inline unsigned DWriteRowFirst(int) { return 0; }
 inline const char* SetOrderFront(unsigned) { return nullptr; }
 
