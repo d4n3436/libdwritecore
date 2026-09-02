@@ -61,6 +61,7 @@
 #include "bold_shaping.h"
 #include "bold_weight.h"
 #include "colr_outline.h"
+#include "fault_report.h"
 #include "weight_style.h"
 #include "dwrite_raster.h"
 #include "render_params.h"
@@ -3128,6 +3129,22 @@ void OnChromiumMetricsPre(void* context, const void* glyph)
     }
     const skia_abi::Glyph g = skia_abi::Glyph::From(glyph);
     const skia_abi::Rec rec = skia_abi::Rec::From(context);
+    // A typeface Windows renders through plain Fontations is measured there by
+    // this same generateMetrics, which never puts the subpixel position in the
+    // matrix, so the box it rounds out must not carry the position either.
+    // Only the faces that reach SkScalerContext_DW on Windows get it.
+    auto* typeface = skia_abi::Read<void*>(context, skia_abi::kContextTypeface);
+    FontBytes font;
+    bool plain = false;
+    if (typeface != nullptr) {
+        const std::lock_guard lock(g_font_mutex);
+        font = FontBytesLocked(typeface);
+        plain = PlainFontationsLocked(typeface, *font);
+    }
+    if (plain) {
+        colr_outline::SetPhase(0, 0, 0, 0);
+        return;
+    }
     float phase_x = 0;
     float phase_y = 0;
     float sub_x = 0;
@@ -3251,6 +3268,23 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
             Report("  box: glyph %u mask=%u bits=%u substituted=%d", g.GlyphId(),
                    static_cast<unsigned>(metrics_mask), static_cast<unsigned>(metrics_bits),
                    use != font.get() ? 1 : 0);
+        }
+    }
+    // A color glyph keeps the box the bounds walk measured, so that box and
+    // the subpixel position it was measured at are what say whether the walk
+    // saw the position at all.
+    if (static const bool tell_color = std::getenv("DWC_COLOR_BOX_LOG") != nullptr;
+        tell_color && metrics_mask == skia_abi::kARGB32) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+            float box[4] = {};
+            std::memcpy(box, static_cast<const unsigned char*>(result) + skia_abi::kMetricsBounds,
+                        sizeof(box));
+            Report("  color box: glyph %u (%.4f %.4f %.4f %.4f) sub %.3f,%.3f size %.3f",
+                   g.GlyphId(), static_cast<double>(box[0]), static_cast<double>(box[1]),
+                   static_cast<double>(box[2]), static_cast<double>(box[3]),
+                   static_cast<double>(g.SubX()) / 4.0, static_cast<double>(g.SubY()) / 4.0,
+                   static_cast<double>(d.text_size_render));
         }
     }
     // A substituted face is asked for its box too, and it is the box that
@@ -3582,6 +3616,8 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
 
 __attribute__((constructor)) static void ChromiumPatchInit()
 {
+    // First, so a fault anywhere below is reported.
+    fault_report::InstallAtLoad();
     ScanLoadedImages();
     // Reading a symbol table needs the filesystem, and a build that compiles
     // HarfBuzz in is only reachable through one.

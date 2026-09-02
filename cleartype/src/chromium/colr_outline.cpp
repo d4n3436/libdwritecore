@@ -105,18 +105,47 @@ NextStopFn g_next_stop = nullptr;
 NumStopsFn g_num_stops = nullptr;
 
 DrawFn g_draw = nullptr;
-FillGlyphRadialFn g_fill_glyph_radial = nullptr;
 ClipBoxFn g_clip_box = nullptr;
-PushTransformFn g_push_transform = nullptr;
-PopTransformFn g_pop_transform = nullptr;
-FillGlyphLinearFn g_fill_glyph_linear = nullptr;
-PushClipRectFn g_push_clip_rect = nullptr;
-FillGlyphLinearFn g_fill_glyph_sweep = nullptr;
-PushClipGlyphFn g_push_clip_glyph = nullptr;
-PopClipFn g_pop_clip = nullptr;
-FillParamsFn g_fill_linear = nullptr;
-FillParamsFn g_fill_radial = nullptr;
-FillParamsFn g_fill_sweep = nullptr;
+
+// The methods one painter vtable held before its slots were replaced. Two
+// painter classes reach draw_colr_glyph, the drawing one and BoundsPainter,
+// and they carry different implementations in the same slots, so the originals
+// are kept per vtable and never in one variable per slot.
+struct PainterOps
+{
+    void** vtable = nullptr;
+    FillGlyphRadialFn fill_glyph_radial = nullptr;
+    PushTransformFn push_transform = nullptr;
+    PopTransformFn pop_transform = nullptr;
+    FillGlyphLinearFn fill_glyph_linear = nullptr;
+    PushClipRectFn push_clip_rect = nullptr;
+    FillGlyphLinearFn fill_glyph_sweep = nullptr;
+    PushClipGlyphFn push_clip_glyph = nullptr;
+    PopClipFn pop_clip = nullptr;
+    FillParamsFn fill_linear = nullptr;
+    FillParamsFn fill_radial = nullptr;
+    FillParamsFn fill_sweep = nullptr;
+};
+
+constexpr int kMaxPainters = 8;
+PainterOps g_painter[kMaxPainters];
+std::atomic<int> g_painters{0};
+
+// The originals for whichever class `self` belongs to, by its own vtable.
+const PainterOps* OpsFor(const void* self)
+{
+    if (self == nullptr) {
+        return nullptr;
+    }
+    void* const* vtable = *reinterpret_cast<void* const* const*>(self);
+    const int count = g_painters.load(std::memory_order_acquire);
+    for (int i = 0; i < count; ++i) {
+        if (g_painter[i].vtable == vtable) {
+            return &g_painter[i];
+        }
+    }
+    return nullptr;
+}
 
 // outlines, glyph, size, coords, hinting instance, the two rust::Vec outputs
 // and the metrics the caller reads back.
@@ -397,6 +426,11 @@ bool SplitFills(void* self)
 void FillGlyphRadialHook(void* self, const uint16_t glyph, const Transform* transform,
                          const RadialParams* params, void* stops, const uint8_t extend)
 {
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
+        return;
+    }
+
     static const bool say = std::getenv("DWC_COLR_PAINT") != nullptr;
     // Walking the stops consumes the iterator, so the layer this call was about
     // draws empty. Only under DWC_COLR_STOPS, where that is the point.
@@ -408,34 +442,44 @@ void FillGlyphRadialHook(void* self, const uint16_t glyph, const Transform* tran
         }
     }
     if (transform != nullptr && SplitFills(self)) {
-        g_push_clip_glyph(self, glyph);
-        g_push_transform(self, transform);
-        g_fill_radial(self, params, stops, extend);
-        g_pop_transform(self);
-        g_pop_clip(self);
+        ops->push_clip_glyph(self, glyph);
+        ops->push_transform(self, transform);
+        ops->fill_radial(self, params, stops, extend);
+        ops->pop_transform(self);
+        ops->pop_clip(self);
         return;
     }
-    g_fill_glyph_radial(self, glyph, transform, params, stops, extend);
+    ops->fill_glyph_radial(self, glyph, transform, params, stops, extend);
 }
 
 void FillGlyphSweepHook(void* self, const uint16_t glyph, const Transform* t, const void* params,
                         void* stops, const uint8_t extend)
 {
-    if (t != nullptr && SplitFills(self)) {
-        g_push_clip_glyph(self, glyph);
-        g_push_transform(self, t);
-        g_fill_sweep(self, params, stops, extend);
-        g_pop_transform(self);
-        g_pop_clip(self);
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
         return;
     }
-    g_fill_glyph_sweep(self, glyph, t, params, stops, extend);
+
+    if (t != nullptr && SplitFills(self)) {
+        ops->push_clip_glyph(self, glyph);
+        ops->push_transform(self, t);
+        ops->fill_sweep(self, params, stops, extend);
+        ops->pop_transform(self);
+        ops->pop_clip(self);
+        return;
+    }
+    ops->fill_glyph_sweep(self, glyph, t, params, stops, extend);
 }
 
 int g_depth = 0;
 
 void PushTransformHook(void* self, const Transform* t)
 {
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
+        return;
+    }
+
     if (t != nullptr && g_depth < 24) {
         (void)std::fprintf(stderr,
                            "chromium-patch: colr xform [%d]: depth %d [%.6f %.6f %.6f %.6f "
@@ -446,18 +490,28 @@ void PushTransformHook(void* self, const Transform* t)
                            static_cast<double>(t->dy));
     }
     ++g_depth;
-    g_push_transform(self, t);
+    ops->push_transform(self, t);
 }
 
 void PopTransformHook(void* self)
 {
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
+        return;
+    }
+
     --g_depth;
-    g_pop_transform(self);
+    ops->pop_transform(self);
 }
 
 void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, const void* params,
                          void* stops, const uint8_t extend)
 {
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
+        return;
+    }
+
     static const bool say = std::getenv("DWC_COLR_XFORM") != nullptr;
     const auto* p = static_cast<const float*>(params);
     if (say && t != nullptr && p != nullptr) {
@@ -472,14 +526,14 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
                            static_cast<double>(t->dx), static_cast<double>(t->dy));
     }
     if (t != nullptr && SplitFills(self)) {
-        g_push_clip_glyph(self, glyph);
-        g_push_transform(self, t);
-        g_fill_linear(self, params, stops, extend);
-        g_pop_transform(self);
-        g_pop_clip(self);
+        ops->push_clip_glyph(self, glyph);
+        ops->push_transform(self, t);
+        ops->fill_linear(self, params, stops, extend);
+        ops->pop_transform(self);
+        ops->pop_clip(self);
         return;
     }
-    g_fill_glyph_linear(self, glyph, t, params, stops, extend);
+    ops->fill_glyph_linear(self, glyph, t, params, stops, extend);
 }
 
 // skrifa forwards the glyph's own COLRv1 clip box through push_clip_rectangle,
@@ -491,6 +545,11 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
 // unrounded box, which is what Windows measures.
 void PushClipRectangleHook(void* self, float x_min, float y_min, float x_max, float y_max)
 {
+    const PainterOps* ops = OpsFor(self);
+    if (ops == nullptr) {
+        return;
+    }
+
     static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
     if (!clip_off && t_source.upem != 0 && t_source.render_size > 0) {
         auto** vtable = *reinterpret_cast<void***>(self);
@@ -505,8 +564,45 @@ void PushClipRectangleHook(void* self, float x_min, float y_min, float x_max, fl
             y_max = (std::round(y_max * s - oy) + oy) / s;
         }
     }
-    g_push_clip_rect(self, x_min, y_min, x_max, y_max);
+    ops->push_clip_rect(self, x_min, y_min, x_max, y_max);
 }
+// A color glyph's bounds come from this box. generateColorV1Metrics in
+// SkScalerContext_win_dw.cpp maps it with the subpixel position already in
+// the matrix:
+//
+//     matrix = fSkXform; matrix.preScale(scale, scale);
+//     if (this->isSubpixel())
+//       matrix.postTranslate(SkFixedToScalar(glyph.getSubXFixed()), ...);
+//     *bounds = sk_rect_from(clipBox); matrix.mapRect(bounds);
+//
+// The Fontations generateMetrics maps it through fRemainingMatrix alone, so
+// its box is a pixel narrow whenever the position carries an edge past the
+// next one and the mask loses a column. The offset is applied before Skia
+// rounds the box out, so the position sits inside the rounding.
+//
+// The box arrives scaled by the size the caller asked for, in the paint
+// tree's y-up space. phase_x and phase_y are the position divided by the whole
+// matrix, so multiplying by that size lands them in the box's space; y is
+// subtracted because the tree's y grows upward.
+bool ClipBoxReplacement(const void* font_ref, const void* coords, const uint16_t glyph,
+                        const float size, ClipBox* out)
+{
+    const bool ok = g_clip_box(font_ref, coords, glyph, size, out);
+    static const bool phase_off = dwcft::IsOffValue(std::getenv("DWC_COLR_SUBPIXEL")) ||
+                                  dwcft::IsOffValue(std::getenv("DWC_COLR_BOXPHASE"));
+    if (!ok || out == nullptr || phase_off ||
+        (t_source.phase_x == 0.0f && t_source.phase_y == 0.0f)) {
+        return ok;
+    }
+    const float dx = t_source.phase_x * size;
+    const float dy = t_source.phase_y * size;
+    out->x_min += dx;
+    out->x_max += dx;
+    out->y_min -= dy;
+    out->y_max -= dy;
+    return ok;
+}
+
 // Patch the painter's vtable once per distinct table. The object is built on
 // the stack of drawCOLRGlyph, so the vtable is what persists, not the object.
 void PatchPainter(void* painter)
@@ -515,28 +611,31 @@ void PatchPainter(void* painter)
         return;
     }
     auto** vtable = *reinterpret_cast<void***>(painter);
-    static void** patched[8] = {};
-    static int patched_count = 0;
+    const int patched_count = g_painters.load(std::memory_order_acquire);
     for (int i = 0; i < patched_count; ++i) {
-        if (patched[i] == vtable) {
+        if (g_painter[i].vtable == vtable) {
             return;
         }
     }
-    if (patched_count >= 8) {
+    if (patched_count >= kMaxPainters) {
         return;
     }
-    patched[patched_count++] = vtable;
-    g_fill_glyph_radial = reinterpret_cast<FillGlyphRadialFn>(vtable[kFillGlyphRadial]);
-    g_push_transform = reinterpret_cast<PushTransformFn>(vtable[kPushTransform]);
-    g_pop_transform = reinterpret_cast<PopTransformFn>(vtable[kPopTransform]);
-    g_fill_glyph_linear = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphLinear]);
-    g_push_clip_rect = reinterpret_cast<PushClipRectFn>(vtable[kPushClipRectangle]);
-    g_fill_glyph_sweep = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphSweep]);
-    g_push_clip_glyph = reinterpret_cast<PushClipGlyphFn>(vtable[kPushClipGlyph]);
-    g_pop_clip = reinterpret_cast<PopClipFn>(vtable[kPopClip]);
-    g_fill_linear = reinterpret_cast<FillParamsFn>(vtable[kFillLinear]);
-    g_fill_radial = reinterpret_cast<FillParamsFn>(vtable[kFillRadial]);
-    g_fill_sweep = reinterpret_cast<FillParamsFn>(vtable[kFillSweep]);
+    PainterOps& ops = g_painter[patched_count];
+    ops.vtable = vtable;
+    ops.fill_glyph_radial = reinterpret_cast<FillGlyphRadialFn>(vtable[kFillGlyphRadial]);
+    ops.push_transform = reinterpret_cast<PushTransformFn>(vtable[kPushTransform]);
+    ops.pop_transform = reinterpret_cast<PopTransformFn>(vtable[kPopTransform]);
+    ops.fill_glyph_linear = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphLinear]);
+    ops.push_clip_rect = reinterpret_cast<PushClipRectFn>(vtable[kPushClipRectangle]);
+    ops.fill_glyph_sweep = reinterpret_cast<FillGlyphLinearFn>(vtable[kFillGlyphSweep]);
+    ops.push_clip_glyph = reinterpret_cast<PushClipGlyphFn>(vtable[kPushClipGlyph]);
+    ops.pop_clip = reinterpret_cast<PopClipFn>(vtable[kPopClip]);
+    ops.fill_linear = reinterpret_cast<FillParamsFn>(vtable[kFillLinear]);
+    ops.fill_radial = reinterpret_cast<FillParamsFn>(vtable[kFillRadial]);
+    ops.fill_sweep = reinterpret_cast<FillParamsFn>(vtable[kFillSweep]);
+    // Published before a slot is written, so a call arriving on the first
+    // patched slot already finds this class's originals.
+    g_painters.store(patched_count + 1, std::memory_order_release);
     const long page = ::sysconf(_SC_PAGESIZE);
     auto* slot = reinterpret_cast<unsigned char*>(&vtable[0]);
     auto* base = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(slot) &
@@ -745,6 +844,13 @@ void InstallAtLoad()
             g_num_stops = reinterpret_cast<NumStopsFn>(address);
         }
     }
+    if (g_clip_box != nullptr) {
+        const unsigned boxed = code_patch::RedirectCalls(
+            image.text, image.size, reinterpret_cast<const unsigned char*>(g_clip_box),
+            reinterpret_cast<void*>(&ClipBoxReplacement));
+        Say("get_colrv1_clip_box call sites rewritten", boxed);
+    }
+
     // The vector shims, one set per element type.
     for (const auto& [name, address] : hb_abi::SymbolsWithPrefix("cxxbridge1$rust_vec$")) {
         VecOps* ops = nullptr;

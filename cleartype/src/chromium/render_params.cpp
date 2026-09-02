@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "code_patch.h"
+#include "fault_report.h"
 #include "skia_abi.h"
 
 namespace render_params {
@@ -22,6 +23,10 @@ namespace render_params {
 void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
                         const bool plain_fontations)
 {
+    // The first rec a process filters is the earliest point the shim runs with
+    // the host up, so the fault handler is reinstalled here in case the host's
+    // own crash handling replaced it.
+    fault_report::Ensure();
     auto* bytes = static_cast<unsigned char*>(rec);
     auto mask_format = skia_abi::Read<uint8_t>(bytes, skia_abi::kRecMaskFormat);
     auto flags = skia_abi::Read<uint16_t>(bytes, skia_abi::kRecFlags);
@@ -43,8 +48,16 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
         const char* v = std::getenv("DWC_AS_PATHS");
         return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
     }();
+    // The size is what names that strike. setupForAsPaths pins it to the
+    // canonical 64 and folds the real size into the matrix, so a rec at any
+    // other size never came from it. Hinting none does not name it on its own:
+    // font_render_params_linux.cc turns hinting off for every rec once the
+    // device scale is above one, and a strike unhinted only for that reason
+    // still wants the ClearType mask Windows fills.
+    const auto rec_text_size = skia_abi::Read<float>(bytes, skia_abi::kRecTextSize);
     const bool as_paths =
         !paths_off &&
+        rec_text_size == static_cast<float>(skia_abi::kCanonicalTextSizeForPaths) &&
         ((flags_before_filter & skia_abi::kHintingMask) >> skia_abi::kHintingShift) ==
             skia_abi::kHintingNone &&
         (flags_before_filter & skia_abi::kEmbeddedBitmapText) == 0;
@@ -54,7 +67,7 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
     // (too_big_for_lcd, SkScalerContext.cpp). MakeRecAndEffects tests the
     // post-2x2 area when the device matrix carried one, which an identity
     // post-2x2 says it did not.
-    const auto text_size = skia_abi::Read<float>(bytes, skia_abi::kRecTextSize);
+    const float text_size = rec_text_size;
     const auto p00 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2);
     const auto p01 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2 + 4);
     const auto p10 = skia_abi::Read<float>(bytes, skia_abi::kRecPost2x2 + 8);
@@ -215,6 +228,43 @@ extern "C" void ChromiumFontRenderParams(void*, void* param_out)
     std::memcpy(p + kFieldSubpixelRendering, &subpixel, sizeof(subpixel));
 }
 
+// The trace name gfx::GetFontRenderParams gives itself, and the only string
+// that function holds.
+constexpr char kQueryName[] = "gfx::GetFontRenderParams";
+
+// GetFontRenderParams(const FontRenderParamsQuery&, std::string*). The result
+// is twenty bytes, so it comes back through a pointer the caller passes.
+using QueryFn = void* (*)(void*, const void*, void*);
+QueryFn g_query = nullptr;
+
+// What fontconfig answered is not the last word. GetFontRenderParams states
+// two answers of its own afterwards, both keyed on the device scale:
+//
+//     params.subpixel_positioning = actual_query.device_scale_factor > 1.0f;
+//     if (params.subpixel_positioning)
+//       params.hinting = FontRenderParams::HINTING_NONE;
+//
+// font_render_params_win.cc never reads the scale, so those two lines are the
+// whole of what makes a scaled Linux answer differ from the Windows one, and
+// the answers here are the Windows ones again.
+//
+// Windows turns subpixel positioning on and this turns it off, because on
+// Linux the field has a second reader. font_metrics.cc moves a unit from the
+// ascent to the descent whenever the descent rounds down and the field is
+// set, under a BUILDFLAG(IS_LINUX) that Windows has no counterpart for, which
+// is a device pixel of baseline on every line of text. ApplyWindowsParams
+// already sets the positioning on every rec, so the field has nothing left to
+// decide, and scale one has always rendered with it off.
+extern "C" void* ChromiumQuery(void* out, const void* query, void* family_out)
+{
+    void* result = g_query(out, query, family_out);
+    if (out != nullptr) {
+        ChromiumFontRenderParams(nullptr, out);
+        static_cast<unsigned char*>(out)[kFieldSubpixelPositioning] = 0;
+    }
+    return result;
+}
+
 // Every copy of a name, and every position it appears at.
 //
 // The linker merges string literals by tail, so a name that ends a longer one
@@ -242,6 +292,108 @@ void FindStrings(const Image& image, const char* needle, const unsigned which,
             p = at + 1;
         }
     }
+}
+
+// Every lea in the image that names `target`, up to `max` of them.
+unsigned LeaSites(const Image& image, const uintptr_t target, uintptr_t* out, const unsigned max)
+{
+    unsigned found = 0;
+    for (unsigned t = 0; t < image.text_count; ++t) {
+        const Region& r = image.text[t];
+        for (const unsigned char* p = r.begin + 1; p + 7 <= r.end; ++p) {
+            if (p[0] != 0x8D || p[-1] < 0x48 || p[-1] > 0x4F || (p[1] & 0xC7) != 0x05) {
+                continue;
+            }
+            int32_t disp;
+            std::memcpy(&disp, p + 2, sizeof(disp));
+            const auto site = reinterpret_cast<uintptr_t>(p - 1);
+            if (site + 7 + static_cast<uintptr_t>(static_cast<intptr_t>(disp)) == target) {
+                if (out != nullptr && found < max) {
+                    out[found] = site;
+                }
+                ++found;
+            }
+        }
+    }
+    return found;
+}
+
+// The function an address inside it belongs to. A function begins where the
+// padding before it ends, so the entry is the nearest call target below the
+// address whose preceding byte is a pad.
+uintptr_t FunctionHolding(const Image& image, const std::vector<uintptr_t>& starts,
+                          const uintptr_t at)
+{
+    for (auto back = std::ranges::upper_bound(starts, at); back != starts.begin();) {
+        --back;
+        const auto* entry = reinterpret_cast<const unsigned char*>(*back);
+        bool room = false;
+        for (unsigned t = 0; t < image.text_count; ++t) {
+            if (entry > image.text[t].begin && entry < image.text[t].end) {
+                room = true;
+            }
+        }
+        if (room && entry[-1] == 0xCC) {
+            return *back;
+        }
+    }
+    return 0;
+}
+
+// Answer the device scale out of the query, by taking over the calls that ask
+// it. The function itself is left standing, since the replacement defers to
+// it for everything but the two fields.
+void AnswerTheQuery(const Image& image, const std::vector<uintptr_t>& starts,
+                    const uintptr_t base)
+{
+    if (const char* off = std::getenv("DWC_SCALE_PARAMS");
+        off != nullptr && (std::strcmp(off, "0") == 0 || std::strcmp(off, "off") == 0)) {
+        return;
+    }
+    std::vector<std::pair<uintptr_t, unsigned>> named;
+    FindStrings(image, kQueryName, 0, &named);
+    uintptr_t site = 0;
+    unsigned sites = 0;
+    for (const auto& [address, which] : named) {
+        uintptr_t one = 0;
+        if (const unsigned n = LeaSites(image, address, &one, 1); n != 0) {
+            sites += n;
+            site = one;
+        }
+    }
+    if (sites != 1) {
+        Say("the query does not name itself from exactly one place");
+        return;
+    }
+    const uintptr_t entry = FunctionHolding(image, starts, site);
+    if (entry == 0) {
+        Say("no function start below the name the query traces itself under");
+        return;
+    }
+    if (std::getenv("CHROMIUM_PATCH_DRYRUN") != nullptr) {
+        (void)std::fprintf(stderr,
+                           "chromium-patch: render params: would take over the calls to "
+                           "GetFontRenderParams +%#lx\n",
+                           entry - base);
+        return;
+    }
+    g_query = reinterpret_cast<QueryFn>(entry);
+    unsigned moved = 0;
+    for (unsigned t = 0; t < image.text_count; ++t) {
+        const Region& r = image.text[t];
+        moved += code_patch::RedirectCalls(r.begin, static_cast<size_t>(r.end - r.begin),
+                                           reinterpret_cast<const unsigned char*>(entry),
+                                           reinterpret_cast<void*>(&ChromiumQuery));
+    }
+    if (moved == 0) {
+        g_query = nullptr;
+        Say("nothing calls GetFontRenderParams");
+        return;
+    }
+    (void)std::fprintf(stderr,
+                       "chromium-patch: render params: GetFontRenderParams +%#lx no longer "
+                       "reads the device scale, at %u call site(s)\n",
+                       entry - base, moved);
 }
 
 }  // namespace
@@ -306,6 +458,8 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
     if (starts.empty()) {
         return;
     }
+
+    AnswerTheQuery(image, starts, base);
 
     // Which distinct property names each function reaches for.
     struct Hit

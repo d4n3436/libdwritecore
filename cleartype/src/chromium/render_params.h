@@ -16,9 +16,11 @@
 //  asked for afterwards.
 //
 //  Two entry points, at the two places those decisions are still visible: the
-//  SkScalerContextRec each scaler context is built from, and the function the
-//  browser process reads the settings with. Font smoothing on with ClearType
-//  is what Windows ships, so that branch is taken as read.
+//  SkScalerContextRec each scaler context is built from, and the browser
+//  process's own reading of the settings, which covers both the fontconfig
+//  answer and the two fields GetFontRenderParams states from the device scale
+//  afterwards. Font smoothing on with ClearType is what Windows ships, so that
+//  branch is taken as read.
 //
 //----------------------------------------------------------------------------
 

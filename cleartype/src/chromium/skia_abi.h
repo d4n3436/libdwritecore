@@ -88,6 +88,10 @@ enum Flags : uint16_t
     kLinearMetrics = 0x1000,
     kHintingMask = 0x0180,
     kHintingShift = 7,
+
+    // SkFontPriv::kCanonicalTextSizeForPaths, the size setupForAsPaths pins
+    // a strike to while folding the real size into the matrix.
+    kCanonicalTextSizeForPaths = 64,
 };
 
 // SkFontationsScalerContext::ScalerContextBits, from
