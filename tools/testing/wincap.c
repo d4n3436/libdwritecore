@@ -1,8 +1,11 @@
 /* wincap.c - capture a window's pixels from inside a Windows guest, to a file
  * or over TCP.
  *
- *   wincap <out.ppm|-> [--class NAME] [--title SUBSTRING] [--screen] [--list]
- *   wincap --serve PORT [--class NAME] [--title SUBSTRING]
+ *   wincap <out.ppm|-> [--class NAME] [--title SUBSTRING] [--pid N] [--screen] [--list]
+ *   wincap --serve PORT [--class NAME] [--title SUBSTRING] [--pid N]
+ *
+ * --pid names the process whose window to capture, which is what separates
+ * several browsers of one class on one desktop.
  *
  * --serve answers one request per connection, the shape the sweep's grabber
  * wants:
@@ -31,26 +34,77 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 static const char* g_class;
 static const char* g_title;
+static DWORD g_pid;
+
+/* The parent of a process, or 0. */
+static DWORD parent_of(DWORD pid)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    PROCESSENTRY32 e;
+    e.dwSize = sizeof(e);
+    DWORD found = 0;
+    if (Process32First(snap, &e)) {
+        do {
+            if (e.th32ProcessID == pid) {
+                found = e.th32ParentProcessID;
+                break;
+            }
+        } while (Process32Next(snap, &e));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+/* Whether a window owned by `owner` belongs to the browser named by --pid.
+ * Firefox starts as a launcher that respawns itself, so the process holding
+ * the Marionette port and the one holding the window are a parent and a child
+ * and either may be the one named. One step of the chain covers both. */
+static int same_browser(DWORD owner)
+{
+    if (owner == g_pid) {
+        return 1;
+    }
+    if (parent_of(owner) == g_pid || parent_of(g_pid) == owner) {
+        return 1;
+    }
+    return 0;
+}
 static HWND g_found;
 
+/* Class and owner are answered by the window manager; the title is asked of
+ * the window's own thread, which a busy browser answers late. So the title is
+ * read last and only when one was asked for. */
 static BOOL CALLBACK pick(HWND hwnd, LPARAM unused)
 {
     (void)unused;
     char cls[256] = {0};
-    char txt[512] = {0};
     GetClassNameA(hwnd, cls, sizeof(cls) - 1);
-    GetWindowTextA(hwnd, txt, sizeof(txt) - 1);
     if (g_class != NULL && strcmp(cls, g_class) != 0) {
         return TRUE;
     }
-    if (g_title != NULL && strstr(txt, g_title) == NULL) {
-        return TRUE;
+    if (g_pid != 0) {
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+        if (!same_browser(owner)) {
+            return TRUE;
+        }
+    }
+    if (g_title != NULL) {
+        char txt[512] = {0};
+        GetWindowTextA(hwnd, txt, sizeof(txt) - 1);
+        if (strstr(txt, g_title) == NULL) {
+            return TRUE;
+        }
     }
     RECT r;
     if (!GetWindowRect(hwnd, &r)) {
@@ -63,17 +117,27 @@ static BOOL CALLBACK pick(HWND hwnd, LPARAM unused)
     return FALSE;
 }
 
-/* The matched window's size, without capturing it. Looked up per request, so
- * a browser that restarted mid-sweep is picked up again. */
+/* The matched window, found once and kept while it exists. A walk over the
+ * desktop's windows costs milliseconds and a sweep asks several times a cell,
+ * so it is repeated only when the window is gone, which is how a browser that
+ * restarted mid-sweep is picked up again. */
+static HWND current_window(void)
+{
+    if (g_found != NULL && !IsWindow(g_found)) {
+        g_found = NULL;
+    }
+    if (g_found == NULL) {
+        EnumWindows(pick, 0);
+    }
+    return g_found;
+}
+
+/* The matched window's size, without capturing it. */
 static int window_size(int* w, int* h)
 {
-    g_found = NULL;
-    EnumWindows(pick, 0);
-    if (g_found == NULL) {
-        return 0;
-    }
+    HWND hwnd = current_window();
     RECT r;
-    if (!GetWindowRect(g_found, &r)) {
+    if (hwnd == NULL || !GetWindowRect(hwnd, &r)) {
         return 0;
     }
     *w = (int)(r.right - r.left);
@@ -81,18 +145,27 @@ static int window_size(int* w, int* h)
     return *w > 0 && *h > 0;
 }
 
-/* The whole window, top-down BGRA, freshly allocated; the caller frees with
- * free(). PrintWindow asks the window to render itself, which is what makes
- * this work on a disconnected session. BitBlt from the screen DC is the route
- * that returns black there, so nothing on the serve path may use it. */
-static unsigned char* capture_window(int* out_w, int* out_h)
+/* The surface PrintWindow renders into, kept between requests and remade only
+ * when the window changes size. */
+static HDC g_mem;
+static HBITMAP g_dib;
+static void* g_bits;
+static int g_dib_w, g_dib_h;
+
+static int surface_for(int w, int h)
 {
-    int w = 0, h = 0;
-    if (!window_size(&w, &h)) {
-        return NULL;
+    if (g_dib != NULL && g_dib_w == w && g_dib_h == h) {
+        return 1;
     }
-    HDC screen = GetDC(NULL);
-    HDC mem = CreateCompatibleDC(screen);
+    if (g_dib != NULL) {
+        DeleteObject(g_dib);
+        g_dib = NULL;
+    }
+    if (g_mem == NULL) {
+        HDC screen = GetDC(NULL);
+        g_mem = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+    }
     BITMAPINFO bi;
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -101,25 +174,43 @@ static unsigned char* capture_window(int* out_w, int* out_h)
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = NULL;
-    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    HGDIOBJ old_obj = SelectObject(mem, dib);
+    g_dib = CreateDIBSection(g_mem, &bi, DIB_RGB_COLORS, &g_bits, NULL, 0);
+    if (g_dib == NULL) {
+        return 0;
+    }
+    SelectObject(g_mem, g_dib);
+    g_dib_w = w;
+    g_dib_h = h;
+    return 1;
+}
+
+/* The whole window, top-down BGRA, freshly allocated; the caller frees with
+ * free(). PrintWindow asks the window to render itself, which is what makes
+ * this work on a disconnected session and under other windows. BitBlt from
+ * the screen DC returns black there, so nothing on the serve path may use it. */
+static unsigned char* capture_window(int* out_w, int* out_h)
+{
+    HWND hwnd = current_window();
+    RECT r;
+    if (hwnd == NULL || !GetWindowRect(hwnd, &r)) {
+        return NULL;
+    }
+    const int w = (int)(r.right - r.left), h = (int)(r.bottom - r.top);
+    if (w <= 0 || h <= 0 || !surface_for(w, h)) {
+        return NULL;
+    }
     /* 2 is PW_RENDERFULLCONTENT, which mingw's headers do not always carry. */
-    BOOL ok = PrintWindow(g_found, mem, 2);
+    BOOL ok = PrintWindow(hwnd, g_mem, 2);
     if (!ok) {
-        ok = PrintWindow(g_found, mem, 0);
+        ok = PrintWindow(hwnd, g_mem, 0);
     }
     unsigned char* out = NULL;
     if (ok) {
         out = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
         if (out != NULL) {
-            memcpy(out, bits, (size_t)w * (size_t)h * 4);
+            memcpy(out, g_bits, (size_t)w * (size_t)h * 4);
         }
     }
-    SelectObject(mem, old_obj);
-    DeleteObject(dib);
-    DeleteDC(mem);
-    ReleaseDC(NULL, screen);
     *out_w = w;
     *out_h = h;
     return out;
@@ -374,6 +465,9 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--class") == 0 && i + 1 < argc) { g_class = argv[++i]; }
         else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) { g_title = argv[++i]; }
+        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+            g_pid = (DWORD)strtoul(argv[++i], NULL, 10);
+        }
         else if (strcmp(argv[i], "--list") == 0) { list = 1; }
         else if (strcmp(argv[i], "--screen") == 0) { screen_mode = 1; }
         else if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) { serve_port = atoi(argv[++i]); }
@@ -384,7 +478,7 @@ int main(int argc, char** argv)
     }
 
     if (out == NULL && !list) {
-        printf("usage: wincap <out.ppm|-> [--class C] [--title T]"
+        printf("usage: wincap <out.ppm|-> [--class C] [--title T] [--pid N]"
                " [--screen] [--list]\n");
         return 2;
     }
@@ -397,7 +491,10 @@ int main(int argc, char** argv)
             GetWindowTextA(h, t, sizeof(t) - 1);
             GetWindowRect(h, &r);
             if (r.right - r.left > 100 && r.bottom - r.top > 100) {
-                printf("%p %-32s %4ldx%-4ld %s\n", (void*)h, c,
+                DWORD owner = 0;
+                GetWindowThreadProcessId(h, &owner);
+                printf("%p pid %-6lu %-32s %4ldx%-4ld %s\n", (void*)h,
+                       (unsigned long)owner, c,
                        r.right - r.left, r.bottom - r.top, t);
             }
             return TRUE;

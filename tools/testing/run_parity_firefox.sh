@@ -11,6 +11,11 @@
 #   --port N        Marionette port                     (default 2828). Each
 #                   port keeps its own state directory, so two browsers on two
 #                   ports run side by side and stop names one of them.
+#                   `guest` takes a comma-separated list and starts one browser
+#                   per port, each with its own profile, capture server and
+#                   scheduled tasks; compare_pages.sh deals a side's cells out
+#                   across the ports it names. Ports must be two apart, since
+#                   each takes PORT+1 for its capture server.
 #   --display :N    X display to create                 (default :99)
 #   --size WxH      X screen size                       (default 2560x1440)
 #   --shim PATH     the interceptor to preload          (default: the build)
@@ -223,6 +228,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# The guest takes a list; everything else takes the first of it.
+GUEST_PORTS="$(printf '%s' "$PORT" | tr ',' ' ')"
+PORT="${GUEST_PORTS%% *}"
 [ -n "$CAPTURE_PORT" ] || CAPTURE_PORT=$((PORT + 1))
 
 # One state directory per Marionette port. The pid files live here, so sharing
@@ -326,8 +334,9 @@ if (\$u) { Write-Output (\$u -replace '.*(Active|Disc).*', '\$1') }
 # session is disconnected; QEMU's screendump cannot, because it photographs
 # whatever the console is scanning out. The session is disconnected only once
 # the capture server has answered, so a failure here leaves the guest usable.
-start_capture() {                         # start_capture <guest ip>
-    local ip="$1"
+# Builds wincap and puts it where the guest can fetch it, once for however
+# many instances follow. Echoes the staged file's name.
+stage_wincap() {
     command -v x86_64-w64-mingw32-g++ >/dev/null || {
         echo "no x86_64-w64-mingw32-g++; captures stay on the console" >&2
         return 1
@@ -345,6 +354,16 @@ start_capture() {                         # start_capture <guest ip>
     stamp="$(sha256sum "$work/wincap.exe" | cut -c1-16)"
     staged="wincap.$stamp.exe"
     cp "$work/wincap.exe" "$STAGE_DIR/$staged"
+    printf '%s' "$staged"
+}
+
+# start_capture <guest ip> <staged wincap> <marionette port> <capture port> <firefox pid>
+#
+# One server per browser. The window is named by the pid of the browser that
+# owns it, because every window on the desktop is MozillaWindowClass with
+# whatever title the sweep navigated to.
+start_capture() {
+    local ip="$1" staged="$2" mport="$3" cport="$4" pid="$5"
 
     # Under SystemDrive and not TEMP, for the reason the profile directory is:
     # the agent runs as SYSTEM, so its TEMP is one the interactive user cannot
@@ -356,33 +375,40 @@ if (-not (Test-Path \$exe)) {
     Invoke-WebRequest -UseBasicParsing '$STAGE_URL/$staged' -OutFile \$exe
 }
 icacls \$exe /grant '*S-1-5-32-545:RX' | Out-Null
-# Matched on the prefix: the staged file carries a build stamp, so the process
-# is wincap.<stamp>, and an older one left listening answers for a window that
-# is no longer the browser's.
-Get-Process | Where-Object { \$_.Name -like 'wincap*' } | Stop-Process -Force
-schtasks /delete /tn dwccap /f 2>&1 | Out-Null
-\$act = New-ScheduledTaskAction -Execute \$exe -Argument '--serve $CAPTURE_PORT --class MozillaWindowClass'
+# Windows meets a program's first listen with a prompt in its session and an
+# inbound block rule in the meantime, and a block rule outranks the port allow
+# below. The staged name carries a build stamp, so every rebuild is a new
+# program to it. The blocks it has made are cleared and the program allowed.
+Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue |
+    Where-Object { \$_.DisplayName -like 'wincap*' } | Remove-NetFirewallRule
+netsh advfirewall firewall delete rule name=dwc-wincap 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-wincap dir=in action=allow program=\$exe | Out-Null
+schtasks /delete /tn dwccap-$mport /f 2>&1 | Out-Null
+\$act = New-ScheduledTaskAction -Execute \$exe -Argument '--serve $cport --class MozillaWindowClass --pid $pid'
 \$pri = $GUEST_PRINCIPAL
-Register-ScheduledTask -TaskName 'dwccap' -Action \$act -Principal \$pri | Out-Null
-Start-ScheduledTask -TaskName 'dwccap'
-netsh advfirewall firewall delete rule name=dwc-capture 2>&1 | Out-Null
-netsh advfirewall firewall add rule name=dwc-capture dir=in action=allow protocol=TCP localport=$CAPTURE_PORT | Out-Null
+Register-ScheduledTask -TaskName 'dwccap-$mport' -Action \$act -Principal \$pri | Out-Null
+Start-ScheduledTask -TaskName 'dwccap-$mport'
+netsh advfirewall firewall delete rule name=dwc-capture-$mport 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-capture-$mport dir=in action=allow protocol=TCP localport=$cport | Out-Null
 Write-Output 'capture server started'
 " || return 1
 
+    # The browser has to paint a window before there is anything to answer
+    # for, and a guest running several of them takes longer over the last
+    # than the first.
     local i size=""
-    for i in $(seq 1 30); do
-        size="$(python3 "$HERE/wincap_size.py" "$ip" "$CAPTURE_PORT")"
+    for i in $(seq 1 90); do
+        size="$(python3 "$HERE/wincap_size.py" "$ip" "$cport")"
         case "$size" in
             ""|"0 0") sleep 1 ;;
             *) break ;;
         esac
     done
     if [ -z "$size" ] || [ "$size" = "0 0" ]; then
-        echo "no window answered on $ip:$CAPTURE_PORT; captures stay on the console" >&2
+        echo "no window answered on $ip:$cport; captures stay on the console" >&2
         return 1
     fi
-    echo "captures at guest:$ip:$CAPTURE_PORT, window $size"
+    echo "captures at guest:$ip:$cport, window $size"
 }
 
 # Disconnecting the console is what takes the browser off the guest's screen,
@@ -402,11 +428,24 @@ if [ "$COMMAND" = "guest-stop" ]; then
     run_guest "
 Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
 Get-Process | Where-Object { \$_.Name -like 'wincap*' } | Stop-Process -Force
+# However many instances the last run left, found rather than named, so a stop
+# does not need the port list the start was given.
+schtasks /query /fo csv 2>\$null | ForEach-Object {
+    if (\$_ -match '\"\\\\(dwc(ff|cap)-\d+)\"') { schtasks /delete /tn \$matches[1] /f 2>&1 | Out-Null }
+}
 schtasks /delete /tn dwcff /f 2>&1 | Out-Null
 schtasks /delete /tn dwccap /f 2>&1 | Out-Null
-netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 | Out-Null
+netsh interface portproxy show v4tov4 | ForEach-Object {
+    if (\$_ -match '^\s*0\.0\.0\.0\s+(\d+)') {
+        netsh interface portproxy delete v4tov4 listenport=\$matches[1] listenaddress=0.0.0.0 | Out-Null
+    }
+}
+netsh advfirewall firewall show rule name=all | Select-String '^Rule Name:\s+(dwc-\S+)' |
+    ForEach-Object { netsh advfirewall firewall delete rule name=(\$_.Matches[0].Groups[1].Value) 2>&1 | Out-Null }
 netsh advfirewall firewall delete rule name=dwc-marionette | Out-Null
 netsh advfirewall firewall delete rule name=dwc-capture 2>&1 | Out-Null
+Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue |
+    Where-Object { \$_.DisplayName -like 'wincap*' } | Remove-NetFirewallRule
 # The harness's own session, if there is one. Never the console user's.
 \$h = quser 2>\$null | Select-String 'dwcparity'
 if (\$h) { logoff (\$h -replace '.*?\s(\d+)\s+(Active|Disc).*', '\$1') 2>&1 | Out-Null }
@@ -434,18 +473,49 @@ if [ "$COMMAND" = "guest" ] && [ "$RDP_SESSION" = 1 ]; then
     start_rdp_session "$GUEST_IP" || exit 1
 fi
 
-if [ "$COMMAND" = "guest" ]; then
+# start_guest_instance <marionette port>
+#
+# Everything one browser needs, named after its port so several can stand side
+# by side. Each has its own profile, Marionette port, pair of scheduled tasks,
+# port proxy and firewall holes.
+start_guest_instance() {
+    local gport="$1"
+    local gcap=$((gport + 1))
+    # Marionette binds inside the guest and the port proxy binds in front of
+    # it, so the two cannot share a number. Whichever starts first takes it
+    # and the other silently does without. The proxy keeps the port the sweep
+    # names and Firefox listens a hundred above it.
+    local ginner=$((gport + 100))
+
     # The prefs go over in pieces. guest-exec passes its argument vector
     # through a helper with a bounded command line, and a whole prefs file
     # base64-encoded inside a UTF-16 -EncodedCommand blows past it - the agent
     # answers "Failed to execute helper program (Invalid argument)", which
     # names nothing. So: append a chunk at a time, then decode in the guest.
-    GUEST_PREFS="$STATE.guest-user.js"
+    GUEST_PREFS="$STATE.guest-user.js.$gport"
     {
         echo ""
         echo "// Added by tools/testing/run_parity_firefox.sh"
-        echo 'user_pref("marionette.port", 2828);'
+        echo "user_pref(\"marionette.port\", $ginner);"
         echo 'user_pref("browser.shell.checkDefaultBrowser", false);'
+        # The sweep asks the page whether anything painted after its capture
+        # landed; this is what lets content see its own paints.
+        echo 'user_pref("dom.send_after_paint_to_content", true);'
+        # A caret that blinks is on in one capture and off in the next, and a
+        # page that focuses an editable element carries one. nsCaret stops the
+        # timer with the caret drawn when the blink time is not positive, so
+        # both sides show it in every capture instead of a coin toss each.
+        echo 'user_pref("ui.caretBlinkTime", 0);'
+        # One page is open at a time and the sweep drives it through one tab,
+        # so the default pool of content processes is idle memory. Eight
+        # browsers of it starves the guest, and a capture that misses its
+        # frame is reported as a difference. Both sides are held to the same
+        # number so neither is measuring a different process layout.
+        echo 'user_pref("dom.ipc.processCount", 2);'
+        # Site isolation pools processes per origin and ignores the count
+        # above, and a preallocated one sits there whether or not it is used.
+        echo 'user_pref("dom.ipc.processCount.webIsolated", 1);'
+        echo 'user_pref("dom.ipc.processPrelaunch.enabled", false);'
         # No caching, on either side. A page under measurement is usually one
         # being regenerated between runs, and a browser that revalidates on a
         # heuristic keeps the old copy - so the two sides compare different
@@ -490,10 +560,10 @@ if [ "$COMMAND" = "guest" ]; then
     FIRST=1
     while IFS= read -r chunk; do
         if [ "$FIRST" = 1 ]; then
-            run_guest "Set-Content -Path \$env:TEMP\dwc-prefs.b64 -Value '$chunk' -NoNewline" >/dev/null || exit 1
+            run_guest "Set-Content -Path \$env:TEMP\dwc-prefs-$gport.b64 -Value '$chunk' -NoNewline" >/dev/null || return 1
             FIRST=0
         else
-            run_guest "Add-Content -Path \$env:TEMP\dwc-prefs.b64 -Value '$chunk' -NoNewline" >/dev/null || exit 1
+            run_guest "Add-Content -Path \$env:TEMP\dwc-prefs-$gport.b64 -Value '$chunk' -NoNewline" >/dev/null || return 1
         fi
     done <<< "$CHUNKS"
 
@@ -505,53 +575,96 @@ if [ "$COMMAND" = "guest" ]; then
 # Marionette, and the only symptom is a port that never opens. A fixed path
 # with the Users group granted access is reachable from both sides. S-1-5-32-545
 # is that group by SID, which is the same on a guest in any language.
-\$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile'
+\$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile-$gport'
 New-Item -ItemType Directory -Force -Path \$profileDir | Out-Null
 icacls \$profileDir /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
-\$prefs = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content \$env:TEMP\dwc-prefs.b64 -Raw)))
+\$prefs = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content \$env:TEMP\dwc-prefs-$gport.b64 -Raw)))
 Set-Content -Path (Join-Path \$profileDir 'user.js') -Value \$prefs -Encoding UTF8
 Write-Output ('user.js ' + (Get-Item (Join-Path \$profileDir 'user.js')).Length + ' bytes')
-" || exit 1
+" || return 1
 
+    # The launch goes over in three calls. guest-exec passes its argument
+    # vector through a helper with a bounded command line, and the whole
+    # launch as a single UTF-16 -EncodedCommand goes past it, with a failure
+    # that names nothing.
     run_guest "
 \$exe = @('$GUEST_FIREFOX',
           (Join-Path \$env:ProgramFiles 'Mozilla Firefox\firefox.exe'),
           (Join-Path \${env:ProgramFiles(x86)} 'Mozilla Firefox\firefox.exe')) |
         Where-Object { \$_ -and (Test-Path \$_) } | Select-Object -First 1
 if (-not \$exe) { Write-Error 'no firefox.exe in the guest'; exit 1 }
-Write-Output ('firefox: ' + \$exe)
-Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
-schtasks /delete /tn dwcff /f 2>&1 | Out-Null
-\$profileDir = Join-Path \$env:SystemDrive 'dwc-parity-profile'
-\$a = '-marionette -remote-allow-system-access -no-remote -profile \"' + \$profileDir + '\" \"$URL\"'
+schtasks /delete /tn dwcff-$gport /f 2>&1 | Out-Null
+\$d = Join-Path \$env:SystemDrive 'dwc-parity-profile-$gport'
+\$a = '-marionette -remote-allow-system-access -no-remote -profile \"' + \$d + '\" \"$URL\"'
 \$act = New-ScheduledTaskAction -Execute \$exe -Argument \$a
-\$pri = $GUEST_PRINCIPAL
-Register-ScheduledTask -TaskName 'dwcff' -Action \$act -Principal \$pri | Out-Null
-Start-ScheduledTask -TaskName 'dwcff'
+Register-ScheduledTask -TaskName 'dwcff-$gport' -Action \$act -Principal ($GUEST_PRINCIPAL) | Out-Null
+Start-ScheduledTask -TaskName 'dwcff-$gport'
 Write-Output 'started'
-" || exit 1
+" >/dev/null || return 1
+
+    # The window's owner, which is what the capture server is told to answer
+    # for. Found by the Marionette port it listens on, which is this
+    # instance's alone and belongs to the parent process, the one with the
+    # window. The guest agent runs in session 0 and can read neither another
+    # session's command lines nor its window handles; wincap runs in the
+    # browser's session and can.
+    GUEST_PID="$(run_guest "
+foreach (\$i in 1..60) {
+  \$c = Get-NetTCPConnection -LocalPort $ginner -State Listen -EA SilentlyContinue |
+        Select-Object -First 1
+  if (\$c) { Write-Output \$c.OwningProcess; exit 0 }
+  Start-Sleep -Milliseconds 500
+}
+Write-Output 0
+" | tr -d '\r' | tail -1)"
 
     run_guest "
-netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 2>&1 | Out-Null
-netsh interface portproxy add v4tov4 listenport=$PORT listenaddress=0.0.0.0 connectport=2828 connectaddress=127.0.0.1 | Out-Null
-netsh advfirewall firewall delete rule name=dwc-marionette 2>&1 | Out-Null
-netsh advfirewall firewall add rule name=dwc-marionette dir=in action=allow protocol=TCP localport=$PORT | Out-Null
-\$ip = (Get-NetIPAddress -AddressFamily IPv4 |
-        Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } |
-        Select-Object -First 1).IPAddress
-Write-Output ('marionette at ' + \$ip + ':$PORT')
-"
-    status=$?
+netsh interface portproxy delete v4tov4 listenport=$gport listenaddress=0.0.0.0 2>&1 | Out-Null
+netsh interface portproxy add v4tov4 listenport=$gport listenaddress=0.0.0.0 connectport=$ginner connectaddress=127.0.0.1 | Out-Null
+netsh advfirewall firewall delete rule name=dwc-marionette-$gport 2>&1 | Out-Null
+netsh advfirewall firewall add rule name=dwc-marionette-$gport dir=in action=allow protocol=TCP localport=$gport | Out-Null
+Write-Output 'routed'
+" >/dev/null || return 1
+
+    case "$GUEST_PID" in
+        ''|0|*[!0-9]*) echo "no browser on port $gport in the guest" >&2; return 1 ;;
+    esac
+    return 0
+}
+
+if [ "$COMMAND" = "guest" ]; then
+    # Once for the whole set, before any of them starts. A browser left from a
+    # previous run holds a profile and a port, and a wincap left listening
+    # answers for a window that is no longer anybody's.
+    run_guest "
+Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process | Where-Object { \$_.Name -like 'wincap*' } | Stop-Process -Force
+Write-Output 'cleared'
+" >/dev/null || exit 1
+
+    STAGED=""
+    if [ -n "$STAGE_DIR" ] && [ -n "$STAGE_URL" ]; then
+        STAGED="$(stage_wincap)" || STAGED=""
+    fi
+
     GUEST_IP="$(python3 "$HERE/vmexec.py" "$GUEST_DOMAIN" powershell -NoProfile -Command \
         "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -First 1).IPAddress" \
         2>/dev/null | tr -d '\r' | tail -1)"
-    if [ -n "$GUEST_IP" ]; then
-        DWC_TESTING_DIR="$HERE" warm_up "$GUEST_IP" "$PORT"
-        if [ -n "$STAGE_DIR" ] && [ -n "$STAGE_URL" ]; then
-            start_capture "$GUEST_IP" && [ "$HIDE_CONSOLE" = 1 ] && hide_console
+    [ -n "$GUEST_IP" ] || { echo "no address for $GUEST_DOMAIN" >&2; exit 1; }
+
+    STARTED=""
+    for gp in $GUEST_PORTS; do
+        start_guest_instance "$gp" || exit 1
+        DWC_TESTING_DIR="$HERE" warm_up "$GUEST_IP" "$gp"
+        echo "marionette at $GUEST_IP:$gp"
+        if [ -n "$STAGED" ]; then
+            start_capture "$GUEST_IP" "$STAGED" "$gp" "$((gp + 1))" "$GUEST_PID" || exit 1
         fi
-    fi
-    exit $status
+        STARTED="$STARTED$gp,"
+    done
+    echo "guest ports ${STARTED%,}"
+    [ "$HIDE_CONSOLE" = 1 ] && hide_console
+    exit 0
 fi
 
 BROWSER="$(find_firefox)"
@@ -569,6 +682,11 @@ mkdir -p "$PROFILE"
     echo "// Added by tools/testing/run_parity_firefox.sh"
     echo "user_pref(\"marionette.port\", $PORT);"
     echo "user_pref(\"browser.shell.checkDefaultBrowser\", false);"
+    echo "user_pref(\"dom.send_after_paint_to_content\", true);"
+    echo "user_pref(\"ui.caretBlinkTime\", 0);"
+    echo "user_pref(\"dom.ipc.processCount\", 2);"
+    echo "user_pref(\"dom.ipc.processCount.webIsolated\", 1);"
+    echo "user_pref(\"dom.ipc.processPrelaunch.enabled\", false);"
     echo "user_pref(\"browser.cache.disk.enable\", false);"
     echo "user_pref(\"browser.cache.memory.enable\", false);"
     echo "user_pref(\"browser.cache.check_doc_frequency\", 1);"
@@ -613,6 +731,8 @@ export DISPLAY="$DISPLAY_NAME"
 export GDK_BACKEND=x11
 export MOZ_ENABLE_WAYLAND=0
 unset WAYLAND_DISPLAY
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 if [ -n "$SHIM" ]; then
     export LD_PRELOAD="$SHIM"
 fi

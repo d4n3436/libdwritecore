@@ -1,4 +1,4 @@
-# css-writing-modes cells whose difference is not the text stack, on Firefox.
+# Cells whose difference is not the text stack, on Firefox.
 #
 # Companion to widget-chrome.accept, which covers the two engines' shared
 # `forms/` cells. Everything here sits outside that directory and is Gecko's
@@ -14,6 +14,36 @@
 wt/external/wpt/css/css-writing-modes/block-plaintext-005.html
 wt/external/wpt/css/css-writing-modes/placeholder-sideways-crash.html
 wt/external/wpt/css/css-writing-modes/writing-mode-vrl-forms-00[34]-manual.html
+# The same grabber in css-fonts. Both pages are a bare <textarea>, the text in
+# it matches, and the whole 149 px sits in one 16x16 corner. A shimmed and an
+# unshimmed Linux draw that corner byte for byte alike, 98 px of ink against
+# the 145 px Windows draws, so nothing the shim answers reaches it.
+wt/external/wpt/css/css-fonts/font-size-monospace-adjust.html
+wt/external/wpt/css/css-fonts/font-size-monospace-adjust-ref.html
+# The same grabber again, in css-inline, css-lists and css-pseudo. Every
+# differing pixel on these pages is charged to a <TEXTAREA> and every control
+# contributes one 16x16 corner of 149 px, whatever font or text it holds; a
+# page with six controls differs by six of them. One reads 155 px at a max
+# channel difference of 83 where the corner overlaps the control below it.
+wt/external/wpt/css/css-inline/baseline-source/baseline-source-first-textarea-00[123].tentative.html
+wt/external/wpt/css/css-inline/baseline-source/baseline-source-last-textarea-00[123].tentative.html
+wt/external/wpt/css/css-lists/list-and-block-textarea-001.html
+wt/external/wpt/css/css-pseudo/first-letter-crash.html
+wt/external/wpt/css/css-pseudo/first-letter-input-textarea.tentative.html
+wt/external/wpt/css/css-pseudo/first-line-input-textarea.tentative.html
+wt/external/wpt/css/css-pseudo/grammar-error-003-manual.html
+wt/external/wpt/css/css-pseudo/input-textarea-ref.html
+wt/external/wpt/css/css-pseudo/placeholder-as-multicol-crash.html
+wt/external/wpt/css/css-pseudo/spelling-error-003-manual.html
+# And again in css-text, where the controls hold Arabic and Latin at 24px and
+# a preserved-space textarea. Same 16x16 corner, same 148 to 149 px; one page
+# has four of them in a row and differs by 596.
+wt/external/wpt/css/css-text/text-align/text-align-end-0[12][89012].html
+wt/external/wpt/css/css-text/text-align/text-align-start-0[12][89012].html
+wt/external/wpt/css/css-text/text-transform/text-transform-copy-paste-001-manual.html
+wt/external/wpt/css/css-text/white-space/textarea-always-preserves-spaces-001.tentative.html
+wt/external/wpt/css/css-text/white-space/textarea-always-preserves-spaces-001-ref.html
+wt/external/wpt/css/css-text/crashtests/rendering-table-caption-with-negative-margins-crash.html
 #
 # Dotted borders on a page with no text. A shimmed and an unshimmed Linux
 # differ from Windows identically here, 99.9983% and a max channel difference
@@ -23,3 +53,65 @@ wt/external/wpt/css/css-writing-modes/inline-box-orthogonal-child-with-margins*.
 # Image resampling. attribute_diff charges all 80000 px to four <IMG> elements
 # at a max channel difference of 1, and the page draws no text.
 wt/external/wpt/css/css-writing-modes/sizing-percentages-replaced-orthogonal-001*.html
+#
+# The selection colors. LookAndFeel::ColorID::Highlight and Highlighttext are
+# the desktop's on both sides: widget/gtk/nsLookAndFeel.cpp reads them off the
+# GTK selection style context, widget/windows/nsLookAndFeel.cpp answers with
+# GetSysColor(COLOR_HIGHLIGHT) and COLOR_HIGHLIGHTTEXT. Here that is #3daee9
+# under #fcfcfc, there #0078d4 under #ffffff, and nsXPLookAndFeel's own
+# #3399ff stands behind neither, so no font decision reaches these pixels.
+# Pinning both sides with `::selection { background-color: #808080; color:
+# #000 }` makes every cell below that colors through that pseudo-element
+# identical, which says the text under the highlight matches byte for byte.
+# The four that stay are the same two colors reached another way: the
+# Highlight and HighlightText CSS keywords, the caret, and an SVG fill the
+# pseudo-element does not cover.
+wt/external/wpt/css/css-text-decor/text-decoration-color-selection-002.html
+wt/external/wpt/css/css-pseudo/active-selection-014.html
+wt/external/wpt/css/css-pseudo/active-selection-051.html
+wt/external/wpt/css/css-pseudo/active-selection-051-ref.html
+wt/external/wpt/css/css-pseudo/active-selection-052.html
+wt/external/wpt/css/css-pseudo/active-selection-053.html
+wt/external/wpt/css/css-pseudo/active-selection-054.html
+wt/external/wpt/css/css-pseudo/chrome-bug-1299142-crash.html
+wt/external/wpt/css/css-pseudo/highlight-painting-005-crash.html
+wt/external/wpt/css/css-pseudo/highlight-painting-soft-hyphens-002-crash.html
+wt/external/wpt/css/css-pseudo/highlight-styling-005.html
+wt/external/wpt/css/css-pseudo/highlight-styling-005-ref.html
+wt/external/wpt/css/css-pseudo/selection-link-00[123].html
+wt/external/wpt/css/css-pseudo/selection-link-00[123]-ref.html
+wt/external/wpt/css/css-pseudo/textpath-selection-011.html
+wt/external/wpt/css/css-pseudo/highlight-cascade/cascade-highlight-004.html
+wt/external/wpt/css/css-pseudo/highlight-cascade/highlight-cascade-003.html
+wt/external/wpt/css/css-pseudo/highlight-cascade/highlight-cascade-003-ref.html
+wt/external/wpt/css/css-pseudo/highlight-cascade/highlight-cascade-007.html
+wt/external/wpt/css/css-pseudo/highlight-cascade/highlight-currentcolor-root-implicit-default-001.html
+wt/external/wpt/css/css-pseudo/reference/active-selection-014-ref.html
+wt/external/wpt/css/css-pseudo/reference/selection-input-011-ref.html
+wt/external/wpt/css/css-pseudo/reference/selection-textarea-011-ref.html
+# The same two colors in css-text. Pinning the pseudo-element makes all three
+# identical, as it does for the cells above.
+wt/external/wpt/css/css-text/text-fit/selection-highlight-painting.html
+wt/external/wpt/css/css-text/text-fit/selection-highlight-painting-ref.html
+wt/external/wpt/css/css-text/text-transform/text-transform-upperlower-107.html
+#
+# The text caret. These four pages call focus() on an editable element on load,
+# and Gecko draws a caret in the element that has it. Here every browser owns
+# an Xvfb screen and its window is the active one, so the caret is painted; on
+# the guest no browser window is active when wincap photographs it, so none of
+# them paints one, the same way on all eight ports. Each cell differs by the
+# same 104 px, a two-pixel column 53 rows tall at the left edge of the control,
+# and by nothing else. run_parity_firefox.sh sets ui.caretBlinkTime to 0 on
+# both sides so the caret is not a blink phase on top of that.
+wt/external/wpt/css/css-pseudo/grammar-spelling-errors-00[12].html
+wt/external/wpt/css/css-pseudo/reference/grammar-spelling-errors-00[12]-ref.html
+#
+# A dashed border, not text. The scroll box these two pages draw carries
+# "border: black dashed", and one dash along the top border and one along the
+# bottom start half a pixel into column 390. The edge pixel there is 106 on
+# Linux and 104 on Windows, a dash phase apart by eight thousandths of a
+# pixel, and nothing else in either page differs. A box with the same border,
+# width and height and no text on the page reproduces both clusters exactly,
+# so no glyph takes part and font metrics cannot reach it.
+wt/external/wpt/css/css-text-decor/text-underline-offset-scroll-001.html
+wt/external/wpt/css/css-text-decor/reference/text-underline-offset-scroll-001-notref.html

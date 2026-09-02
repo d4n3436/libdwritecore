@@ -21,11 +21,16 @@
 size 2200 1150
 
 # side <name> <backend> <host> <port> <base-url> [driver]
-#   backend is x11:<display> here, or libvirt:<domain> for a guest.
+#   backend is x11:<display> here, libvirt:<domain> for a guest photographed
+#   from its console, or guest:<guest-ip> for one whose browsers were started
+#   with run_parity_firefox.sh guest --rdp, which serves each window on its
+#   Marionette port plus one.
 #   driver is marionette, the default, or cdp for Chromium and Electron, and
 #   the port is that driver's, Marionette's or --remote-debugging-port.
-#   A cdp side may list several ports comma-separated, one running browser
-#   instance each, and the sweep spreads the pages across them.
+#   Either side may list several ports comma-separated, one running browser
+#   instance each, and the sweep spreads the pages across them. A Marionette
+#   side then needs one screen per instance: x11 backends listed in the same
+#   order as the ports, or a guest: backend, which finds each on its own.
 #   Start a Chromium side with run_electron_side.sh rather than
 #   run_parity_firefox.sh.
 side linux x11::99            127.0.0.1       2828 http://127.0.0.1:8080

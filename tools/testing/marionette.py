@@ -64,27 +64,42 @@ class Marionette:
         """How long one reply may take."""
         self.sock.settimeout(seconds)
 
+    def _frame(self):
+        """The next whole message in the buffer, or None."""
+        if b":" not in self.buf:
+            return None
+        length, _, rest = self.buf.partition(b":")
+        need = int(length)
+        if len(rest) < need:
+            return None
+        self.buf = rest[need:]
+        return json.loads(rest[:need])
+
     def recv(self):
-        while b":" not in self.buf:
+        # Everything read stays in the buffer until a whole message is there,
+        # so a wait that runs out partway through one leaves the stream
+        # readable for the next call.
+        while True:
+            frame = self._frame()
+            if frame is not None:
+                return frame
             chunk = self.sock.recv(1 << 20)
             if not chunk:
                 raise RuntimeError("marionette closed the connection")
             self.buf += chunk
-        length, _, rest = self.buf.partition(b":")
-        need = int(length)
-        while len(rest) < need:
-            chunk = self.sock.recv(1 << 20)
-            if not chunk:
-                raise RuntimeError("marionette closed the connection")
-            rest += chunk
-        self.buf = rest[need:]
-        return json.loads(rest[:need])
 
     def call(self, name, params=None):
-        message = json.dumps([0, self.next_id, name, params or {}]).encode()
+        message_id = self.next_id
         self.next_id += 1
+        message = json.dumps([0, message_id, name, params or {}]).encode()
         self.sock.sendall(b"%d:%s" % (len(message), message))
-        reply = self.recv()
+        # Replies are matched by id. One to an earlier command whose wait ran
+        # out arrives here instead, and would otherwise be taken for this
+        # command's answer, and every answer after it for the next command's.
+        while True:
+            reply = self.recv()
+            if reply[1] == message_id:
+                break
         if reply[2] is not None:
             raise RuntimeError("%s: %s" % (name, reply[2]))
         return reply[3]
