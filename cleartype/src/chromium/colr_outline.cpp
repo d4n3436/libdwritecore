@@ -1,3 +1,7 @@
+// A color layer is asked for at exactly units per em, and the size dedup
+// below is an identity check. A tolerance would take a different branch.
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+
 #include "colr_outline.h"
 
 #include "code_patch.h"
@@ -14,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include <unistd.h>
@@ -41,6 +46,7 @@ enum Slot
     kPushClipGlyph = 5,
     kPushClipRectangle = 6,
     kPopClip = 7,
+    // ReSharper disable CppEnumeratorNeverUsed
     kFillSolid = 8,
     kFillLinear = 9,
     kFillRadial = 10,
@@ -125,11 +131,14 @@ struct PainterOps
     FillParamsFn fill_linear = nullptr;
     FillParamsFn fill_radial = nullptr;
     FillParamsFn fill_sweep = nullptr;
+    // Set once the vtable carries the hooks. The count is published first so a
+    // hook finds its originals, which leaves the class listed and unpatched.
+    std::atomic<bool> ready{false};
 };
 
 constexpr int kMaxPainters = 8;
 PainterOps g_painter[kMaxPainters];
-std::atomic<int> g_painters{0};
+std::atomic g_painters{0};
 
 // The originals for whichever class `self` belongs to, by its own vtable.
 const PainterOps* OpsFor(const void* self)
@@ -137,7 +146,7 @@ const PainterOps* OpsFor(const void* self)
     if (self == nullptr) {
         return nullptr;
     }
-    void* const* vtable = *reinterpret_cast<void* const* const*>(self);
+    void* const* vtable = *static_cast<void* const* const*>(self);
     const int count = g_painters.load(std::memory_order_acquire);
     for (int i = 0; i < count; ++i) {
         if (g_painter[i].vtable == vtable) {
@@ -195,6 +204,7 @@ struct Source
 
 thread_local Source t_source;
 
+
 // Whether the current walk carries the subpixel transform PushPhase adds, so
 // the clip snap can put the phase on both sides of its rounding.
 thread_local bool t_phased = false;
@@ -238,7 +248,7 @@ void Say(const char* what, const unsigned long value)
     if (std::getenv("DWC_COLR_LOG") == nullptr) {
         return;
     }
-    (void)std::fprintf(stderr, "chromium-patch: colr outline [%d]: %s %lu\n", ::getpid(), what,
+    (void)std::fprintf(stderr, "chromium-patch: colr outline [%d]: %s %lu\n", getpid(), what,
                        value);
 }
 
@@ -267,7 +277,11 @@ bool Substitute(const uint16_t glyph, void* verbs, void* points)
     const float to_em = 1.0f / s.render_size;
     float upem = static_cast<float>(s.upem);
     if (const char* k = std::getenv("DWC_COLR_SCALE"); k != nullptr) {
-        upem *= static_cast<float>(std::atof(k));
+        char* end = nullptr;
+        const double scale = std::strtod(k, &end);
+        if (end != k) {
+            upem *= static_cast<float>(scale);
+        }
     }
     for (path_abi::Point& p : dw_points) {
         p.x = p.x * to_em * upem;
@@ -318,7 +332,7 @@ bool Replacement(const void* outlines, const uint16_t glyph, const float size, c
                 ++seen_n;
                 (void)std::fprintf(stderr,
                                    "chromium-patch: colr outline [%d]: layer glyph %u -> %s\n",
-                                   ::getpid(), glyph, swapped ? "swapped" : "KEPT");
+                                   getpid(), glyph, swapped ? "swapped" : "KEPT");
             }
         }
         static int told = 0;
@@ -327,7 +341,7 @@ bool Replacement(const void* outlines, const uint16_t glyph, const float size, c
             (void)std::fprintf(stderr,
                                "chromium-patch: colr outline [%d]: layer %u at upem %.0f "
                                "render %.3f -> %s\n",
-                               ::getpid(), glyph, static_cast<double>(size),
+                               getpid(), glyph, static_cast<double>(size),
                                static_cast<double>(t_source.render_size),
                                swapped ? "swapped" : "kept");
         }
@@ -345,7 +359,7 @@ bool Replacement(const void* outlines, const uint16_t glyph, const float size, c
             ++said;
             (void)std::fprintf(stderr,
                                "chromium-patch: colr outline [%d]: glyph %u at size %.3f -> %s\n",
-                               ::getpid(), glyph, static_cast<double>(size), ok ? "ok" : "no");
+                               getpid(), glyph, static_cast<double>(size), ok ? "ok" : "no");
         }
     }
     return ok;
@@ -377,7 +391,7 @@ void SayRadial(const uint16_t glyph, const Transform& t, const RadialParams& r)
                        "chromium-patch: colr paint [%d]: glyph %u radial "
                        "c0=(%.6f,%.6f) r0=%.6f c1=(%.6f,%.6f) r1=%.6f "
                        "xform=[%.6f %.6f %.6f %.6f %.6f %.6f]\n",
-                       ::getpid(), glyph, static_cast<double>(r.x0), static_cast<double>(r.y0),
+                       getpid(), glyph, static_cast<double>(r.x0), static_cast<double>(r.y0),
                        static_cast<double>(r.r0), static_cast<double>(r.x1),
                        static_cast<double>(r.y1), static_cast<double>(r.r1),
                        static_cast<double>(t.xx), static_cast<double>(t.xy),
@@ -390,7 +404,7 @@ void SayStops(const uint16_t glyph, void* stops)
     if (g_next_stop == nullptr || stops == nullptr) {
         return;
     }
-    (void)std::fprintf(stderr, "chromium-patch: colr stops [%d]: glyph %u, %zu stops:", ::getpid(),
+    (void)std::fprintf(stderr, "chromium-patch: colr stops [%d]: glyph %u, %zu stops:", getpid(),
                        glyph, g_num_stops != nullptr ? g_num_stops(stops) : 0);
     ColorStop stop{};
     for (int i = 0; i < 16 && g_next_stop(stops, &stop); ++i) {
@@ -419,7 +433,7 @@ bool SplitFills(void* self)
     if (split_off || self == nullptr || t_source.upem == 0) {
         return false;
     }
-    auto** vtable = *reinterpret_cast<void***>(self);
+    auto** vtable = *static_cast<void***>(self);
     return !reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode])(self);
 }
 
@@ -484,7 +498,7 @@ void PushTransformHook(void* self, const Transform* t)
         (void)std::fprintf(stderr,
                            "chromium-patch: colr xform [%d]: depth %d [%.6f %.6f %.6f %.6f "
                            "%.6f %.6f]\n",
-                           ::getpid(), g_depth, static_cast<double>(t->xx),
+                           getpid(), g_depth, static_cast<double>(t->xx),
                            static_cast<double>(t->xy), static_cast<double>(t->yx),
                            static_cast<double>(t->yy), static_cast<double>(t->dx),
                            static_cast<double>(t->dy));
@@ -513,12 +527,11 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
     }
 
     static const bool say = std::getenv("DWC_COLR_XFORM") != nullptr;
-    const auto* p = static_cast<const float*>(params);
-    if (say && t != nullptr && p != nullptr) {
+    if (const auto* p = static_cast<const float*>(params); say && t != nullptr && p != nullptr) {
         (void)std::fprintf(stderr,
                            "chromium-patch: colr linear [%d]: glyph %u p0=(%.4f,%.4f) "
                            "p1=(%.4f,%.4f) p2=(%.4f,%.4f) xform=[%.6f %.6f %.6f %.6f %.6f %.6f]\n",
-                           ::getpid(), glyph, static_cast<double>(p[0]), static_cast<double>(p[1]),
+                           getpid(), glyph, static_cast<double>(p[0]), static_cast<double>(p[1]),
                            static_cast<double>(p[2]), static_cast<double>(p[3]),
                            static_cast<double>(p[4]), static_cast<double>(p[5]),
                            static_cast<double>(t->xx), static_cast<double>(t->xy),
@@ -534,6 +547,20 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
         return;
     }
     ops->fill_glyph_linear(self, glyph, t, params, stops, extend);
+}
+
+// SkRect::round, which SkCanvas::clipRect applies to a device edge when it is
+// not antialiasing. An exact half goes toward positive infinity.
+float SkRound(const float v)
+{
+    return static_cast<float>(std::floor(static_cast<double>(v) + 0.5));
+}
+
+// The same for a paint-tree y, which the painter negates before the device
+// edge, so positive infinity there is negative infinity here.
+float SkRoundNegated(const float v)
+{
+    return static_cast<float>(std::ceil(static_cast<double>(v) - 0.5));
 }
 
 // skrifa forwards the glyph's own COLRv1 clip box through push_clip_rectangle,
@@ -552,16 +579,16 @@ void PushClipRectangleHook(void* self, float x_min, float y_min, float x_max, fl
 
     static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
     if (!clip_off && t_source.upem != 0 && t_source.render_size > 0) {
-        auto** vtable = *reinterpret_cast<void***>(self);
+        auto** vtable = *static_cast<void***>(self);
         if (!reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode])(self)) {
             const float s = t_source.render_size / static_cast<float>(t_source.upem);
             const float ox = t_phased ? t_source.sub_x : 0.0f;
             const float oy = t_phased ? t_source.sub_y : 0.0f;
-            x_min = (std::round(x_min * s + ox) - ox) / s;
-            x_max = (std::round(x_max * s + ox) - ox) / s;
+            x_min = (SkRound(x_min * s + ox) - ox) / s;
+            x_max = (SkRound(x_max * s + ox) - ox) / s;
             // The painter negates each y on the way to the device rect.
-            y_min = (std::round(y_min * s - oy) + oy) / s;
-            y_max = (std::round(y_max * s - oy) + oy) / s;
+            y_min = (SkRoundNegated(y_min * s - oy) + oy) / s;
+            y_max = (SkRoundNegated(y_max * s - oy) + oy) / s;
         }
     }
     ops->push_clip_rect(self, x_min, y_min, x_max, y_max);
@@ -605,12 +632,23 @@ bool ClipBoxReplacement(const void* font_ref, const void* coords, const uint16_t
 
 // Patch the painter's vtable once per distinct table. The object is built on
 // the stack of drawCOLRGlyph, so the vtable is what persists, not the object.
+// Two threads reach a color glyph at once on a fresh renderer. Without this
+// both take the same slot, and one records the other's hooks as originals.
+std::mutex g_patch_mutex;
+
 void PatchPainter(void* painter)
 {
     if (painter == nullptr) {
         return;
     }
-    auto** vtable = *reinterpret_cast<void***>(painter);
+    auto** vtable = *static_cast<void***>(painter);
+    for (int i = 0, n = g_painters.load(std::memory_order_acquire); i < n; ++i) {
+        if (g_painter[i].vtable == vtable && g_painter[i].ready.load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+    // Only the holder adds a class, and marks it ready before letting go.
+    const std::lock_guard patch_lock(g_patch_mutex);
     const int patched_count = g_painters.load(std::memory_order_acquire);
     for (int i = 0; i < patched_count; ++i) {
         if (g_painter[i].vtable == vtable) {
@@ -636,11 +674,11 @@ void PatchPainter(void* painter)
     // Published before a slot is written, so a call arriving on the first
     // patched slot already finds this class's originals.
     g_painters.store(patched_count + 1, std::memory_order_release);
-    const long page = ::sysconf(_SC_PAGESIZE);
+    const long page = sysconf(_SC_PAGESIZE);
     auto* slot = reinterpret_cast<unsigned char*>(&vtable[0]);
     auto* base = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(slot) &
                                          ~static_cast<uintptr_t>(page - 1));
-    if (::mprotect(base, static_cast<size_t>(page) * 2, PROT_READ | PROT_WRITE) != 0) {
+    if (mprotect(base, static_cast<size_t>(page) * 2, PROT_READ | PROT_WRITE) != 0) {
         return;
     }
     vtable[kFillGlyphRadial] = reinterpret_cast<void*>(&FillGlyphRadialHook);
@@ -651,7 +689,8 @@ void PatchPainter(void* painter)
         vtable[kPushTransform] = reinterpret_cast<void*>(&PushTransformHook);
         vtable[kPopTransform] = reinterpret_cast<void*>(&PopTransformHook);
     }
-    (void)::mprotect(base, static_cast<size_t>(page) * 2, PROT_READ);
+    (void)mprotect(base, static_cast<size_t>(page) * 2, PROT_READ);
+    ops.ready.store(true, std::memory_order_release);
     Say("painter vtable patched, fill_glyph_radial slot", kFillGlyphRadial);
 }
 
@@ -673,19 +712,20 @@ bool PushPhase(void* painter)
     if (t_source.upem == 0 || (t_source.phase_x == 0.0f && t_source.phase_y == 0.0f)) {
         return false;
     }
-    auto** vtable = *reinterpret_cast<void***>(painter);
+    auto** vtable = *static_cast<void***>(painter);
     const auto push = reinterpret_cast<PushTransformFn>(vtable[kPushTransform]);
     const auto em = static_cast<float>(t_source.upem);
     // The bridge negates the translation's y, since the paint tree's space is
     // y up and the canvas is y down.
-    const Transform t{1.0f, 0.0f, 0.0f, 1.0f, t_source.phase_x * em, -t_source.phase_y * em};
+    const Transform t{.xx = 1.0f, .xy = 0.0f, .yx = 0.0f, .yy = 1.0f,
+                      .dx = t_source.phase_x * em, .dy = -t_source.phase_y * em};
     push(painter, &t);
     return true;
 }
 
 void PopPhase(void* painter)
 {
-    auto** vtable = *reinterpret_cast<void***>(painter);
+    auto** vtable = *static_cast<void***>(painter);
     reinterpret_cast<PopTransformFn>(vtable[kPopTransform])(painter);
 }
 
@@ -705,17 +745,17 @@ bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t gl
     ClipBox box{};
     if (!clip_off && g_clip_box != nullptr && painter != nullptr && t_source.upem != 0 &&
         t_source.render_size > 0) {
-        auto** vtable = *reinterpret_cast<void***>(painter);
+        auto** vtable = *static_cast<void***>(painter);
         const auto bounds_mode = reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode]);
         if (!bounds_mode(painter) &&
             g_clip_box(font_ref, coords, glyph, static_cast<float>(t_source.upem), &box)) {
             if (std::getenv("DWC_COLR_CLIPLOG") != nullptr) {
-                static std::atomic<int> told{0};
+                static std::atomic told{0};
                 if (told.fetch_add(1, std::memory_order_relaxed) < 4) {
                     (void)std::fprintf(stderr,
                                        "chromium-patch: colr clip [%d]: glyph %u upem %u box "
                                        "(%.3f %.3f %.3f %.3f)\n",
-                                       ::getpid(), glyph, t_source.upem,
+                                       getpid(), glyph, t_source.upem,
                                        static_cast<double>(box.x_min),
                                        static_cast<double>(box.y_min),
                                        static_cast<double>(box.x_max),
@@ -728,20 +768,20 @@ bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t gl
             // antialiased, so the box lands on whole device pixels.
             // push_clip_rectangle always antialiases, so the box is snapped
             // here instead and the antialiasing has nothing left to blend.
-            const float s = static_cast<float>(t_source.render_size) /
+            const float s = t_source.render_size /
                             static_cast<float>(t_source.upem);
             // Windows rounds the box after the subpixel offset is in the
             // matrix, so the phase belongs on both sides of the rounding.
             const float ox = phased ? t_source.sub_x : 0.0f;
             const float oy = phased ? t_source.sub_y : 0.0f;
             const auto snap_x = [s, ox](const float v) {
-                return (std::round(v * s + ox) - ox) / s;
+                return (SkRound(v * s + ox) - ox) / s;
             };
             // It also builds SkRect::MakeLTRB(x_min, -y_min, x_max, -y_max), so
             // the y pair goes in swapped to come out as a sorted rect, and the
             // device edge each one lands on is negated.
             const auto snap_y = [s, oy](const float v) {
-                return (std::round(v * s - oy) + oy) / s;
+                return (SkRoundNegated(v * s - oy) + oy) / s;
             };
             push(painter, snap_x(box.x_min), snap_y(box.y_max), snap_x(box.x_max),
                  snap_y(box.y_min));
