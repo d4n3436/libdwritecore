@@ -115,6 +115,24 @@ wt/external/wpt/css/css-pseudo/reference/grammar-spelling-errors-00[12]-ref.html
 # so no glyph takes part and font metrics cannot reach it.
 wt/external/wpt/css/css-text-decor/text-underline-offset-scroll-001.html
 wt/external/wpt/css/css-text-decor/reference/text-underline-offset-scroll-001-notref.html
+#
+# A dashed outline, not text. These four pages put `outline: 1px dashed gray`
+# on the two balanced paragraphs, and every differing pixel is one end of a
+# dash: solid grey, 128 on Linux and 129 on Windows, five to eight of them per
+# page at a max channel difference of 1. Three empty divs carrying the same
+# outline on a page with no text at all reproduce the same 128 against 129 at
+# the same spacing, so no glyph takes part.
+wt/external/wpt/css/css-text/white-space/text-wrap-balance-before-after-00[12].html
+wt/external/wpt/css/css-text/white-space/reference/text-wrap-balance-before-after-00[12]-ref.html
+#
+# The dotted rule down the left of r12a-scripts, which is
+# `<div id=line>&nbsp;</div>` carrying `border-left: 2px dotted rgb(0,90,156)`
+# at a fractional x. Three pixels at the end of one dot differ by one level in
+# every channel, and attribute_diff charges all three to that div, whose only
+# content is a non-breaking space. Three such rules at the same fractional
+# offsets on a page with no text reproduce the same one-level pixels in the
+# same rows.
+r12a-scripts/index.html
 
 # Firefox's broken-image placeholder, which one of two Firefoxes paints and the
 # other does not. Every one of these pages carries `<img src="broken">`, and the
@@ -149,3 +167,14 @@ wt/external/wpt/css/css-contain/contain-size-replaced-003[abc].html
 # shim, disagree on one of the eight. Nothing here is text, and the two sides
 # of the comparison are the same browser, so the timing is the whole of it.
 wt/external/wpt/css/css-writing-modes/crashtests/table-root-direction-propagation-crash.html
+#
+# highlight-custom-properties-dynamic-001 selects the whole body, then sets
+# --background-color to green from inside a doubled requestAnimationFrame, so
+# the selection is red until that lands and green afterwards. A capture that
+# arrives first holds the red one.
+#
+# Four runs of the cell on one build give two identical and two differing, and
+# the differing ones are red against green with the glyphs on top of them
+# matching. The text is the same either way; only which frame was photographed
+# is not.
+wt/external/wpt/css/css-pseudo/highlight-custom-properties-dynamic-001.html
