@@ -809,7 +809,7 @@ unsigned ChromiumMajor()
         {
             uintptr_t base;
             unsigned found;
-        } ask{g_image.base, 0};
+        } ask{.base = g_image.base, .found = 0};
         dl_iterate_phdr(
             [](dl_phdr_info* info, size_t, void* data) {
                 auto* a = static_cast<Ask*>(data);
@@ -1014,7 +1014,10 @@ std::mutex g_probe_mutex;
 std::atomic<uintptr_t> g_probe_read_lo{0};
 std::atomic<uintptr_t> g_probe_read_hi{0};
 
-void ProbeFaultHandler(int sig, siginfo_t* info, void* uc)
+// The kernel supplies info; the guard on it is not redundant here.
+// ReSharper disable CppDFAConstantConditions
+// ReSharper disable CppDFANullDereference
+void ProbeFaultHandler(const int sig, siginfo_t* info, void* uc)
 {
     // Only this thread faulting on the tag itself belongs to the guard.
     // Anything else is a real crash and goes to the handler already there,
@@ -1262,7 +1265,7 @@ void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
         // Patching this one as well is only sound while both hold the same
         // function, since the thunk calls through one pointer.
         if (may_patch && g_original_filter_rec != nullptr) {
-            void** slot = reinterpret_cast<void**>(base) + kFilterRecSlot;
+            void** slot = (base) + kFilterRecSlot;
             if (*slot != reinterpret_cast<void*>(&chromium_filter_rec_thunk) &&
                 InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
                 if (*slot != g_original_filter_rec) {
@@ -1282,7 +1285,7 @@ void ResolveTypefaceVtable(const void* typeface, const bool may_patch,
             }
         }
         if (may_patch && g_original_filter_rec == nullptr) {
-            if (void** slot = reinterpret_cast<void**>(base) + kFilterRecSlot;
+            if (void** slot = (base) + kFilterRecSlot;
                 InText(g_image, reinterpret_cast<uintptr_t>(*slot))) {
                 g_original_filter_rec = *slot;
                 if (WriteSlot(slot, reinterpret_cast<void*>(&chromium_filter_rec_thunk))) {
@@ -2199,8 +2202,7 @@ void ScanLoadedImages()
         return;
     }
     for (unsigned i = 0; i < list.count; ++i) {
-        const LoadedModule& m = list.mods[i];
-        if (m.name == nullptr || m.name[0] == '\0') {
+        if (const LoadedModule& m = list.mods[i]; m.name == nullptr || m.name[0] == '\0') {
             TryPatchModule(m.base, m.phdr, m.phnum, "/proc/self/exe", {});
             return;
         }
@@ -2288,6 +2290,8 @@ void FindVariationSlot(void** base, void** data_slot)
     // reaches the bridge.
     const size_t back = ChromiumMajor() >= 146 ? kTableTagsToVariationPosition
                                                : kTableTagsToVariationPosition - 2;
+    // ChromiumMajor is read from the loaded image at runtime.
+    // ReSharper disable once CppDFAConstantConditions
     if (back < tags) {
         ConfirmVariationSlot(base, tags - back, bridge);
     }
@@ -2418,7 +2422,7 @@ void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
         return;
     }
     const auto fn = reinterpret_cast<VariationPositionFn>(
-        (*reinterpret_cast<void***>(typeface))[index]);
+        (*static_cast<void***>(typeface))[index]);
     const int count = fn(typeface, nullptr, 0);
     const bool unconfirmed = g_variation_unconfirmed.load(std::memory_order_relaxed);
     const auto give_up = [&](const char* why) {
@@ -2548,7 +2552,7 @@ windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int 
 
     const windows_path::FontFacts facts =
         font_facts::Describe(*FontBytesLocked(typeface), gasp_ppem, bitmap_ppem);
-    cache[typeface] = {gasp_ppem, bitmap_ppem, facts};
+    cache[typeface] = {.gasp_ppem = gasp_ppem, .bitmap_ppem = bitmap_ppem, .facts = facts};
     return facts;
 }
 
@@ -2700,9 +2704,6 @@ struct PathView
 // and gets left alone.
 bool MirrorHolds(const PathView& v)
 {
-    if (v.point_count == 0 || v.verb_count == 0) {
-        return false;
-    }
     // The reference count is SkNVRefCnt's, and a path shared with anything
     // else must not be edited underneath it.
     if (skia_abi::Read<int32_t>(v.data, path_abi::kDataRefCnt) != 1) {
@@ -2720,6 +2721,11 @@ bool MirrorHolds(const PathView& v)
     // path holding any is out of scope. Neither source emits them.
     if (skia_abi::Read<size_t>(v.data, path_abi::kDataConics + path_abi::kSpanCount) != 0) {
         return false;
+    }
+    // An empty path stores nothing and holds null spans, so the layout check
+    // below has nothing to describe. The replacement carries its own arrays.
+    if (v.point_count == 0 && v.verb_count == 0) {
+        return v.points == nullptr && v.verbs == nullptr;
     }
     // The three arrays are trailing storage laid out points, conics, verbs.
     if (reinterpret_cast<unsigned char*>(v.points) != v.data + path_abi::kDataSize ||
@@ -2838,24 +2844,24 @@ bool ReplacePathData(void* path, const PathView& v, const std::vector<uint8_t>& 
     }
     const size_t size = path_abi::kDataSize + points.size() * sizeof(path_abi::Point) +
                         verbs.size();
-    auto* fresh = static_cast<unsigned char*>(::operator new(size));
+    auto* fresh = static_cast<unsigned char*>(operator new(size));
     std::memcpy(fresh, v.data, path_abi::kDataSize);
 
     unsigned char* const inline_element = fresh + path_abi::kListInline;
-    std::memcpy(fresh + path_abi::kListData, &inline_element, sizeof(inline_element));
+    std::memcpy(fresh + path_abi::kListData, static_cast<const void*>(&inline_element), sizeof(inline_element));
 
     unsigned char* const trailing = fresh + path_abi::kDataSize;
     unsigned char* const verb_data = trailing + points.size() * sizeof(path_abi::Point);
     const size_t point_count = points.size();
     const size_t conic_count = 0;
     const size_t verb_count = verbs.size();
-    std::memcpy(fresh + path_abi::kDataPoints, &trailing, sizeof(trailing));
+    std::memcpy(fresh + path_abi::kDataPoints, static_cast<const void*>(&trailing), sizeof(trailing));
     std::memcpy(fresh + path_abi::kDataPoints + path_abi::kSpanCount, &point_count,
                 sizeof(point_count));
-    std::memcpy(fresh + path_abi::kDataConics, &verb_data, sizeof(verb_data));
+    std::memcpy(fresh + path_abi::kDataConics, static_cast<const void*>(&verb_data), sizeof(verb_data));
     std::memcpy(fresh + path_abi::kDataConics + path_abi::kSpanCount, &conic_count,
                 sizeof(conic_count));
-    std::memcpy(fresh + path_abi::kDataVerbs, &verb_data, sizeof(verb_data));
+    std::memcpy(fresh + path_abi::kDataVerbs, static_cast<const void*>(&verb_data), sizeof(verb_data));
     std::memcpy(fresh + path_abi::kDataVerbs + path_abi::kSpanCount, &verb_count,
                 sizeof(verb_count));
     std::memcpy(trailing, points.data(), points.size() * sizeof(path_abi::Point));
@@ -2867,11 +2873,11 @@ bool ReplacePathData(void* path, const PathView& v, const std::vector<uint8_t>& 
     constexpr uint8_t unknown = path_abi::kConvexityUnknown;
     std::memcpy(fresh + path_abi::kDataConvexity, &unknown, sizeof(unknown));
 
-    std::memcpy(static_cast<unsigned char*>(path) + path_abi::kPathData, &fresh, sizeof(fresh));
+    std::memcpy(static_cast<unsigned char*>(path) + path_abi::kPathData, static_cast<const void*>(&fresh), sizeof(fresh));
     // The destructor is a debug-only write to the unique id plus the listener
     // list's, and the list has just been shown to hold nothing and own
     // nothing, so releasing the storage is all there is to do.
-    ::operator delete(v.data);
+    operator delete(v.data);
     return true;
 }
 
@@ -2949,7 +2955,10 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     v.point_count = skia_abi::Read<size_t>(v.data, path_abi::kDataPoints + path_abi::kSpanCount);
     v.verbs = skia_abi::Read<const uint8_t*>(v.data, path_abi::kDataVerbs);
     v.verb_count = skia_abi::Read<size_t>(v.data, path_abi::kDataVerbs + path_abi::kSpanCount);
-    if (v.points == nullptr || v.verbs == nullptr || !MirrorHolds(v)) {
+    // A null pair with no counts is an empty path, which MirrorHolds takes.
+    const bool empty_path = v.points == nullptr && v.verbs == nullptr &&
+                            v.point_count == 0 && v.verb_count == 0;
+    if ((!empty_path && (v.points == nullptr || v.verbs == nullptr)) || !MirrorHolds(v)) {
         static std::atomic said{false};
         if (!said.exchange(true)) {
             Report("the SkPathData layout does not check out; outlines stay with skrifa");
@@ -3022,28 +3031,31 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
         windows_path::WithWindowsHinting(flat), scale_y,
         font_facts::Describe(*use, oblique_gasp_ppem, oblique_bitmap_ppem, face_index));
 
-    static thread_local std::vector<uint8_t> dw_verbs;
-    static thread_local std::vector<path_abi::Point> dw_points;
+    thread_local std::vector<uint8_t> dw_verbs;
+    thread_local std::vector<path_abi::Point> dw_points;
     if (!dwrite_raster::GlyphOutline(face_key, *use, g.GlyphId(), d.text_size_render, &dw_verbs,
                                      &dw_points, face_index, simulate_bold, simulate_oblique)) {
+        return;
+    }
+    // PointBounds reads the first point.
+    if (dw_verbs.empty() || dw_points.empty()) {
         return;
     }
     // Both scaler contexts generate at scale.fY and then apply what
     // computeMatrices left over, so DirectWrite's outline needs the same
     // matrix before it can be compared with the one already in the path.
     for (path_abi::Point& p : dw_points) {
-        p = {remaining.scale_x * p.x + remaining.skew_x * p.y,
-             remaining.skew_y * p.x + remaining.scale_y * p.y};
+        p = {.x = remaining.scale_x * p.x + remaining.skew_x * p.y,
+             .y = remaining.skew_y * p.x + remaining.scale_y * p.y};
     }
 
-    if (!substituted &&
-        (dw_verbs.size() != v.verb_count ||
-         !CurveOnlyDifference(dw_verbs.data(), v.verbs, v.verb_count))) {
-        if (log) {
-            Report("path: glyph %u verbs differ (%zu/%zu against %zu/%zu); kept skrifa's",
-                   g.GlyphId(), dw_verbs.size(), dw_points.size(), v.verb_count, v.point_count);
-        }
-        return;
+    // Windows draws the glyph from DirectWrite's outline whatever the verbs
+    // are. A differing sequence falls through to the whole-path replacement,
+    // which carries its own, and the bounds check below holds either way.
+    if (log && (dw_verbs.size() != v.verb_count ||
+                !CurveOnlyDifference(dw_verbs.data(), v.verbs, v.verb_count))) {
+        Report("path: glyph %u verbs differ (%zu/%zu against %zu/%zu); replacing whole",
+               g.GlyphId(), dw_verbs.size(), dw_points.size(), v.verb_count, v.point_count);
     }
 
     float bounds[4];
@@ -3089,7 +3101,8 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
         return;
     }
     float worst = 0;
-    if (!substituted) {
+    // An empty incumbent has no bounds to compare.
+    if (!substituted && v.point_count != 0) {
         float existing[4];
         PointBounds(v.points, v.point_count, existing);
         for (int i = 0; i < 4; ++i) {
@@ -3295,10 +3308,9 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         int top = 0;
         int right = 0;
         int bottom = 0;
-        const bool got = dwrite_raster::GlyphBounds(face_key, *use, g, flat, d,
-                                                    d.rendering_mode, d.texture_type,
-                                                    &left, &top, &right, &bottom,
-                                                    face_index, simulate_bold, simulate_oblique);
+        bool got = dwrite_raster::GlyphBounds(face_key, *use, g, flat, d, d.rendering_mode,
+                                              d.texture_type, &left, &top, &right, &bottom,
+                                              face_index, simulate_bold, simulate_oblique);
         static const bool tell = std::getenv("DWC_METRICS_LOG") != nullptr;
         if (tell) {
             static std::atomic<int> told{0};
@@ -3315,6 +3327,19 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
                        static_cast<int>(d.grid_fit_mode));
             }
         }
+        // An empty rect is Skia's signal to ask for the aliased texture,
+        // where a glyph too small for ClearType coverage still has a box.
+        // generateMetrics skips the retry when it already asked for that one.
+        bool aliased = false;
+        if (!got && (d.texture_type != windows_path::kTextureAliased1x1 ||
+                     d.anti_alias_mode == windows_path::kAntiAliasGrayscale)) {
+            got = dwrite_raster::GlyphBounds(face_key, *use, g, flat, d,
+                                             windows_path::kRenderAliased,
+                                             windows_path::kTextureAliased1x1, &left, &top,
+                                             &right, &bottom, face_index, simulate_bold,
+                                             simulate_oblique);
+            aliased = got;
+        }
         if (got) {
             const float box[4] = {static_cast<float>(left), static_cast<float>(top),
                                   static_cast<float>(right), static_cast<float>(bottom)};
@@ -3323,10 +3348,15 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
             constexpr bool kFromPath = false;
             std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsComputeFromPath,
                         &kFromPath, sizeof(kFromPath));
+            if (aliased) {
+                // generateDWImage reads this back to pick the aliased texture.
+                constexpr auto kBwMask = static_cast<uint8_t>(skia_abi::kBW);
+                std::memcpy(static_cast<unsigned char*>(result) + skia_abi::kMetricsMaskFormat,
+                            &kBwMask, sizeof(kBwMask));
+            }
         }
-        // An empty rect is Skia's signal to try another texture type, and it
-        // then draws the glyph a different way. Nothing here follows it that
-        // far, so Skia's own bounds stay and so does its image.
+        // Neither texture had a box, which is generateMetrics' computeFromPath
+        // case. Fontations already answers an outline glyph that way.
     }
 
     // useStrokeForFakeBold leaves a frame width behind, and SkScalerContext
