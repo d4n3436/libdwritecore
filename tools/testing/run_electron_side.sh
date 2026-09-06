@@ -185,8 +185,19 @@ mkdir -p "$STATE"
 # is stated outright.
 # The --unset comes first because env takes its options before any
 # assignments; after one, it would be read as the command to run.
-env_args=(--unset=WAYLAND_DISPLAY
-          DISPLAY="$DISPLAY_NAME" DWC_URL="$URL" DWC_W="$WIDTH" DWC_H="$HEIGHT")
+#
+# LD_PRELOAD is stated either way. A shell that has the installed shim
+# preloaded passes it to every browser it starts, so a run given no --preload
+# is otherwise not the control it reads as: it measures whatever build is
+# installed, silently, and only the mapped path in /proc says so.
+env_args=(--unset=WAYLAND_DISPLAY)
+if [ -z "$PRELOAD" ]; then
+    env_args+=(--unset=LD_PRELOAD)
+    if [ -n "${LD_PRELOAD:-}" ]; then
+        echo "note: this shell preloads $LD_PRELOAD; starting without it, since no --preload was given" >&2
+    fi
+fi
+env_args+=(DISPLAY="$DISPLAY_NAME" DWC_URL="$URL" DWC_W="$WIDTH" DWC_H="$HEIGHT")
 [ -n "$LIBDIR" ]  && env_args+=(LD_LIBRARY_PATH="$LIBDIR")
 [ -n "$PRELOAD" ] && env_args+=(LD_PRELOAD="$PRELOAD")
 
