@@ -203,13 +203,25 @@ side_browser() {                          # side_browser <driver> <host> <port>
     esac
 }
 
+# Every shard of both sides, not just the first port of each. A side lists one
+# port per browser instance, and reading only the first left a second shard
+# started on another build to pass, which measures two builds against each
+# other in the cells that landed on it. A port that does not answer is skipped
+# here; the sweep drops it below.
 if [ "${DRIVERS[0]}" = "${DRIVERS[1]}" ]; then
-    v0="$(side_browser "${DRIVERS[0]}" "${HOSTS[0]}" "${PORTS[0]%%,*}")"
-    v1="$(side_browser "${DRIVERS[1]}" "${HOSTS[1]}" "${PORTS[1]%%,*}")"
-    if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ]; then
-        echo "side ${LABELS[0]} is $v0 and side ${LABELS[1]} is $v1, so this sweep would measure the difference between two browser builds; start both on the same one" >&2
-        exit 2
-    fi
+    build=""; built_by=""
+    for i in 0 1; do
+        for port in ${PORTS[$i]//,/ }; do
+            v="$(side_browser "${DRIVERS[$i]}" "${HOSTS[$i]}" "$port")"
+            [ -n "$v" ] || continue
+            if [ -z "$build" ]; then
+                build="$v"; built_by="side ${LABELS[$i]} port $port"
+            elif [ "$v" != "$build" ]; then
+                echo "$built_by is $build and side ${LABELS[$i]} port $port is $v, so this sweep would measure the difference between two browser builds; start every shard of both sides on the same one" >&2
+                exit 2
+            fi
+        done
+    done
 fi
 
 printf '%-38s %8s  %10s  %8s\n' page scrollY identical "max diff"
@@ -333,324 +345,188 @@ DEV_H="$(python3 -c "print(round($HEIGHT * $SCALE))")"
 
 # capture; sweep_pages_marionette.py opens with why. It grabs through Xlib into
 # memory instead of shelling out to `import`, and holds one process for the
-# plan instead of one per page. That grab is the one new dependency, so a
-# machine without python-xlib falls back to the per-page route below.
-DIRECT=1
+# plan instead of one per page. python-xlib is what that needs, and a
+# Marionette side has no other way to reach a screen.
 for i in 0 1; do
     [ "${DRIVERS[$i]}" = cdp ] && continue
-    python3 -c "import Xlib" 2>/dev/null || DIRECT=0
-done
-# The per-page route below sizes its crop in CSS pixels, so a scaled plan
-# taking it would compare the corner of each frame and call the rest a match.
-# Refused rather than run, since that is a number that looks like a result.
-if [ "$DIRECT" = 0 ] && [ "$SCALE" != 1 ]; then
-    echo "this plan asks for a scale of $SCALE and the per-page capture route measures in CSS pixels, so it would compare only part of each frame. Install python-xlib so the sweep takes the direct route." >&2
+    python3 -c "import Xlib" 2>/dev/null && continue
+    echo "side ${LABELS[$i]} is photographed from its screen and python-xlib is not installed, so there is nothing to read the screen with" >&2
     exit 1
-fi
+done
 
-if [ "$DIRECT" = 1 ]; then
-    ALL_PATHS=(); ALL_SCROLLS=()
-    : > "$SHOTS/cells"
-    for entry in "${PAGES[@]}"; do
-        set -- $entry
-        path="$1"; shift
-        for scroll in "$@"; do
-            CELLS=$((CELLS + 1))
-            ALL_PATHS+=("$path"); ALL_SCROLLS+=("$scroll")
-            printf '%d %s %s\n' "$CELLS" "$path" "$scroll" >> "$SHOTS/cells"
-        done
-    done
-
-    # A side may list several ports, comma-separated, one browser instance
-    # each. The cells are dealt out round-robin so the heavy pages, which sit
-    # together in the plan, spread across the instances. Ports that do not
-    # answer are dropped, so a plan naming a second instance still works with
-    # only the first one running.
-    SWEEPERS=()
-    for i in 0 1; do
-        # The backend field may list one backend per port, in the same order,
-        # for a Marionette side whose instances each need their own screen; a
-        # single backend serves every port.
-        read -ra backends <<< "${BACKENDS[$i]//,/ }"
-        live=(); livebk=(); j=0
-        for port in ${PORTS[$i]//,/ }; do
-            # DevTools answers an HTTP probe; Marionette is a bare socket.
-            if [ "${DRIVERS[$i]}" = cdp ]; then
-                probe() { curl -s --max-time 3 "http://${HOSTS[$i]}:$port/json/version" >/dev/null 2>&1; }
-            else
-                probe() { (exec 3<>"/dev/tcp/${HOSTS[$i]}/$port") 2>/dev/null; }
-            fi
-            if probe; then
-                live+=("$port")
-                livebk+=("${backends[$j]:-${backends[0]}}")
-            else
-                echo "side ${LABELS[$i]}: nothing answers on port $port; sweeping without it" >&2
-            fi
-            j=$((j + 1))
-        done
-        if [ "${#live[@]}" -eq 0 ]; then
-            echo "side ${LABELS[$i]}: no port answers" >&2
-            exit 1
-        fi
-        for k in "${!live[@]}"; do
-            awk -v n="${#live[@]}" -v k="$k" 'NR % n == (k + 1) % n' \
-                "$SHOTS/cells" > "$SHOTS/cells.${LABELS[$i]}.$k"
-            # The Marionette sweeper takes the side's screen backend first;
-            # everything after that is the same argument list.
-            if [ "${DRIVERS[$i]}" = cdp ]; then
-                SWEEP=("$HERE/sweep_pages_cdp.py")
-            else
-                SWEEP=("$HERE/sweep_pages_marionette.py" "${livebk[$k]}")
-            fi
-            python3 "${SWEEP[@]}" "${HOSTS[$i]}" "${live[$k]}" \
-                    "${PREFIXES[$i]}" "$WIDTH" "$HEIGHT" "${LABELS[$i]}" \
-                    --scale "$SCALE" ${SCHEME:+--scheme "$SCHEME"} \
-                    "$SHOTS" "$SHOTS/cells.${LABELS[$i]}.$k" "${CSS[@]+"${CSS[@]}"}" \
-                    >"$SHOTS/${LABELS[$i]}.$k.log" 2>&1 &
-            SWEEPERS+=($!)
-        done
-    done
-    trap 'kill "${SWEEPERS[@]}" 2>/dev/null; [ "$KEEP" = 1 ] || rm -rf "$SHOTS"' EXIT
-
-    # Both sides have to be laid out at the same viewport. converge_inner_size
-    # agrees a device size per side and steps off it where the window cannot
-    # hold the one the plan asks for, so a plan size that is not a whole
-    # number of device pixels can leave the two a pixel apart, and a page
-    # whose blocks fill the viewport then differs with no glyph taking part.
-    # Waited for, since a sweeper reports this only once it has converged.
-    vp_a=""; vp_b=""
-    for _ in $(seq 1 600); do
-        vp_a="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[0]}.0.log" 2>/dev/null)"
-        vp_b="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[1]}.0.log" 2>/dev/null)"
-        [ -n "$vp_a" ] && [ -n "$vp_b" ] && break
-        alive=0
-        for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
-        [ "$alive" = 0 ] && break
-        sleep 0.5
-    done
-    # A side that never reported one never converged, and every one of its
-    # sweepers has since exited. No cell can be captured now, so the plan
-    # ends here and prints what the sweepers said.
-    if [ -z "$vp_a" ] || [ -z "$vp_b" ]; then
-        echo "side ${LABELS[0]} or ${LABELS[1]} never reported a viewport, so no cell can be captured:" >&2
-        tail -n 3 "$SHOTS/${LABELS[0]}".*.log "$SHOTS/${LABELS[1]}".*.log 2>/dev/null \
-            | sed 's/^/    /' >&2
-        kill "${SWEEPERS[@]}" 2>/dev/null
-        exit 2
-    fi
-    if [ "$vp_a" != "$vp_b" ]; then
-        echo "side ${LABELS[0]} converged to ${vp_a#viewport } and side ${LABELS[1]} to ${vp_b#viewport }; the two sides would be laid out at different sizes, so every block that fills the viewport would differ without a glyph taking part. Pick a size whose device size both windows can hold." >&2
-        kill "${SWEEPERS[@]}" 2>/dev/null
-        exit 2
-    fi
-
-    # Comparing is most of a sweep's wall time and one cell says nothing about
-    # another, so it runs in a pool that outlives the loop instead of a fresh
-    # interpreter per cell. Waiting and printing stay here: the dispatcher
-    # feeds cells to the pool as their shots land, and the loop below prints
-    # them in plan order as the pool finishes them.
-    mkfifo "$SHOTS/jobs"
-    python3 "$HERE/compare_viewport.py" --serve "$COMPARE_WORKERS" \
-            < "$SHOTS/jobs" >"$SHOTS/serve.log" 2>&1 &
-    COMPARER=$!
-    exec {JOBFD}>"$SHOTS/jobs"
-    want_clusters=0
-    [ -n "$CLUSTERS" ] && want_clusters="${CLUSTERS##* }"
-
-    (
-        stalled=0
-        for n in $(seq 1 "$CELLS"); do
-            cell="$SHOTS/cell$n"
-            a="$cell/${LABELS[0]}_clean.png"; b="$cell/${LABELS[1]}_clean.png"
-            # A cell needs both sides. Sweepers exit at different times when a
-            # side shards, so one being gone does not mean the sweep is over;
-            # the deadline is what ends the wait when nothing arrives at all.
-            waited=0
-            while [ ! -f "$a" ] || [ ! -f "$b" ]; do
-                alive=0
-                for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
-                if [ "$alive" = 0 ]; then break; fi
-                if [ "$waited" -ge "$STALL_TICKS" ]; then
-                    echo "no capture for cell $n in ${STALL_SECONDS}s while a sweeper is still running; treating it as failed" >&2
-                    stalled=$((stalled + 1))
-                    break
-                fi
-                waited=$((waited + 1))
-                sleep 0.05
-            done
-            if [ ! -f "$a" ] || [ ! -f "$b" ]; then
-                # The sweepers make the cell directory as they deliver into
-                # it, so a cell neither side reached has none, and the mark
-                # has nowhere to go. The loop below waits on that mark, so
-                # without the directory it waits forever.
-                mkdir -p "$cell"
-                : > "$cell/failed"
-                # A side that stopped delivering fails every cell after this
-                # one too, each at the full stall wait, so two in a row ends
-                # the plan.
-                if [ "$stalled" -ge 2 ]; then
-                    echo "$n" > "$SHOTS/lastcell"
-                    break
-                fi
-                continue
-            fi
-            stalled=0
-            printf '%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\n' \
-                   "$n" "$DEV_W" "$DEV_H" "$a" "$b" "$cell/out" \
-                   "$cell/clusters.tsv" \
-                   "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
-                   "$want_clusters" >&$JOBFD
-        done
-        [ -f "$SHOTS/lastcell" ] || echo "$CELLS" > "$SHOTS/lastcell"
-    ) &
-    DISPATCH=$!
-
-    for n in $(seq 1 "$CELLS"); do
-        cell="$SHOTS/cell$n"
-        # The dispatcher records where it stopped, so a plan cut short here
-        # stops printing at the same cell.
-        while [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; do
-            if [ -f "$SHOTS/lastcell" ] && [ "$n" -gt "$(cat "$SHOTS/lastcell")" ]; then
-                break
-            fi
-            sleep 0.02
-        done
-        if [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; then
-            break
-        fi
-        if [ -f "$cell/failed" ]; then
-            printf '%-38s %8s  %10s\n' "${ALL_PATHS[$((n-1))]}" \
-                   "${ALL_SCROLLS[$((n-1))]}" "CAPTURE FAILED"
-            grep "^fail $n " "$SHOTS/${LABELS[0]}".*.log \
-                 "$SHOTS/${LABELS[1]}".*.log 2>/dev/null | sed 's/^/    /' >&2
-            FAILED=$((FAILED + 1))
-            continue
-        fi
-        out="$(cat "$cell/out")"
-        pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
-        max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
-        mark=""
-        if [ "${pct:-}" != "100.0000" ] && is_accepted "${ALL_PATHS[$((n-1))]}"; then
-            mark=" accepted"
-            ACCEPTED=$((ACCEPTED + 1))
-        fi
-        printf '%-38s %8s  %9s%%  %8s%s\n' "${ALL_PATHS[$((n-1))]}" \
-               "${ALL_SCROLLS[$((n-1))]}" "${pct:-?}" "${max:-0}" "$mark"
-        if [ -z "$mark" ]; then
-            if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
-            note_divergence "${pct:-}" "$n"
-        fi
-        [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
-        if [ -n "$CLUSTERS" ]; then
-            printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
-        fi
-    done
-    wait "$DISPATCH" 2>/dev/null
-    # Closing the write end is what tells the pool no more cells are coming.
-    exec {JOBFD}>&-
-    wait "$COMPARER" 2>/dev/null
-    wait "${SWEEPERS[@]}" 2>/dev/null
-    # Each worker logs its clusters beside its own cell, since several
-    # appending to one file would interleave their rows.
-    cat "$SHOTS"/cell*/clusters.tsv > "$SHOTS/clusters.tsv" 2>/dev/null
-    [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
-
-    printf '\n%d of %d identical%s\n' "$EXACT" "$CELLS" \
-           "$([ "$ACCEPTED" -gt 0 ] && echo ", $ACCEPTED accepted")"
-    printf '%d cells in %ds, worst channel difference %d%s\n' \
-           "$CELLS" "$(( $(date +%s) - STARTED ))" "$WORST" \
-           "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
-    summarize_clusters
-    warn_if_wedged
-    exit "$((FAILED > 0))"
-fi
-
-# Comparing one cell and capturing the next have nothing to say to each other,
-# so they overlap. The four shots move into a directory of their own, the
-# comparison runs there in the background, and its line is printed just before
-# the next one's. The table arrives in order and a cell at a time, and a sweep
-# costs the captures plus one comparison instead of the sum of the two.
-PENDING=""; P_PATH=""; P_SCROLL=""; P_DIR=""; P_N=0
-
-report() {
-    [ -n "$PENDING" ] || return 0
-    wait "$PENDING"; PENDING=""
-    local out pct max i
-    out="$(cat "$P_DIR/out")"
-    pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
-    max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
-    mark=""
-    if [ "${pct:-}" != "100.0000" ] && is_accepted "$P_PATH"; then
-        mark=" accepted"
-        ACCEPTED=$((ACCEPTED + 1))
-    fi
-    printf '%-38s %8s  %9s%%  %8s%s\n' "$P_PATH" "$P_SCROLL" "${pct:-?}" "${max:-0}" "$mark"
-    if [ -z "$mark" ]; then
-        if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
-        note_divergence "${pct:-}" "$P_N"
-    fi
-    [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
-    if [ -n "$CLUSTERS" ]; then
-        printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
-    fi
-    if [ "$KEEP" != 1 ]; then
-        # Four full-screen PNGs a cell, and a sweep is many cells.
-        rm -rf "$P_DIR"
-    fi
-    return 0
-}
-
+ALL_PATHS=(); ALL_SCROLLS=()
+: > "$SHOTS/cells"
 for entry in "${PAGES[@]}"; do
     set -- $entry
     path="$1"; shift
     for scroll in "$@"; do
         CELLS=$((CELLS + 1))
-        pids=()
-        for i in 0 1; do
-            "$HERE/capture_viewport.sh" --driver "${DRIVERS[$i]}" "${BACKENDS[$i]}" \
-                "$SHOTS/${LABELS[$i]}" "${HOSTS[$i]}" "${PORTS[$i]}" \
-                "${PREFIXES[$i]}/$path" "$WIDTH" "$HEIGHT" --scroll "$scroll" \
-                "${CSS[@]+"${CSS[@]}"}" \
-                >"$SHOTS/${LABELS[$i]}.log" 2>&1 &
-            pids+=($!)
-        done
-        ok=1
-        for pid in "${pids[@]}"; do
-            wait "$pid" || ok=0
-        done
-        if [ "$ok" = 0 ]; then
-            report
-            printf '%-38s %8s  %10s\n' "$path" "$scroll" "CAPTURE FAILED"
-            sed 's/^/    /' "$SHOTS/${LABELS[0]}.log" "$SHOTS/${LABELS[1]}.log" >&2
-            FAILED=$((FAILED + 1))
-            STRIKES=$((STRIKES + 1))
-            # A browser that has stopped answering fails every cell after this
-            # one too, and each of those costs a Marionette setup timeout. One
-            # failure can be a bad page; two in a row is the browser.
-            if [ "$STRIKES" -ge 2 ]; then
-                echo "two cells in a row failed, so the rest of the plan is skipped" >&2
-                break 2
-            fi
-            continue
-        fi
-        STRIKES=0
-
-        report
-        cell="$SHOTS/cell$CELLS"
-        mkdir -p "$cell"
-        for i in 0 1; do
-            mv "$SHOTS/${LABELS[$i]}_marked.png" "$cell/${LABELS[$i]}_marked.png"
-            mv "$SHOTS/${LABELS[$i]}_clean.png"  "$cell/${LABELS[$i]}_clean.png"
-        done
-        python3 "$HERE/compare_viewport.py" "$DEV_W" "$DEV_H" \
-                "$cell/${LABELS[0]}_marked.png" "$cell/${LABELS[0]}_clean.png" \
-                "$cell/${LABELS[1]}_marked.png" "$cell/${LABELS[1]}_clean.png" \
-                --cluster-log "$SHOTS/clusters.tsv" --cluster-tag "$path $scroll" \
-                $CLUSTERS >"$cell/out" 2>&1 &
-        PENDING=$!; P_PATH="$path"; P_SCROLL="$scroll"; P_DIR="$cell"; P_N="$CELLS"
+        ALL_PATHS+=("$path"); ALL_SCROLLS+=("$scroll")
+        printf '%d %s %s\n' "$CELLS" "$path" "$scroll" >> "$SHOTS/cells"
     done
 done
-report
+
+# A side may list several ports, comma-separated, one browser instance
+# each. The cells are dealt out round-robin so the heavy pages, which sit
+# together in the plan, spread across the instances. Ports that do not
+# answer are dropped, so a plan naming a second instance still works with
+# only the first one running.
+SWEEPERS=()
+# Both sweepers hand their frames to the comparison over this. Nothing writes
+# a capture.
+FRAMES="$SHOTS/frames.sock"
+WANT_CLUSTERS=0
+[ -n "$CLUSTERS" ] && WANT_CLUSTERS="${CLUSTERS##* }"
+for i in 0 1; do
+    # The backend field may list one backend per port, in the same order,
+    # for a Marionette side whose instances each need their own screen; a
+    # single backend serves every port.
+    read -ra backends <<< "${BACKENDS[$i]//,/ }"
+    live=(); livebk=(); j=0
+    for port in ${PORTS[$i]//,/ }; do
+        # DevTools answers an HTTP probe; Marionette is a bare socket.
+        if [ "${DRIVERS[$i]}" = cdp ]; then
+            probe() { curl -s --max-time 3 "http://${HOSTS[$i]}:$port/json/version" >/dev/null 2>&1; }
+        else
+            probe() { (exec 3<>"/dev/tcp/${HOSTS[$i]}/$port") 2>/dev/null; }
+        fi
+        if probe; then
+            live+=("$port")
+            livebk+=("${backends[$j]:-${backends[0]}}")
+        else
+            echo "side ${LABELS[$i]}: nothing answers on port $port; sweeping without it" >&2
+        fi
+        j=$((j + 1))
+    done
+    if [ "${#live[@]}" -eq 0 ]; then
+        echo "side ${LABELS[$i]}: no port answers" >&2
+        exit 1
+    fi
+    for k in "${!live[@]}"; do
+        awk -v n="${#live[@]}" -v k="$k" 'NR % n == (k + 1) % n' \
+            "$SHOTS/cells" > "$SHOTS/cells.${LABELS[$i]}.$k"
+        # The Marionette sweeper takes the side's screen backend first;
+        # everything after that is the same argument list.
+        if [ "${DRIVERS[$i]}" = cdp ]; then
+            SWEEP=("$HERE/sweep_pages_cdp.py")
+        else
+            SWEEP=("$HERE/sweep_pages_marionette.py" "${livebk[$k]}")
+        fi
+        FRAME_ARGS=(--frames "$FRAMES"
+                    --labels "${LABELS[0]},${LABELS[1]}"
+                    --clusters "$WANT_CLUSTERS")
+        python3 "${SWEEP[@]}" "${HOSTS[$i]}" "${live[$k]}" \
+                "${PREFIXES[$i]}" "$WIDTH" "$HEIGHT" "${LABELS[$i]}" \
+                --scale "$SCALE" ${SCHEME:+--scheme "$SCHEME"} \
+                "${FRAME_ARGS[@]+"${FRAME_ARGS[@]}"}" \
+                "$SHOTS" "$SHOTS/cells.${LABELS[$i]}.$k" "${CSS[@]+"${CSS[@]}"}" \
+                >"$SHOTS/${LABELS[$i]}.$k.log" 2>&1 &
+        SWEEPERS+=($!)
+    done
+done
+trap 'kill "${SWEEPERS[@]}" 2>/dev/null; [ "$KEEP" = 1 ] || rm -rf "$SHOTS"' EXIT
+
+# Both sides have to be laid out at the same viewport. converge_inner_size
+# agrees a device size per side and steps off it where the window cannot
+# hold the one the plan asks for, so a plan size that is not a whole
+# number of device pixels can leave the two a pixel apart, and a page
+# whose blocks fill the viewport then differs with no glyph taking part.
+# Waited for, since a sweeper reports this only once it has converged.
+vp_a=""; vp_b=""
+for _ in $(seq 1 600); do
+    vp_a="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[0]}.0.log" 2>/dev/null)"
+    vp_b="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[1]}.0.log" 2>/dev/null)"
+    [ -n "$vp_a" ] && [ -n "$vp_b" ] && break
+    alive=0
+    for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && break
+    sleep 0.5
+done
+# A side that never reported one never converged, and every one of its
+# sweepers has since exited. No cell can be captured now, so the plan
+# ends here and prints what the sweepers said.
+if [ -z "$vp_a" ] || [ -z "$vp_b" ]; then
+    missing="${LABELS[0]}"
+    [ -n "$vp_a" ] && missing="${LABELS[1]}"
+    [ -z "$vp_a" ] && [ -z "$vp_b" ] && missing="${LABELS[0]} and ${LABELS[1]}"
+    echo "side $missing never reported a viewport, so no cell can be captured. Every sweeper has to print one, and the size agreement below is checked against it:" >&2
+    tail -n 3 "$SHOTS/${LABELS[0]}".*.log "$SHOTS/${LABELS[1]}".*.log 2>/dev/null \
+        | sed 's/^/    /' >&2
+    kill "${SWEEPERS[@]}" 2>/dev/null
+    exit 2
+fi
+if [ "$vp_a" != "$vp_b" ]; then
+    echo "side ${LABELS[0]} converged to ${vp_a#viewport } and side ${LABELS[1]} to ${vp_b#viewport }; the two sides would be laid out at different sizes, so every block that fills the viewport would differ without a glyph taking part. Pick a size whose device size both windows can hold." >&2
+    kill "${SWEEPERS[@]}" 2>/dev/null
+    exit 2
+fi
+
+# Comparing is most of a sweep's wall time and one cell says nothing about
+# another, so it runs in a pool that outlives the loop instead of a fresh
+# interpreter per cell. The pool pairs the frames itself and ends once every
+# sweeper has connected and then closed; the loop below prints the cells in
+# plan order as it finishes them.
+python3 "$HERE/compare_viewport.py" --serve-frames "$COMPARE_WORKERS" \
+        "$FRAMES" "${#SWEEPERS[@]}" >"$SHOTS/serve.log" 2>&1 &
+COMPARER=$!
+echo "$CELLS" > "$SHOTS/lastcell"
+
+for n in $(seq 1 "$CELLS"); do
+    cell="$SHOTS/cell$n"
+    # lastcell bounds the printing, so a plan cut short stops here too.
+    while [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; do
+        if [ -f "$SHOTS/lastcell" ] && [ "$n" -gt "$(cat "$SHOTS/lastcell")" ]; then
+            break
+        fi
+        # Nothing watches for a side that stopped delivering, so a cell
+        # whose sweepers and comparison are all gone is one that is never
+        # coming.
+        alive=0
+        for pid in "${SWEEPERS[@]}" "$COMPARER"; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        if [ "$alive" = 0 ]; then
+            mkdir -p "$cell"
+            : > "$cell/failed"
+            break
+        fi
+        sleep 0.02
+    done
+    if [ ! -f "$cell/out" ] && [ ! -f "$cell/failed" ]; then
+        break
+    fi
+    if [ -f "$cell/failed" ]; then
+        printf '%-38s %8s  %10s\n' "${ALL_PATHS[$((n-1))]}" \
+               "${ALL_SCROLLS[$((n-1))]}" "CAPTURE FAILED"
+        grep "^fail $n " "$SHOTS/${LABELS[0]}".*.log \
+             "$SHOTS/${LABELS[1]}".*.log 2>/dev/null | sed 's/^/    /' >&2
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+    out="$(cat "$cell/out")"
+    pct="$(printf '%s' "$out" | sed -n 's/.*= \([0-9.]*\)%.*/\1/p' | head -1)"
+    max="$(printf '%s' "$out" | sed -n 's/.*max |diff| \([0-9]*\).*/\1/p' | head -1)"
+    mark=""
+    if [ "${pct:-}" != "100.0000" ] && is_accepted "${ALL_PATHS[$((n-1))]}"; then
+        mark=" accepted"
+        ACCEPTED=$((ACCEPTED + 1))
+    fi
+    printf '%-38s %8s  %9s%%  %8s%s\n' "${ALL_PATHS[$((n-1))]}" \
+           "${ALL_SCROLLS[$((n-1))]}" "${pct:-?}" "${max:-0}" "$mark"
+    if [ -z "$mark" ]; then
+        if [ -n "${max:-}" ] && [ "$max" -gt "$WORST" ]; then WORST="$max"; fi
+        note_divergence "${pct:-}" "$n"
+    fi
+    [ "${pct:-}" = "100.0000" ] && EXACT=$((EXACT + 1))
+    if [ -n "$CLUSTERS" ]; then
+        printf '%s\n' "$out" | sed -n '/cluster(s)/,$p' | sed 's/^/    /'
+    fi
+done
+wait "$COMPARER" 2>/dev/null
+wait "${SWEEPERS[@]}" 2>/dev/null
+# Each worker logs its clusters beside its own cell, since several
+# appending to one file would interleave their rows.
+cat "$SHOTS"/cell*/clusters.tsv > "$SHOTS/clusters.tsv" 2>/dev/null
 [ "$KEEP" = 1 ] && echo "shots kept in $SHOTS" >&2
 
 printf '\n%d of %d identical%s\n' "$EXACT" "$CELLS" \
@@ -660,4 +536,4 @@ printf '%d cells in %ds, worst channel difference %d%s\n' \
        "$([ "$FAILED" -gt 0 ] && echo ", $FAILED failed")"
 summarize_clusters
 warn_if_wedged
-[ "$FAILED" -eq 0 ]
+exit "$((FAILED > 0))"

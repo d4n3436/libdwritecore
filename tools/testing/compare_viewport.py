@@ -367,14 +367,12 @@ def report(a, b, cluster_log=None, cluster_tag=None, want_clusters=False,
 # temporary name so the sweep never sees a partial one. Cluster rows go to a
 # per-cell file, since several workers would otherwise interleave their
 # appends into one log.
-def compare_cell(job):
-    number, width, height, a_path, b_path, out_path, cluster_log, tag, wanted = job
+def write_cell(number, a, b, width, height, out_path, cluster_log, tag, wanted):
+    """Compare one cell's two sides and write the report beside it."""
     buf = io.StringIO()
     stdout = sys.stdout
     sys.stdout = buf
     try:
-        a = crop(a_path, 0, 0, width, height)
-        b = crop(b_path, 0, 0, width, height)
         print("direct capture %dx%d" % (width, height))
         report(a, b, cluster_log, tag, wanted > 0, wanted)
     except BaseException as exc:                     # noqa: BLE001
@@ -388,32 +386,123 @@ def compare_cell(job):
     return number
 
 
-# Compare the cells named on stdin, several at once. A sweep spends most of
-# its wall time here, and one cell is independent of every other, so the pool
-# is what turns the machine's cores on the problem. One line per cell:
-#   <number> <width> <height> <a.png> <b.png> <out> <cluster-log> <tag> <clusters>
-def serve(workers):
+def compare_frames(job):
+    """One cell's comparison, on two frames that were never written down."""
+    number, width, height, a, b, out_path, cluster_log, tag, wanted = job
+    return write_cell(number, a, b, width, height, out_path, cluster_log, tag, wanted)
+
+
+# The frames a sweep captured, paired as they arrive and never written down.
+#
+# Two sweepers run at their own pace, so a side that gets ahead has frames with
+# no other half yet. Each is a whole capture in memory, so a sender is answered
+# only once its frame is held and the reply is withheld while this many are
+# still waiting, which bounds what the skew between the sides can cost.
+UNPAIRED_LIMIT = 12
+
+
+def serve_frames(workers, sock_path, senders):
+    """Pair the frames `senders` sweepers send and compare each pair.
+
+    Ends when every sweeper has connected and then closed, so a plan whose
+    sides finish at different times still gets all of its cells.
+    """
+    import json
     import multiprocessing
-    pending = []
-    with multiprocessing.Pool(workers) as pool:
-        for line in sys.stdin:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 9:
-                continue
-            job = (int(parts[0]), int(parts[1]), int(parts[2]), parts[3],
-                   parts[4], parts[5], parts[6] or None, parts[7], int(parts[8]))
-            pending.append(pool.apply_async(compare_cell, (job,)))
-        pool.close()
-        pool.join()
-    for slot in pending:
+    import socket
+    import threading
+
+    waiting = {}
+    results = []
+    lock = threading.Condition()
+    state = {"joined": 0, "active": 0}
+    pool = multiprocessing.Pool(workers)
+
+    def take(meta, frame):
+        cell = meta["cell"]
+        with lock:
+            while len(waiting) >= UNPAIRED_LIMIT and cell not in waiting:
+                lock.wait(30.0)
+            side = waiting.setdefault(cell, {})
+            side[meta["label"]] = frame
+            side["meta"] = meta
+            if len(side) < 3:
+                return
+            del waiting[cell]
+            lock.notify_all()
+        labels = meta["labels"]
+        job = (cell, meta["w"], meta["h"], side[labels[0]], side[labels[1]],
+               meta["out"], meta["clusters"], meta["tag"], meta["wanted"])
+        results.append(pool.apply_async(compare_frames, (job,)))
+
+    def serve_one(conn):
+        with lock:
+            state["joined"] += 1
+            state["active"] += 1
+        stream = conn.makefile("rwb")
+        try:
+            while True:
+                head = stream.readline()
+                if not head:
+                    return
+                meta = json.loads(head)
+                want = meta["h"] * meta["w"] * 3
+                raw = stream.read(want)
+                if len(raw) != want:
+                    return
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(meta["h"], meta["w"], 3)
+                take(meta, frame)
+                stream.write(b"k\n")
+                stream.flush()
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                stream.close()
+                conn.close()
+            except OSError:
+                pass
+            with lock:
+                state["active"] -= 1
+                lock.notify_all()
+
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(64)
+    threads = []
+
+    def accept_loop():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            thread = threading.Thread(target=serve_one, args=(conn,), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+    accepting = threading.Thread(target=accept_loop, daemon=True)
+    accepting.start()
+    with lock:
+        while state["joined"] < senders or state["active"] > 0:
+            lock.wait(1.0)
+    server.close()
+    accepting.join(5.0)
+    for thread in list(threads):
+        thread.join(30.0)
+    pool.close()
+    pool.join()
+    for slot in results:
         slot.get()
     return 0
 
 
 def main():
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] == "--serve":
-        return serve(int(args[1]))
+    if len(args) == 4 and args[0] == "--serve-frames":
+        return serve_frames(int(args[1]), args[2], int(args[3]))
     if len(args) == 2 and args[0] == "--aggregate":
         return aggregate_clusters(args[1])
     if len(args) == 2 and args[0] == "--fonts":

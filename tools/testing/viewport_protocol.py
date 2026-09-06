@@ -2,9 +2,10 @@
 """
 The parts of a viewport capture that do not depend on which browser it is.
 
-capture_viewport.py drives Firefox over Marionette; capture_viewport_cdp.py
-drives Chromium and Electron over the DevTools protocol. What they have in
-common is everything that matters to the comparison:
+capture_viewport.py takes one cell and the sweepers take a whole plan, over
+Marionette for Firefox and over the DevTools protocol for Chromium and
+Electron. What they have in common is everything that matters to the
+comparison:
 
   the JavaScript          the same page state has to be reached on both sides,
                           so the snippets that set it live here and not in
@@ -826,7 +827,7 @@ return Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
 """
 
 
-def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
+def capture_direct(browser, url, want_w, want_h, out_png=None, scroll=0,
                    deadline=WORK_TIMEOUT, css=None):
     """Put the page into the compared state and read the frame back over CDP.
 
@@ -837,6 +838,11 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
     and the two routes are never mixed.
 
     CDP only. The Marionette route keeps the marker handshake in capture().
+
+    With no `out_png` the encoded frame is returned instead of written, so a
+    sweep can hand it straight to a comparison and put nothing on disk. The
+    stability loop stays here either way: refusing a frame that never held
+    still twice is what keeps a mid-paint capture from becoming a measurement.
     """
     browser.navigate(url)
     await_condition(browser, PAGE_LOADED, deadline, "the page never finished loading")
@@ -883,6 +889,11 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
         if time.time() > stable_end:
             raise RuntimeError("%s never held still for two captures" % url)
         data = fresh
+    # Without a path the caller wants the frame itself. These are the PNG bytes
+    # as the browser encoded them, so the caller decodes and composites away
+    # the alpha the way crop() does for a file.
+    if out_png is None:
+        return data
     # Through a temporary name, so a reader waiting for this file never sees
     # a partial one. The sweep compares cells as soon as both sides' shots
     # appear, and several comparisons run at once, so the window between
@@ -891,6 +902,7 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
     with open(part, "wb") as handle:
         handle.write(data)
     os.replace(part, out_png)
+    return None
 
 
 def capture(browser, url, want_w, want_h, tag, scroll=0, deadline=WORK_TIMEOUT,

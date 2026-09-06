@@ -6,14 +6,14 @@ Capture one Firefox side of a whole plan over a single Marionette connection.
                                             <width> <height> <label> \
                                             <out_dir> <cells> [--css RULES]
 
-<cells> is a file with one cell per line, "<index> <path> <scroll>". Each cell
-becomes <out_dir>/cell<index>/<label>_clean.png, exactly width by height. The
-page is laid out STRIP pixels taller than that, the same on every Marionette
-side, and the strip below the compared part is where the capture marker goes.
-One line per cell goes to stdout, "ok <index>" followed by the milliseconds
-the load, the settle, the capture and the encode took, or "fail <index>
-<why>", so the caller can compare finished cells while later ones are still
-being captured. This is the sibling of sweep_pages_cdp.py for a side whose
+<cells> is a file with one cell per line, "<index> <path> <scroll>". Each
+cell's frame goes to the comparison over --frames, exactly width by height,
+and nothing is written down. The page is laid out STRIP pixels taller than
+that, the same on every Marionette side, and the strip below the compared part
+is where the capture marker goes. One line per cell goes to stdout, "ok
+<index>" followed by the milliseconds the load, the settle, the capture and
+the hand-over took, or "fail <index> <why>", so the caller can compare
+finished cells while later ones are still being captured. This is the sibling of sweep_pages_cdp.py for a side whose
 driver is marionette.
 
 The screen is still what gets read. Firefox has no faithful in-browser capture:
@@ -51,8 +51,8 @@ import sys
 import time
 
 import numpy as np
-from PIL import Image
 
+from screen_grab import open_grabber
 import viewport_protocol as vp
 
 # The page's own rules reach a bare div. `left:0` positions the margin box, so
@@ -199,253 +199,6 @@ PAINTED_AFTER = "return (window.__dwc_last_paint || 0) > arguments[0];"
 
 
 
-class X11Grabber:
-    """The root window of one X display, read straight into memory."""
-
-    # GetImage answers BadMatch for a root window the server will not read
-    # right then, and the next attempt a moment later succeeds. One of those
-    # used to lose the cell, and a lost cell reads as a difference, so the
-    # grab is retried the way the rest of the capture retakes a shot that did
-    # not answer. The geometry is read again first, since a root that resized
-    # is the other thing BadMatch reports.
-    _RETRIES = 4
-
-    def __init__(self, spec):
-        from Xlib import display, X, error
-        self._X = X
-        self._error = error
-        self._display = display.Display(spec)
-        self._root = self._display.screen().root
-        self._measure()
-
-    def _measure(self):
-        geometry = self._root.get_geometry()
-        self.width, self.height = geometry.width, geometry.height
-
-    def grab(self, x=0, y=0, w=None, h=None):
-        want_w, want_h = w, h
-        last = None
-        for attempt in range(self._RETRIES):
-            w = self.width if want_w is None else want_w
-            h = self.height if want_h is None else want_h
-            try:
-                raw = self._root.get_image(x, y, w, h, self._X.ZPixmap, 0xFFFFFFFF)
-            except (self._error.BadMatch, self._error.BadDrawable) as caught:
-                last = caught
-                time.sleep(0.05 * (attempt + 1))
-                self._measure()
-                continue
-            flat = np.frombuffer(raw.data, dtype=np.uint8)
-            return flat.reshape(h, w, 4)[:, :, 2::-1]
-        raise last
-
-
-class LibvirtGrabber:
-    """A guest's whole display, through QEMU's own screendump.
-
-    libvirt's screenshot API hands back a PNG, and the encode is most of what it
-    costs: 124 ms against 17 ms for the same frame dumped as a PPM, and 37 ms to
-    decode against 4 ms. QEMU writes the file on the host itself, so the image
-    never crosses the libvirt stream. The two routes were compared over a whole
-    2560x1440 frame and are identical, max channel difference 0.
-    """
-
-    def __init__(self, domain):
-        self.domain = domain
-        self.path = "/tmp/dwc-screendump-%s.ppm" % domain
-        self._pixels = None
-        self._dump()
-        self._header()
-
-    def _dump(self):
-        uri = os.environ.get("LIBVIRT_URI", "qemu:///system")
-        command = json.dumps({"execute": "screendump",
-                              "arguments": {"filename": self.path}})
-        subprocess.run(["virsh", "--connect", uri, "qemu-monitor-command",
-                        self.domain, command], check=True, capture_output=True)
-
-    def _header(self):
-        """Where the pixels start in the P6 file, and how wide a row is.
-
-        Read once: the guest's mode does not change under a sweep. It lets a
-        poll read the sixteen rows it looks at instead of all 11 MB.
-        """
-        if self._pixels is None:
-            with open(self.path, "rb") as handle:
-                fields = []
-                while len(fields) < 4:
-                    line = handle.readline()
-                    if line.startswith(b"#"):
-                        continue
-                    fields.extend(line.split())
-                self._pixels = handle.tell()
-            self.width, self.height = int(fields[1]), int(fields[2])
-        return self._pixels
-
-    def grab(self, x=0, y=0, w=None, h=None):
-        self._dump()
-        start = self._header()
-        rows = self.height if h is None else h
-        flat = np.fromfile(self.path, dtype=np.uint8,
-                           count=rows * self.width * 3,
-                           offset=start + y * self.width * 3)
-        frame = flat.reshape(rows, self.width, 3)
-        return frame if w is None else frame[:, x:x + w]
-
-
-class GuestGrabber:
-    """A window inside a Windows guest, read over TCP from wincap.exe.
-
-    screendump photographs the emulated framebuffer, so it sees only what the
-    console is scanning out. wincap runs inside the session that owns the
-    window and asks the window to render itself, so a capture does not need
-    that session to be the one on screen.
-
-    GRABZ is used for the payload, which is PackBits over whole pixels. A page
-    of text compresses enough that the wire is not what a sweep costs.
-
-    The connection is kept. wincap answers one request per connection unless
-    the client opens with KEEP, and a handshake polls the screen several times
-    a cell, so a fresh TCP connect for each costs more than a small grab. A
-    server that declines KEEP is served one request per connection.
-    """
-
-    def __init__(self, spec, marionette_port):
-        # guest:<host> alone means the capture server sits one above the
-        # browser's Marionette port, which is where run_parity_firefox.sh
-        # starts it for each instance.
-        host, _, port = spec.rpartition(":")
-        if not host:
-            host, port = spec, str(marionette_port + 1)
-        if not host or not port.isdigit():
-            sys.exit("guest backend is guest:<host>[:<port>]")
-        self.addr = (host, int(port))
-        self.sock = None
-        self.stream = None
-        self.keep = self._open()
-        self.width, self.height = self._size()
-
-    def _open(self):
-        """Connect and ask to keep it. True once the server has agreed."""
-        sock = socket.create_connection(self.addr, timeout=60)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        stream = sock.makefile("rb")
-        sock.sendall(b"KEEP\n")
-        if stream.readline().strip() == b"OK":
-            self.sock, self.stream = sock, stream
-            return True
-        stream.close()
-        sock.close()
-        return False
-
-    def _drop(self):
-        for handle in (self.stream, self.sock):
-            try:
-                if handle is not None:
-                    handle.close()
-            except OSError:
-                pass
-        self.sock = self.stream = None
-
-    def _ask(self, request, read):
-        """Send one request and read exactly its answer.
-
-        Every answer is self-delimiting, so the reader stops on its own
-        boundary and leaves the connection at the start of the next one.
-        """
-        if not self.keep:
-            sock = socket.create_connection(self.addr, timeout=60)
-            try:
-                sock.sendall(request)
-                return read(sock.makefile("rb"))
-            finally:
-                sock.close()
-        for attempt in (0, 1):
-            try:
-                if self.sock is None and not self._open():
-                    self.keep = False
-                    return self._ask(request, read)
-                self.sock.sendall(request)
-                return read(self.stream)
-            except OSError:
-                self._drop()
-                if attempt:
-                    raise
-        raise RuntimeError("unreachable")
-
-    @staticmethod
-    def _read_size(stream):
-        return stream.readline().split()
-
-    @staticmethod
-    def _read_frame(stream):
-        # "PK\n<w> <h> <bytes>\n", then the packed pixels.
-        head = stream.readline().strip()
-        if head != b"PK":
-            sys.exit("wincap answered %r, not a packed frame" % head[:16])
-        gw, gh, count = (int(v) for v in stream.readline().split())
-        if gw <= 0 or gh <= 0:
-            sys.exit("wincap could not capture the window")
-        packed = stream.read(count)
-        if len(packed) != count:
-            raise OSError("wincap sent %d of %d packed bytes" % (len(packed), count))
-        return _unpack(packed, gw, gh)
-
-    def _size(self):
-        answer = self._ask(b"SIZE\n", self._read_size)
-        if len(answer) != 2:
-            sys.exit("wincap did not answer SIZE")
-        return int(answer[0]), int(answer[1])
-
-    def grab(self, x=0, y=0, w=None, h=None):
-        # The whole window means the window as it is now, which is not the
-        # size it had when this opened once the sweep has resized it.
-        if w is None or h is None:
-            self.width, self.height = self._size()
-        w = self.width if w is None else w
-        h = self.height if h is None else h
-        return self._ask(b"GRABZ %d %d %d %d\n" % (x, y, w, h), self._read_frame)
-
-
-def _unpack(packed, w, h):
-    """Decode PackBits over whole pixels, the encoding GRABZ writes.
-
-    A leading byte over 127 is a run of 257 - b pixels of the one color that
-    follows. Otherwise it is b + 1 literal pixels.
-    """
-    flat = np.empty((h * w, 3), dtype=np.uint8)
-    src = 0
-    out = 0
-    total = h * w
-    while out < total and src < len(packed):
-        control = packed[src]
-        src += 1
-        if control > 127:
-            run = min(257 - control, total - out)
-            flat[out:out + run] = np.frombuffer(packed, np.uint8, 3, src)
-            src += 3
-            out += run
-        else:
-            lit = min(control + 1, total - out)
-            flat[out:out + lit] = np.frombuffer(
-                packed, np.uint8, lit * 3, src).reshape(lit, 3)
-            src += (control + 1) * 3
-            out += lit
-    if out != total:
-        sys.exit("wincap sent %d of %d pixels" % (out, total))
-    return flat.reshape(h, w, 3)
-
-
-def open_grabber(backend, marionette_port):
-    kind, _, rest = backend.partition(":")
-    if kind == "x11":
-        return X11Grabber(rest)
-    if kind == "libvirt":
-        return LibvirtGrabber(rest)
-    if kind == "guest":
-        return GuestGrabber(rest, marionette_port)
-    raise SystemExit("backend must be x11:<display>, libvirt:<domain> "
-                     "or guest:<host>[:<port>]")
 
 
 # What an unobstructed marker is worth to marker_mask, which is the magenta
@@ -581,6 +334,41 @@ def handshake_frame(browser, grabber, x, y, w, h, scale, flipped,
         browser.script_async(vp.PAINTED)
 
 
+# A frame goes to the comparison pool over a socket, and the reply is what
+# paces the sweep. Waiting for it holds a side that has run ahead until its
+# frames have been paired, so the skew between the two sides costs a bounded
+# number of frames instead of one per cell.
+def open_sender(path, deadline=60.0):
+    import socket
+    # The pool is started once the caller knows how many sweepers there are,
+    # which is after the sweepers themselves, so the socket can be a moment
+    # behind this.
+    end = time.time() + deadline
+    while True:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.connect(path)
+            return conn.makefile("rwb")
+        except OSError:
+            conn.close()
+            if time.time() > end:
+                raise
+            time.sleep(0.1)
+
+
+def send_frame(stream, index, label, labels, frame, out, clusters, tag, wanted):
+    import json
+    pixels = np.ascontiguousarray(frame[:, :, :3], dtype=np.uint8)
+    head = {"cell": int(index), "label": label, "labels": labels,
+            "h": int(pixels.shape[0]), "w": int(pixels.shape[1]),
+            "out": out, "clusters": clusters, "tag": tag, "wanted": wanted}
+    stream.write((json.dumps(head) + "\n").encode("utf-8"))
+    stream.write(pixels.tobytes())
+    stream.flush()
+    if not stream.readline():
+        raise RuntimeError("the comparison pool closed before the frame landed")
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("backend")
@@ -599,6 +387,15 @@ def main():
                          "report. Refused when it does not, since the scheme "
                          "is set when the browser starts and nothing in a "
                          "plan otherwise says which one a run measured")
+    ap.add_argument("--frames", required=True,
+                    help="a unix socket to send the captured frames to. The "
+                         "pair is compared in memory there and no capture is "
+                         "written down.")
+    ap.add_argument("--labels", default=None,
+                    help="both sides' labels, comma separated and in the "
+                         "order the comparison reports them")
+    ap.add_argument("--clusters", type=int, default=0,
+                    help="how many differing-pixel clusters to describe")
     ap.add_argument("--scale", type=float, default=None,
                     help="the device pixel ratio this side is expected to be "
                          "at. The sweep refuses a browser that is not, since a "
@@ -609,6 +406,7 @@ def main():
 
     browser = vp.open_browser("marionette:%s:%d" % (args.host, args.port))
     grabber = open_grabber(args.backend, args.port)
+    labels = args.labels.split(",") if args.labels else [args.label, args.label]
     vp.converge_inner_size(browser, args.width, args.height + STRIP,
                            vp.SETUP_TIMEOUT)
     vp.hide_scrollbars(browser)
@@ -623,6 +421,11 @@ def main():
     vp_dw, vp_dh, vp_aw, vp_ah = browser.script(vp.VIEWPORT_UNITS)
     print("viewport %dx%d device %dx%d appunits"
           % (vp_dw, vp_dh, vp_aw, vp_ah), file=sys.stderr, flush=True)
+    # Connected here, once the viewport has been reported and the caller has
+    # started the comparison on the strength of it. Every sweeper connects
+    # whether or not it has a frame to send, since the pool waits for all of
+    # them before it decides the plan is over.
+    sender = open_sender(args.frames)
     if args.scheme is not None:
         seen = browser.script("return matchMedia('(prefers-color-scheme: dark)')"
                               ".matches ? 'dark' : 'light';")
@@ -647,7 +450,6 @@ def main():
             index, path, scroll = parts[0], parts[1], int(parts[2])
             cell = os.path.join(args.out_dir, "cell" + index)
             os.makedirs(cell, exist_ok=True)
-            out = os.path.join(cell, args.label + "_clean.png")
             # SystemExit included: the waits in viewport_protocol exit on a
             # timeout, which must not take the rest of the plan with it here.
             try:
@@ -696,27 +498,28 @@ def main():
                                             args.width, args.height, scale,
                                             taken % 2 == 1, final=True)
                 grabbed = time.time()
-                # Through a temporary name, so a reader waiting for this
-                # file never sees a partial one. The sweep compares cells as
-                # soon as both sides' shots appear, and several comparisons
-                # run at once, so the window between creating the file and
-                # filling it is one a reader does reach.
-                part = out + ".part"
-                # Named, because the temporary has no .png on the end for
-                # Image.save to infer the format from.
-                Image.fromarray(frame).save(part, "PNG", compress_level=1)
-                os.replace(part, out)
+                send_frame(sender, index, args.label, labels, frame,
+                           os.path.join(cell, "out"),
+                           os.path.join(cell, "clusters.tsv"),
+                           "%s %d" % (path, scroll), args.clusters)
             except (Exception, SystemExit) as exc:
                 print("fail %s %s" % (index, exc), flush=True)
+                # Nothing else marks a cell this side never delivered, and the
+                # caller waits on the mark.
+                open(os.path.join(cell, "failed"), "a").close()
                 continue
             # Where the cell's time went, in milliseconds, so a slow sweep
             # can be read off its logs: the load, the settle, the capture
-            # handshake, and the encode.
+            # handshake, and handing the frame over.
             print("ok %s %d %d %d %d" % (index, (loaded - started) * 1000,
                                          (settled - loaded) * 1000,
                                          (grabbed - settled) * 1000,
                                          (time.time() - grabbed) * 1000),
                   flush=True)
+
+    # Closing is what tells the pool this side is done; it waits for every
+    # sweeper to have connected and then gone.
+    sender.close()
 
 
 if __name__ == "__main__":
