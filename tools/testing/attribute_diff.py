@@ -83,6 +83,26 @@ SNAPSHOT = """
 """
 
 
+def device_scale(browser):
+    """Device pixels per CSS pixel on this side.
+
+    getBoundingClientRect answers in CSS pixels and a capture is device
+    pixels. At any scale but 1 the boxes land away from the ink they cover,
+    so every differing pixel misses every box and the whole difference reads
+    as `chrome`.
+    """
+    return float(browser.script("return window.devicePixelRatio;"))
+
+
+def to_device(rows, scale):
+    """The snapshot's rects, in the units the capture is in."""
+    if scale != 1.0:
+        for r in rows.values():
+            for i in (3, 4, 5, 6):
+                r[i] = r[i] * scale
+    return rows
+
+
 def snapshot(browser, url, scroll=0):
     browser.navigate(url)
     vp.await_condition(browser, vp.PAGE_LOADED, 60, "the page never finished loading")
@@ -164,7 +184,7 @@ def label_map(rows, width, height):
     """
     labels = np.full((height, width), -1, np.int32)
     depths = np.zeros((height, width), np.int32)
-    for r in sorted(rows.values(), key=lambda r: r[2]):
+    for r in sorted(rows.values(), key=lambda rec: rec[2]):
         x0, y0 = max(0, int(math.floor(r[3]))), max(0, int(math.floor(r[4])))
         x1 = min(width, int(math.ceil(r[3] + r[5])))
         y1 = min(height, int(math.ceil(r[4] + r[6])))
@@ -354,8 +374,15 @@ def main():
     ba = vp.open_browser(args.a)
     bb = vp.open_browser(args.b)
     try:
-        rows_a = snapshot(ba, args.url, args.scroll)
-        rows_b = snapshot(bb, args.url_b or args.url, args.scroll)
+        scale_a, scale_b = device_scale(ba), device_scale(bb)
+        if scale_a != scale_b:
+            print("the two sides are at %g and %g device pixels per CSS pixel; "
+                  "compare them at one scale" % (scale_a, scale_b), file=sys.stderr)
+            return 2
+        if scale_a != 1.0:
+            print("boxes taken to device pixels at %g" % scale_a)
+        rows_a = to_device(snapshot(ba, args.url, args.scroll), scale_a)
+        rows_b = to_device(snapshot(bb, args.url_b or args.url, args.scroll), scale_b)
 
         # The tree, from the recorded-ancestor field, so a box whose own rect
         # agrees can still be caught holding something that moved.
@@ -363,7 +390,7 @@ def main():
         for r in rows_a.values():
             children.setdefault(r[11], []).append(r[0])
 
-        def moved_inside(index, band):
+        def moved_inside(node, y_range):
             """A descendant that sits differently, in the rows that differ.
 
             Text after a run that changed width shifts along with it while
@@ -372,15 +399,15 @@ def main():
             count, since a block that moved at the other end of a long
             container did not put these pixels where they are.
             """
-            lo, hi = band
-            stack = list(children.get(index, []))
+            lo_y, hi_y = y_range
+            stack = list(children.get(node, []))
             while stack:
                 j = stack.pop()
                 stack.extend(children.get(j, []))
                 ja, jb = rows_a.get(j), rows_b.get(j)
                 if ja is None or jb is None or ja[3:7] == jb[3:7]:
                     continue
-                if min(ja[4], jb[4]) <= hi and max(ja[4] + ja[6], jb[4] + jb[6]) >= lo:
+                if min(ja[4], jb[4]) <= hi_y and max(ja[4] + ja[6], jb[4] + jb[6]) >= lo_y:
                     return ja, jb
             return None
 
@@ -418,10 +445,11 @@ def main():
             try:
                 fa, fb = platform_fonts(ba, index), platform_fonts(bb, index)
             except FontQueryFailed as err:
-                sys.exit("the browsers could not be asked which faces drew "
-                         "element %d: %s\nEvery verdict below it would read as "
-                         "raster, so nothing is reported. Recapture against the "
-                         "browsers that are running now." % (index, err))
+                raise SystemExit("the browsers could not be asked which faces "
+                                 "drew element %d: %s\nEvery verdict below it "
+                                 "would read as raster, so nothing is reported. "
+                                 "Recapture against the browsers that are "
+                                 "running now." % (index, err)) from err
             kind, why = classify(ra, rb, fa, fb, moved_inside(index, band[index]))
             detail.append([counts[index], kind, why, ra, index, fa, fb])
 
@@ -431,10 +459,10 @@ def main():
         # everything is classified, a raster verdict is withdrawn if a
         # substituted element's box, grown by its font size, reaches the
         # pixels, that being how far a glyph's ink can go.
-        def reaches(r, lo, hi, left, right):
-            reach = size(r)
-            return (r[4] - reach <= hi and r[4] + r[6] + reach >= lo
-                    and r[3] - reach <= right and r[3] + r[5] + reach >= left)
+        def reaches(rec, lo_y, hi_y, x_left, x_right):
+            reach = size(rec)
+            return (rec[4] - reach <= hi_y and rec[4] + rec[6] + reach >= lo_y
+                    and rec[3] - reach <= x_right and rec[3] + rec[5] + reach >= x_left)
 
         known = {row[4]: (row[3], row[5], row[6]) for row in detail}
         for row in detail:
@@ -446,7 +474,7 @@ def main():
             # these pixels is the one asked about, and the search stops there.
             near = sorted((r for j, r in rows_a.items()
                            if j != row[4] and j in rows_b and reaches(r, lo, hi, left, right)),
-                          key=lambda r: r[5] * r[6])
+                          key=lambda rec: rec[5] * rec[6])
             for ra_near in near[:8]:
                 j = ra_near[0]
                 if j in known:

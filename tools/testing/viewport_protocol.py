@@ -42,10 +42,62 @@ import urllib.request
 INNER = ("return [window.innerWidth, window.innerHeight, "
          "window.outerWidth, window.outerHeight];")
 
+# The same reading, with the layout viewport measured in device pixels.
+#
+# window.innerWidth is a whole number of CSS pixels, and above a device pixel
+# ratio of one it is a rounded one: at 1.5 a root 2098 device pixels wide and
+# one 2099 wide both answer 1399. Two sides converged on that number can
+# therefore sit a device pixel apart, which is a different layout and a
+# different capture, and nothing in the CSS reading says so. The root's own
+# rectangle is not rounded, so it is what the sizes are held to.
+INNER_DEVICE = """
+const d = window.devicePixelRatio;
+// visualViewport carries the viewport unrounded, where innerWidth and
+// clientWidth are whole CSS pixels. The root's own rectangle is the document,
+// which is shorter than the viewport on a short page, so it answers for
+// neither dimension.
+const v = window.visualViewport;
+const w = v ? v.width : window.innerWidth;
+const h = v ? v.height : window.innerHeight;
+return [window.innerWidth, window.innerHeight, window.outerWidth,
+        window.outerHeight, Math.round(w * d), Math.round(h * d), d];
+"""
+
+# The viewport a page is laid out in, in device pixels and in the app units
+# Gecko lays out in. converge_inner_size agrees a device size per side, and a
+# side that cannot hold the one the plan asks for steps to a size it can. Two
+# sides that step differently lay the page out at different heights, and every
+# block filling the viewport is then a device pixel apart.
+VIEWPORT_UNITS = """
+const v = window.visualViewport, d = window.devicePixelRatio;
+const w = v ? v.width : window.innerWidth;
+const h = v ? v.height : window.innerHeight;
+return [Math.round(w * d), Math.round(h * d), Math.round(w * 60), Math.round(h * 60)];
+"""
+
 # readyState reaches complete before font loading has settled, and a capture
 # taken in between catches the page laid out with the fonts it had at the time.
 PAGE_LOADED = """
 return document.readyState === 'complete' && document.fonts.status === 'loaded';
+"""
+
+# Whether a web font came over the network on this load.
+#
+# A page that measures during parsing gets the fallback face while the font is
+# still in flight and the real one once it is cached, and the two answers are
+# different layouts. The corpus is served without cache headers, so a
+# stylesheet is refetched every time and its transfer size says nothing; a font
+# already in the font cache is not requested again at all, and so has no
+# resource entry. An entry for a font file therefore means this load raced it
+# and the next one will not.
+FONT_OVER_NETWORK = """
+const kFontFile = /\\.(ttf|otf|ttc|otc|woff2?)(\\?|$)/i;
+for (const entry of performance.getEntriesByType('resource')) {
+  if (kFontFile.test(new URL(entry.name, location.href).pathname)) {
+    return true;
+  }
+}
+return false;
 """
 
 # Fonts loaded and no pending layout. document.fonts.ready alone is not
@@ -92,12 +144,19 @@ SHAPE = ("return document.documentElement.scrollHeight + 'x' +"
 # their width differs between platforms and would shift the content.
 MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
-const d = document.createElement('div');
+// An element name no page selects, with its pseudo-elements refused.
+// all:initial cannot reach a generated box, so a page styling *::after would
+// paint over the marker and fail the capture; the rule below refuses it one.
+const g = document.createElement('style');
+g.textContent = '#__dwc_origin_mark::before,#__dwc_origin_mark::after'
+              + '{content:none!important;display:none!important}';
+document.documentElement.appendChild(g);
+const d = document.createElement('dwc-origin-mark');
 d.id = '__dwc_origin_mark';
-// all:initial first, because the page's own rules reach a bare div. A
-// `div { margin: 0 20px }` moves the marker, since left:0 positions the
-// margin box, and a border grows it; the crop then starts in the wrong
-// place or off the window entirely.
+// all:initial first, because the page's own rules still reach it through a
+// universal selector. A `* { margin: 0 20px }` moves the marker, since left:0
+// positions the margin box, and a border grows it; the crop then starts in
+// the wrong place or off the window entirely.
 // Two off-primary colors in vertical stripes, magenta on columns 0-3 and
 // green on 4-7. Neither half alone is enough: rgb(255,0,255) is `magenta`,
 // `fuchsia` and `#f0f` at once, and a page painting it in the corner captures
@@ -560,20 +619,53 @@ def converge_inner_size(browser, want_w, want_h, deadline):
     request adds the chrome to an outer size that has already grown, and the
     window runs away until the override below is taken for a window that was
     resizing fine.
+
+    Above a ratio of one the CSS size is not enough. It is rounded, so two
+    sides holding the same innerWidth can still be a device pixel apart, and
+    every length the page derives from the viewport carries that pixel: the
+    root, the body inside it, and each block that fills them. The device size
+    is therefore agreed as well, and the CSS size is what is asked for to
+    reach it.
     """
     end = time.time() + deadline
     agreed = 0
     forced = False
     misses = 0
+    want_dev_w = want_dev_h = None
     while agreed < 4:
-        iw, ih, ow, oh = browser.script(INNER)
-        if (iw, ih) == (want_w, want_h):
+        reading = browser.script(INNER_DEVICE)
+        iw, ih, ow, oh = reading[0], reading[1], reading[2], reading[3]
+        dev_w, dev_h, dpr = reading[4], reading[5], float(reading[6])
+        if want_dev_w is None:
+            want_dev_w = int(round(want_w * dpr))
+            want_dev_h = int(round(want_h * dpr))
+            # The window is asked for in whole CSS pixels and placed on a
+            # device grid, and the chrome between the outer and inner sizes is
+            # not a whole number of CSS pixels. That fixes the parity of every
+            # inner size the window can hold: where the chrome comes to an odd
+            # number of device pixels, only odd inner sizes exist, and a target
+            # computed from a whole CSS size is always even. Such a target is
+            # unreachable however long it is waited for, so it is stepped.
+            # Both sides carry the same constraint, so they step together and
+            # land on the same size.
+            tried = 0
+        # The device size is what is agreed, since that is what a capture is of
+        # and what every length the page derives from the viewport is built on.
+        # At a ratio of one it is the CSS size and this is the old test.
+        if (dev_w, dev_h) == (want_dev_w, want_dev_h):
             agreed += 1
             continue
         agreed = 0
         if time.time() > end:
-            sys.exit("window never held %dx%d inner (last %dx%d)"
-                     % (want_w, want_h, iw, ih))
+            # A target the grid cannot express is stepped by one and tried
+            # again, once each way, before the size is given up on.
+            if tried < 2:
+                tried += 1
+                want_dev_h += -1 if tried == 1 else 2
+                end = time.time() + deadline
+                continue
+            sys.exit("window never held %dx%d device pixels (last %dx%d, inner %dx%d)"
+                     % (want_dev_w, want_dev_h, dev_w, dev_h, iw, ih))
         if forced:
             time.sleep(POLL)
             continue
@@ -589,8 +681,17 @@ def converge_inner_size(browser, want_w, want_h, deadline):
         # values, and the subtraction would then ask for a negative size.
         # Asking for the inner size itself is wrong by exactly the chrome and
         # is corrected on the next turn of this loop.
-        if browser.set_window_rect(want_w + max(ow - iw, 0),
-                                   want_h + max(oh - ih, 0)) is False:
+        # What the inner size still has to move, taken to CSS pixels because
+        # that is what the call is made in, and never less than one so a
+        # difference smaller than a CSS pixel still moves the window.
+        def toward(now, want):
+            gap = (want - now) / dpr
+            if gap == 0:
+                return 0
+            return int(gap) if abs(gap) >= 1 else (1 if gap > 0 else -1)
+
+        if browser.set_window_rect(ow + toward(dev_w, want_dev_w),
+                                   oh + toward(dev_h, want_dev_h)) is False:
             # An app that sizes its own window answers False. Electron's does
             # and already holds the size, so this is only reached where the
             # two sides disagree: cefsimple opens 800x600 and cefclient 784x485,
@@ -752,8 +853,11 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
     # background image decodes with nothing to await and its first frame can
     # land after any fixed number of quiet ones. Two consecutive captures
     # with the same bytes can. The wait between tries is the paint settle
-    # itself, and a page that never stabilizes keeps its newest frame once
-    # the window closes, which is what a single capture did anyway.
+    # itself.
+    #
+    # A frame the window closed on is not a capture. Raising hands it to the
+    # sweep's retry: kept, it is indistinguishable from a settled frame and a
+    # mid-paint one becomes a measurement.
     # optimizeForSpeed trades PNG size for encode time. Lossless either way,
     # and the encode is the whole cost of a busy frame without it.
     stable_end = time.time() + 5.0
@@ -764,9 +868,10 @@ def capture_direct(browser, url, want_w, want_h, out_png, scroll=0,
                             {"format": "png", "fromSurface": True,
                              "optimizeForSpeed": True})
         fresh = base64.b64decode(shot["data"])
-        if fresh == data or time.time() > stable_end:
-            data = fresh
+        if fresh == data:
             break
+        if time.time() > stable_end:
+            raise RuntimeError("%s never held still for two captures" % url)
         data = fresh
     # Through a temporary name, so a reader waiting for this file never sees
     # a partial one. The sweep compares cells as soon as both sides' shots

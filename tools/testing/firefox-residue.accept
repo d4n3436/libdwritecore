@@ -115,3 +115,37 @@ wt/external/wpt/css/css-pseudo/reference/grammar-spelling-errors-00[12]-ref.html
 # so no glyph takes part and font metrics cannot reach it.
 wt/external/wpt/css/css-text-decor/text-underline-offset-scroll-001.html
 wt/external/wpt/css/css-text-decor/reference/text-underline-offset-scroll-001-notref.html
+
+# Firefox's broken-image placeholder, which one of two Firefoxes paints and the
+# other does not. Every one of these pages carries `<img src="broken">`, and the
+# whole difference is the 16x16 icon in that image's box: 209 px at a max
+# channel difference of 252, one side drawing the icon and the other leaving
+# the box white. On a page sitting on its own it is drawn every time, so it
+# takes the load of a full sweep to miss.
+#
+# Two Linux Firefoxes compared against each other, four sweeps, differ on these
+# same pages whether or not the shim is loaded at all - 763, 764 and 765 of 765
+# across the four, with the misses landing on this family every time and on a
+# different member of it each run. Nothing the shim answers is in an image, and
+# with it out of the process the cells still differ, so this is Gecko deciding
+# whether the icon is ready when the page paints.
+wt/external/wpt/css/css-writing-modes/abs-pos-vlr-border-001.html
+wt/external/wpt/css/css-writing-modes/abs-pos-vlr-border-001-ref.html
+wt/external/wpt/css/css-writing-modes/abs-pos-vlr-padding-001.html
+wt/external/wpt/css/css-writing-modes/abs-pos-vlr-padding-001-ref.html
+wt/external/wpt/css/css-contain/contain-inline-size-replaced.html
+wt/external/wpt/css/css-contain/contain-size-replaced-003-ref.html
+wt/external/wpt/css/css-contain/contain-size-replaced-003[abc].html
+
+# Pages that remove their own content a frame or two after they load, so what a
+# capture holds depends on which side of that it lands.
+# table-root-direction-propagation-crash puts a border on a root that is
+# display:table and then removes the body from inside a doubled
+# requestAnimationFrame; the body going takes the table's height with it, so
+# the difference is 24 px of that border at the viewport's right edge, at a max
+# channel difference of 255.
+#
+# Two Linux Firefoxes given that page eight times each, same build and same
+# shim, disagree on one of the eight. Nothing here is text, and the two sides
+# of the comparison are the same browser, so the timing is the whole of it.
+wt/external/wpt/css/css-writing-modes/crashtests/table-root-direction-propagation-crash.html

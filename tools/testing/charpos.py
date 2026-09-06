@@ -76,7 +76,7 @@ class Side:
         elif len(parts) == 2:
             self.driver, (host, port) = "cdp", parts
         else:
-            sys.exit("side is [driver:]host:port, got %r" % spec)
+            raise SystemExit("side is [driver:]host:port, got %r" % spec)
         if self.driver == "cdp":
             import viewport_protocol as vp
             self.browser = vp.CdpBrowser(host, int(port))

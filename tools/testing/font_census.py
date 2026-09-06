@@ -120,7 +120,13 @@ KERNED = ["Arial", "Times New Roman", "Segoe UI", "Calibri", "Georgia",
 # Whole sizes alone hide a whole class: anything that rounds a size only shows
 # where the size has a fraction to lose. A UA stylesheet reaches these
 # constantly, since h5 is 0.83em, h6 0.67em and small/sub/sup are `smaller`.
-METRIC_SIZES = [11, 12, 12.5, 13, 13.28, 13.33, 14.4, 16, 16.6, 17.28,
+METRIC_SIZES = [
+                # Under a pixel the em box rounds to nothing and the platforms
+                # decide separately whether an ascent of zero stands. A page
+                # reaches this through a small zoom rather than a small
+                # font-size, so nothing in the corpus covered it.
+                0.05, 0.2, 0.35, 0.5, 0.6, 0.75, 0.9, 1, 1.5, 2, 4, 8,
+                11, 12, 12.5, 13, 13.28, 13.33, 14.4, 16, 16.6, 17.28,
                 18, 19.2, 20.8, 21, 24, 25.8064, 26.6, 28.8, 32, 33.12,
                 36.8, 40, 48,
                 # Above 256 Skia stops drawing from a mask and generates at a
@@ -290,9 +296,15 @@ class CdpSide:
             self.browser.call("Emulation.setDeviceMetricsOverride",
                               {"width": kViewport[0], "height": kViewport[1],
                                "deviceScaleFactor": 1, "mobile": False})
+
         self.browser.call("DOM.enable")
         self.browser.call("CSS.enable")
         self.warm()
+
+    def browser_build(self):
+        """The browser build, as DevTools names it."""
+        return self.browser.call("Browser.getVersion",
+                                 session=False).get("product", "")
 
     def warm(self):
         """Draw once before anything is measured.
@@ -381,6 +393,19 @@ class MarionetteSide:
                      "compares whole screenshots needs both sides the same "
                      "size, and mismatched ones report negative counts"
                      % (self.name, kViewport[0], kViewport[1]))
+        self.warm()
+
+    def warm(self):
+        """Draw once before anything is measured.
+
+        The shim finds Skia's FreeType library from a glyph drawn through it,
+        so the first cells of a fresh browser are answered before it knows
+        which rasterizer is asking. A run that restarts a side per language
+        meets that every time, and it showed as a handful of consecutive
+        codepoints naming the wrong face, on a different language each run.
+        """
+        self.evaluate(WARM)
+        self.settle()
 
     def pin_viewport(self, width, height):
         """Size the window so its content area is exactly width by height.
@@ -620,8 +645,8 @@ def both_sides(work, sides, *args):
     def run(i):
         try:
             out[i] = work(sides[i], *args)
-        except BaseException as exc:                 # noqa: BLE001
-            error[i] = exc
+        except BaseException as err:                 # noqa: BLE001
+            error[i] = err
 
     threads = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
     for t in threads:
@@ -888,20 +913,20 @@ def mode_metrics(sides, full):
         # connection order restores config order.
         share = (len(configs) + len(conns) - 1) // len(conns)
         parts = [configs[i * share:(i + 1) * share] for i in range(len(conns))]
-        rows = [None] * len(conns)
+        per_conn = [None] * len(conns)
         errors = [None] * len(conns)
 
         def run(i):
             try:
-                got = []
-                for at in range(0, len(parts[i]), kConfigsPerWorkerBatch):
-                    batch = parts[i][at:at + kConfigsPerWorkerBatch]
+                collected = []
+                for start in range(0, len(parts[i]), kConfigsPerWorkerBatch):
+                    batch = parts[i][start:start + kConfigsPerWorkerBatch]
                     measured = measure_workers(conns[i], batch)
-                    got.extend(measured if measured is not None
+                    collected.extend(measured if measured is not None
                                else measure_main(conns[i], batch))
-                rows[i] = got
-            except BaseException as exc:             # noqa: BLE001
-                errors[i] = exc
+                per_conn[i] = collected
+            except BaseException as err:             # noqa: BLE001
+                errors[i] = err
 
         threads = [threading.Thread(target=run, args=(i,)) for i in range(len(conns))]
         for t in threads:
@@ -911,7 +936,7 @@ def mode_metrics(sides, full):
         for exc in errors:
             if exc is not None:
                 raise exc
-        return [row for part in rows for row in part]
+        return [row for part in per_conn for row in part]
 
     rows = list(both_sides(measure, sides))
     labels = ["applied", "boxAscent", "boxDescent", "inkAscent", "inkDescent",
@@ -1214,6 +1239,17 @@ def main():
         sys.exit("both sides must be the same browser; %s answers over %s and "
                  "%s over %s" % (args.a, sides[0].driver, args.b,
                                  sides[1].driver))
+    # The same browser also has to be the same build of it. A machine with
+    # more than one installed hands whichever the launcher found first, and
+    # every layer then reads that version's answers as the shim's; uifonts,
+    # whose patch matches on code the build moves, reads as wholly broken.
+    if sides[0].driver == "cdp":
+        builds = [side.browser_build() for side in sides]
+        if builds[0] and builds[1] and builds[0] != builds[1]:
+            for side in sides:
+                side.close()
+            sys.exit("both sides must be the same build; %s is %s and %s is %s"
+                     % (args.a, builds[0], args.b, builds[1]))
     for side, specs in zip(sides, (args.mirror_a, args.mirror_b)):
         for spec in specs or []:
             mirror = open_side(spec)

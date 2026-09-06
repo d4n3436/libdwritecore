@@ -25,6 +25,16 @@
 #                   carrying the parity prefs answers with what those prefs
 #                   say, which is circular if the answer is what they should
 #                   say in the first place.
+#   --scale S       device pixels per CSS pixel          (default: the
+#                   display's own). Both sides must be given the same S: it is
+#                   a Gecko pref on either platform, so the two reach the scale
+#                   through the same code and a comparison at it is a
+#                   comparison of one variable.
+#   --scheme NAME   light or dark                        (default light). What
+#                   a page's prefers-color-scheme reads, on both sides alike.
+#                   The text color decides the gamma a mask is corrected with,
+#                   so dark is a rasterizer decision of its own and not the
+#                   light run inverted.
 #   --url URL       first page to open                  (default about:blank)
 #   --profile DIR   keep the profile here               (default: a temp dir)
 #   --capture-port N  where the guest's capture server listens (default PORT+1)
@@ -195,6 +205,8 @@ case "$COMMAND" in
 esac
 
 PORT=2828
+SCALE=""
+SCHEME="light"
 DISPLAY_NAME=":99"
 SIZE="2560x1440"
 SHIM="$(find_shim)"
@@ -218,6 +230,8 @@ while [ $# -gt 0 ]; do
         --shim)    SHIM="$2"; shift 2 ;;
         --no-shim) SHIM=""; shift ;;
         --no-prefs) USE_PREFS=0; export CLEARTYPE_PREFS=0; shift ;;
+        --scale)   SCALE="$2"; shift 2 ;;
+        --scheme)  SCHEME="$2"; shift 2 ;;
         --url)     URL="$2"; shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --capture-port) CAPTURE_PORT="$2"; shift 2 ;;
@@ -230,6 +244,17 @@ done
 
 # The guest takes a list; everything else takes the first of it.
 GUEST_PORTS="$(printf '%s' "$PORT" | tr ',' ' ')"
+case "$SCHEME" in
+    light) SCHEME_PREF=1 ;;
+    dark)  SCHEME_PREF=0 ;;
+    *) echo "--scheme takes light or dark, not $SCHEME" >&2; exit 2 ;;
+esac
+if [ -n "$SCALE" ]; then
+    case "$SCALE" in
+        ''|*[!0-9.]*|*.*.*) echo "--scale takes a number, not $SCALE" >&2; exit 2 ;;
+    esac
+fi
+
 PORT="${GUEST_PORTS%% *}"
 [ -n "$CAPTURE_PORT" ] || CAPTURE_PORT=$((PORT + 1))
 
@@ -473,6 +498,51 @@ if [ "$COMMAND" = "guest" ] && [ "$RDP_SESSION" = 1 ]; then
     start_rdp_session "$GUEST_IP" || exit 1
 fi
 
+# check_guest_dwrite_names <firefox.exe>
+#
+# Both of xul.dll's DirectWrite references, counted. A build meant to run on
+# DWriteCore has to name it in the import descriptor, which is ASCII, and in
+# dwrote's LoadLibraryW argument, which is UTF-16; a build meant to run on the
+# system DirectWrite has to name that in both. Anything else is a mixture, and
+# a mixture reads as a parity difference on some cells and crashes the GPU
+# process on others.
+check_guest_dwrite_names() {
+    local exe="$1"
+    local xul="${exe%\\*}\\xul.dll"
+    local counts
+    counts="$(run_guest "
+\$src = @'
+using System;
+public class Scan {
+  public static int Count(byte[] hay, byte[] needle) {
+    int hits = 0;
+    for (int i = 0; i <= hay.Length - needle.Length; i++) {
+      int j = 0;
+      while (j < needle.Length && hay[i+j] == needle[j]) j++;
+      if (j == needle.Length) hits++;
+    }
+    return hits;
+  }
+}
+'@
+if (-not ('Scan' -as [type])) { Add-Type -TypeDefinition \$src }
+\$b = [IO.File]::ReadAllBytes('$xul')
+\$a = [Text.Encoding]::ASCII
+\$u = [Text.Encoding]::Unicode
+'core=' + ([Scan]::Count(\$b, \$a.GetBytes('dwcore.dll')) + [Scan]::Count(\$b, \$u.GetBytes('dwcore.dll'))) +
+' write=' + ([Scan]::Count(\$b, \$a.GetBytes('dwrite.dll')) + [Scan]::Count(\$b, \$u.GetBytes('dwrite.dll')))
+" | tr -d '\r' | tail -1)"
+    local core write
+    core="${counts#core=}"; core="${core%% *}"
+    write="${counts##*write=}"
+    case "$core:$write" in
+        2:0) echo "guest xul.dll is on DWriteCore" ;;
+        0:2) echo "guest xul.dll is on the system DirectWrite" ;;
+        *)   echo "guest xul.dll names both DirectWrite builds ($counts): the import descriptor and dwrote's LoadLibraryW have to agree, or gfx/2d and WebRender run on different implementations" >&2
+             return 1 ;;
+    esac
+}
+
 # start_guest_instance <marionette port>
 #
 # Everything one browser needs, named after its port so several can stand side
@@ -548,12 +618,19 @@ start_guest_instance() {
         echo 'user_pref("network.proxy.ssl_port", 1);'
         echo 'user_pref("network.proxy.no_proxies_on", "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16");'
         echo 'user_pref("browser.chrome.site_icons", false);'
-        # Light content on both sides, whatever theme each machine is set to.
-        # A page with a prefers-color-scheme rule otherwise reads the guest's
-        # Windows theme on one side and the GTK theme on the other, and
-        # clagnut-pangrams came back 0.0000% identical for that alone. 1 is
-        # Light in modules/libpref/init/StaticPrefList.yaml.
-        echo 'user_pref("layout.css.prefers-color-scheme.content-override", 1);'
+        # The same scheme on both sides, whatever theme each machine is set
+        # to. A page with a prefers-color-scheme rule otherwise reads the
+        # guest's Windows theme on one side and the GTK theme on the other,
+        # and clagnut-pangrams came back 0.0000% identical for that alone.
+        # 1 is Light and 0 is Dark, confirmed against a running browser
+        # rather than read off the enum.
+        echo "user_pref(\"layout.css.prefers-color-scheme.content-override\", $SCHEME_PREF);"
+        # A scale states itself as a Gecko pref on either platform, so both
+        # sides reach it through the same code. Written whether or not one was
+        # asked for: user.js is appended to, and a profile left from an earlier
+        # run otherwise keeps that run's scale and answers with it. -1.0 is the
+        # default, which is the browser following the display it is on.
+        echo "user_pref(\"layout.css.devPixelsPerPx\", \"${SCALE:--1.0}\");"
         echo 'user_pref("datareporting.policy.dataSubmissionEnabled", false);'
     } > "$GUEST_PREFS"
     CHUNKS="$(base64 -w0 < "$GUEST_PREFS" | fold -w1200)"
@@ -652,6 +729,10 @@ Write-Output 'cleared'
         2>/dev/null | tr -d '\r' | tail -1)"
     [ -n "$GUEST_IP" ] || { echo "no address for $GUEST_DOMAIN" >&2; exit 1; }
 
+    if [ -n "$GUEST_FIREFOX" ]; then
+        check_guest_dwrite_names "$GUEST_FIREFOX" || exit 1
+    fi
+
     STARTED=""
     for gp in $GUEST_PORTS; do
         start_guest_instance "$gp" || exit 1
@@ -698,7 +779,8 @@ mkdir -p "$PROFILE"
     echo "user_pref(\"network.proxy.ssl_port\", 1);"
     echo "user_pref(\"network.proxy.no_proxies_on\", \"localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16\");"
     echo "user_pref(\"browser.chrome.site_icons\", false);"
-    echo "user_pref(\"layout.css.prefers-color-scheme.content-override\", 1);"
+    echo "user_pref(\"layout.css.prefers-color-scheme.content-override\", $SCHEME_PREF);"
+    echo "user_pref(\"layout.css.devPixelsPerPx\", \"${SCALE:--1.0}\");"
     echo "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");"
     echo "user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);"
     echo "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);"

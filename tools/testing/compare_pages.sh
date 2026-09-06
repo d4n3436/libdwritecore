@@ -8,6 +8,7 @@
 # The plan is the comparison, written down. Everything a sweep needs is in it:
 #
 #     size 2200 1150
+#     scale 1.25
 #     side linux x11::99          127.0.0.1  2828 http://127.0.0.1:8080
 #     side win   libvirt:<domain> <guest-ip> 2929 http://<host-ip>:8080 cdp
 #     accept widget-chrome.accept
@@ -16,7 +17,16 @@
 #
 # parity.plan.example beside this script is a filled-in skeleton to copy.
 #
-#   size    the inner width and height both browsers are held at
+#   size    the inner width and height both browsers are held at, in CSS
+#           pixels, which is what the window is sized in
+#   scheme  light or dark. Both sides are asked what they report and a side
+#           that disagrees stops the sweep. The scheme is set when a browser
+#           starts, so without this a plan carries no record of which one a
+#           run measured. Set it with run_parity_firefox.sh --scheme.
+#   scale   device pixels per CSS pixel, default 1. Both sides are held to it
+#           and each is asked what it is actually at, so a side whose pref
+#           never landed stops the sweep instead of contributing the scale as
+#           a difference. Captures and crops are this many times `size`.
 #   side    a label, a capture backend (see capture_viewport.sh), the host
 #           and port its browser listens on (Marionette or DevTools, per the
 #           driver), and the URL prefix *that machine* reaches the page
@@ -96,7 +106,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHOTS="$(mktemp -d "${TMPDIR:-/tmp}/dwc-pages-XXXXXX")"
 [ "$KEEP" = 1 ] || trap 'rm -rf "$SHOTS"' EXIT
 
-WIDTH=""; HEIGHT=""
+WIDTH=""; HEIGHT=""; SCALE=1; SCHEME=""
 LABELS=(); BACKENDS=(); HOSTS=(); PORTS=(); PREFIXES=(); DRIVERS=()
 PAGES=()
 
@@ -104,6 +114,8 @@ while read -r kind rest; do
     case "${kind:-}" in
         ""|\#*) continue ;;
         size) WIDTH="${rest%% *}"; HEIGHT="${rest##* }" ;;
+        scale) SCALE="$rest" ;;
+        scheme) SCHEME="$rest" ;;
         side)
             set -- $rest
             LABELS+=("$1"); BACKENDS+=("$2"); HOSTS+=("$3"); PORTS+=("$4"); PREFIXES+=("$5")
@@ -163,6 +175,42 @@ for i in 0 1; do
     done
 done
 [ "$STALE" = 0 ] || exit 2
+
+# The two sides have to be the same browser build. A machine with more than
+# one installed hands whichever one the launcher found first, and a sweep
+# across two versions measures the difference between them as though it were
+# the shim's. Each driver is asked its version before anything is captured.
+#
+# Firefox is asked for Services.appinfo.version and not its build id, since
+# the two sides are the Linux and Windows builds of one release and those
+# always carry different build ids.
+MARIONETTE_VERSION='import sys
+sys.path.insert(0, sys.argv[3])
+from marionette import Marionette
+with Marionette(sys.argv[1], int(sys.argv[2]), timeout=20) as m:
+    m.start()
+    print(m.script("return Services.appinfo.version;", sandbox="system"))'
+
+side_browser() {                          # side_browser <driver> <host> <port>
+    case "$1" in
+        cdp)
+            curl -s --max-time 5 "http://$2:$3/json/version" 2>/dev/null |
+                sed -n 's/.*"Browser": *"\([^"]*\)".*/\1/p' | head -1
+            ;;
+        marionette)
+            python3 -c "$MARIONETTE_VERSION" "$2" "$3" "$HERE" 2>/dev/null
+            ;;
+    esac
+}
+
+if [ "${DRIVERS[0]}" = "${DRIVERS[1]}" ]; then
+    v0="$(side_browser "${DRIVERS[0]}" "${HOSTS[0]}" "${PORTS[0]%%,*}")"
+    v1="$(side_browser "${DRIVERS[1]}" "${HOSTS[1]}" "${PORTS[1]%%,*}")"
+    if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ]; then
+        echo "side ${LABELS[0]} is $v0 and side ${LABELS[1]} is $v1, so this sweep would measure the difference between two browser builds; start both on the same one" >&2
+        exit 2
+    fi
+fi
 
 printf '%-38s %8s  %10s  %8s\n' page scrollY identical "max diff"
 printf '%-38s %8s  %10s  %8s\n' "-------------------------------------" ------- ---------- --------
@@ -280,6 +328,9 @@ warn_if_wedged() {
 #
 # A CDP side reads the compositor with Page.captureScreenshot. A Marionette
 # side still photographs the screen, because Firefox has no faithful in-browser
+DEV_W="$(python3 -c "print(round($WIDTH * $SCALE))")"
+DEV_H="$(python3 -c "print(round($HEIGHT * $SCALE))")"
+
 # capture; sweep_pages_marionette.py opens with why. It grabs through Xlib into
 # memory instead of shelling out to `import`, and holds one process for the
 # plan instead of one per page. That grab is the one new dependency, so a
@@ -289,6 +340,14 @@ for i in 0 1; do
     [ "${DRIVERS[$i]}" = cdp ] && continue
     python3 -c "import Xlib" 2>/dev/null || DIRECT=0
 done
+# The per-page route below sizes its crop in CSS pixels, so a scaled plan
+# taking it would compare the corner of each frame and call the rest a match.
+# Refused rather than run, since that is a number that looks like a result.
+if [ "$DIRECT" = 0 ] && [ "$SCALE" != 1 ]; then
+    echo "this plan asks for a scale of $SCALE and the per-page capture route measures in CSS pixels, so it would compare only part of each frame. Install python-xlib so the sweep takes the direct route." >&2
+    exit 1
+fi
+
 if [ "$DIRECT" = 1 ]; then
     ALL_PATHS=(); ALL_SCROLLS=()
     : > "$SHOTS/cells"
@@ -345,12 +404,35 @@ if [ "$DIRECT" = 1 ]; then
             fi
             python3 "${SWEEP[@]}" "${HOSTS[$i]}" "${live[$k]}" \
                     "${PREFIXES[$i]}" "$WIDTH" "$HEIGHT" "${LABELS[$i]}" \
+                    --scale "$SCALE" ${SCHEME:+--scheme "$SCHEME"} \
                     "$SHOTS" "$SHOTS/cells.${LABELS[$i]}.$k" "${CSS[@]+"${CSS[@]}"}" \
                     >"$SHOTS/${LABELS[$i]}.$k.log" 2>&1 &
             SWEEPERS+=($!)
         done
     done
     trap 'kill "${SWEEPERS[@]}" 2>/dev/null; [ "$KEEP" = 1 ] || rm -rf "$SHOTS"' EXIT
+
+    # Both sides have to be laid out at the same viewport. converge_inner_size
+    # agrees a device size per side and steps off it where the window cannot
+    # hold the one the plan asks for, so a plan size that is not a whole
+    # number of device pixels can leave the two a pixel apart, and a page
+    # whose blocks fill the viewport then differs with no glyph taking part.
+    # Waited for, since a sweeper reports this only once it has converged.
+    vp_a=""; vp_b=""
+    for _ in $(seq 1 600); do
+        vp_a="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[0]}.0.log" 2>/dev/null)"
+        vp_b="$(grep -m1 '^viewport ' "$SHOTS/${LABELS[1]}.0.log" 2>/dev/null)"
+        [ -n "$vp_a" ] && [ -n "$vp_b" ] && break
+        alive=0
+        for pid in "${SWEEPERS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+        [ "$alive" = 0 ] && break
+        sleep 0.5
+    done
+    if [ -n "$vp_a" ] && [ -n "$vp_b" ] && [ "$vp_a" != "$vp_b" ]; then
+        echo "side ${LABELS[0]} converged to ${vp_a#viewport } and side ${LABELS[1]} to ${vp_b#viewport }; the two sides would be laid out at different sizes, so every block that fills the viewport would differ without a glyph taking part. Pick a size whose device size both windows can hold." >&2
+        kill "${SWEEPERS[@]}" 2>/dev/null
+        exit 2
+    fi
 
     # Comparing is most of a sweep's wall time and one cell says nothing about
     # another, so it runs in a pool that outlives the loop instead of a fresh
@@ -399,7 +481,7 @@ if [ "$DIRECT" = 1 ]; then
             fi
             stalled=0
             printf '%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\n' \
-                   "$n" "$WIDTH" "$HEIGHT" "$a" "$b" "$cell/out" \
+                   "$n" "$DEV_W" "$DEV_H" "$a" "$b" "$cell/out" \
                    "$cell/clusters.tsv" \
                    "${ALL_PATHS[$((n-1))]} ${ALL_SCROLLS[$((n-1))]}" \
                    "$want_clusters" >&$JOBFD
@@ -545,7 +627,7 @@ for entry in "${PAGES[@]}"; do
             mv "$SHOTS/${LABELS[$i]}_marked.png" "$cell/${LABELS[$i]}_marked.png"
             mv "$SHOTS/${LABELS[$i]}_clean.png"  "$cell/${LABELS[$i]}_clean.png"
         done
-        python3 "$HERE/compare_viewport.py" "$WIDTH" "$HEIGHT" \
+        python3 "$HERE/compare_viewport.py" "$DEV_W" "$DEV_H" \
                 "$cell/${LABELS[0]}_marked.png" "$cell/${LABELS[0]}_clean.png" \
                 "$cell/${LABELS[1]}_marked.png" "$cell/${LABELS[1]}_clean.png" \
                 --cluster-log "$SHOTS/clusters.tsv" --cluster-tag "$path $scroll" \

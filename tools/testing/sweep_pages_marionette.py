@@ -88,6 +88,18 @@ import viewport_protocol as vp
 # planted, so a leftover marker cannot pass for the new one.
 STRIP = 16
 
+
+def device(css, scale):
+    """A length the page was given, in the pixels the screen is read in.
+
+    The window is sized in CSS pixels and the frame is grabbed in device
+    pixels, and above a device pixel ratio of one those are different numbers.
+    Every length handed to the page stays CSS and every length that indexes a
+    grabbed frame comes through here. At a ratio of one the two units coincide
+    and nothing moves.
+    """
+    return int(round(css * scale))
+
 # How long a page has to go without painting after a grab before the grab is
 # kept. The pages that paint late for a stated reason are waited for by name
 # in PAGE_DONE; this is for the rest, such as text whose font arrives after
@@ -95,18 +107,54 @@ STRIP = 16
 QUIET = 0.15
 MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
+// Same-origin frames as well as the top document. A frame whose content
+// overflows keeps its own scrollbar, and that one is drawn by the platform:
+// the Windows theme draws it and GTK draws the Linux one, so it lands in the
+// capture as a strip of difference that has nothing to do with text. A
+// cross-origin frame throws on the property access and is left alone, and so
+// is one that is not loaded yet.
+for (const f of Array.from(document.querySelectorAll('iframe, frame'))) {
+  try {
+    const d = f.contentDocument;
+    if (!d || !d.documentElement) { continue; }
+    d.documentElement.style.scrollbarWidth = 'none';
+    if (!d.getElementById('__dwc_no_scrollbars')) {
+      const fs = d.createElement('style');
+      fs.id = '__dwc_no_scrollbars';
+      fs.textContent = '*{scrollbar-width:none!important}';
+      d.documentElement.appendChild(fs);
+    }
+  } catch (e) {}
+}
 const s = document.createElement('style');
 s.id = '__dwc_no_scrollbars';
-s.textContent = '*{scrollbar-width:none!important}';
+// The second rule refuses the marker a generated box. Its element name is
+// one no page selects; this covers the pages that reach it through *::after,
+// which would paint over the marker and fail the grab.
+s.textContent = '*{scrollbar-width:none!important}'
+              + '#__dwc_origin_mark::before,#__dwc_origin_mark::after'
+              + '{content:none!important;display:none!important}';
 document.documentElement.appendChild(s);
-const d = document.createElement('div');
+const d = document.createElement('dwc-origin-mark');
 d.id = '__dwc_origin_mark';
 const stripes = arguments[1] ? 'rgb(3,251,3) 0 50%,rgb(253,3,251) 50% 100%'
                              : 'rgb(253,3,251) 0 50%,rgb(3,251,3) 50% 100%';
 d.style.cssText = 'all:initial;position:fixed;left:0;top:' + arguments[0] + 'px;'
                 + 'width:8px;height:8px;z-index:2147483647;'
                 + 'background:linear-gradient(90deg,' + stripes + ');';
+// A page with an open dialog paints its backdrop over everything in the
+// normal layer, whatever z-index the marker carries, and the marker is then
+// invisible on both sides and the cell is never measured. A popover is in the
+// top layer too, and the top layer paints in the order it was entered, so a
+// marker shown last sits over a dialog opened earlier. `manual` closes nothing
+// the page opened.
+if (typeof d.showPopover === 'function') {
+  d.setAttribute('popover', 'manual');
+}
 document.documentElement.appendChild(d);
+if (d.hasAttribute('popover')) {
+  try { d.showPopover(); } catch (e) {}
+}
 // A contained root clips its descendants to its own box, and a short page's
 // root ends above the strip. Only such a root is made tall enough to reach it.
 if (getComputedStyle(document.documentElement).contain !== 'none') {
@@ -396,8 +444,8 @@ def open_grabber(backend, marionette_port):
         return LibvirtGrabber(rest)
     if kind == "guest":
         return GuestGrabber(rest, marionette_port)
-    sys.exit("backend must be x11:<display>, libvirt:<domain> "
-             "or guest:<host>[:<port>]")
+    raise SystemExit("backend must be x11:<display>, libvirt:<domain> "
+                     "or guest:<host>[:<port>]")
 
 
 # What an unobstructed marker is worth to marker_mask, which is the magenta
@@ -411,14 +459,20 @@ MARKER_B = (3, 251, 3)
 MARKER_TOLERANCE = 2
 
 
-def marker_mask(frame, flipped=False):
+def marker_mask(frame, flipped=False, scale=1.0):
     """Where the frame carries the checker, which is not where it is magenta.
 
-    A magenta pixel counts only where green sits four columns along, that being
-    the checker's period; `flipped` looks for the stripes the other way round.
-    Matches compare_viewport.py's origin(), and a frame narrower than the
-    period carries no marker by definition.
+    A magenta pixel counts only where green sits the checker's period along;
+    `flipped` looks for the stripes the other way round. Matches
+    compare_viewport.py's origin(), and a frame narrower than the period
+    carries no marker by definition.
+
+    The period is half the marker, which is 8 CSS pixels, so it is four device
+    columns only while the ratio is one. A scaled marker is wider and its
+    halves meet further apart, and a period left at four then pairs magenta
+    with magenta and finds no marker at all.
     """
+    period = device(4, scale)
     def near(rgb):
         return ((np.abs(frame[:, :, 0].astype(np.int16) - rgb[0]) <= MARKER_TOLERANCE)
                 & (np.abs(frame[:, :, 1].astype(np.int16) - rgb[1]) <= MARKER_TOLERANCE)
@@ -428,16 +482,16 @@ def marker_mask(frame, flipped=False):
     if flipped:
         first, second = second, first
     paired = first.copy()
-    paired[:, :-4] &= second[:, 4:]
-    paired[:, -4:] = False
+    paired[:, :-period] &= second[:, period:]
+    paired[:, -period:] = False
     return paired
 
 
-def marker_pixels(frame, flipped=False):
-    return int(marker_mask(frame, flipped).sum())
+def marker_pixels(frame, flipped=False, scale=1.0):
+    return int(marker_mask(frame, flipped, scale).sum())
 
 
-def find_origin(browser, grabber, height, budget=30.0):
+def find_origin(browser, grabber, height, scale, budget=30.0):
     """Where the viewport's top left corner sits on the screen.
 
     Done once for the plan. The window does not move between pages: the marker
@@ -457,16 +511,16 @@ def find_origin(browser, grabber, height, budget=30.0):
     deadline = time.time() + budget
     while time.time() < deadline:
         frame = grabber.grab()
-        ys, xs = np.nonzero(marker_mask(frame))
+        ys, xs = np.nonzero(marker_mask(frame, False, scale))
         if len(ys) >= MARKER_PAIRS:
             browser.script(UNMARK, [])
-            return int(xs.min()), int(ys.min()) - height
+            return int(xs.min()), int(ys.min()) - device(height, scale)
     browser.script(UNMARK, [])
-    sys.exit("the origin marker never appeared on the screen")
+    raise SystemExit("the origin marker never appeared on the screen")
 
 
-def handshake_frame(browser, grabber, x, y, w, h, flipped, budget=2.0,
-                    final=False):
+def handshake_frame(browser, grabber, x, y, w, h, scale, flipped,
+                    budget=2.0, final=False):
     """The frame for one cell, once the screen proves it arrived.
 
     The marker is planted per page even though the origin is already known,
@@ -504,10 +558,14 @@ def handshake_frame(browser, grabber, x, y, w, h, flipped, budget=2.0,
     a frame, which is what a page that never stops painting comes down to.
     """
     browser.script_async(MARK_PAINTED, [h, flipped])
+    # The marker is planted at a CSS offset and looked for at a device one.
+    dev_w, dev_h = device(w, scale), device(h, scale)
+    dev_strip, dev_window = device(STRIP, scale), device(16, scale)
     deadline = time.time() + budget
     while True:
-        frame = grabber.grab(x, y, w, h + STRIP)
-        if marker_pixels(frame[h:h + STRIP, :16], flipped) < MARKER_PAIRS:
+        frame = grabber.grab(x, y, dev_w, dev_h + dev_strip)
+        if marker_pixels(frame[dev_h:dev_h + dev_strip, :dev_window],
+                         flipped, scale) < MARKER_PAIRS:
             if time.time() > deadline:
                 raise RuntimeError("the marked frame never reached the screen")
             time.sleep(0.01)
@@ -515,10 +573,10 @@ def handshake_frame(browser, grabber, x, y, w, h, flipped, budget=2.0,
         stamp = browser.script(STAMP)
         time.sleep(QUIET)
         if not browser.script(PAINTED_AFTER, [stamp]):
-            return frame[:h]
+            return frame[:dev_h]
         if time.time() > deadline:
             if final:
-                return frame[:h]
+                return frame[:dev_h]
             raise RuntimeError("the page was still painting when the frame was taken")
         browser.script_async(vp.PAINTED)
 
@@ -536,6 +594,17 @@ def main():
     ap.add_argument("cells")
     ap.add_argument("--css", default=None,
                     help="extra rule sheet, applied to both sides alike")
+    ap.add_argument("--scheme", default=None, choices=("light", "dark"),
+                    help="the prefers-color-scheme this side is expected to "
+                         "report. Refused when it does not, since the scheme "
+                         "is set when the browser starts and nothing in a "
+                         "plan otherwise says which one a run measured")
+    ap.add_argument("--scale", type=float, default=None,
+                    help="the device pixel ratio this side is expected to be "
+                         "at. The sweep refuses a browser that is not, since a "
+                         "side that quietly ignored the scale still captures, "
+                         "still compares and reports a difference that is the "
+                         "scale rather than the shim")
     args = ap.parse_args()
 
     browser = vp.open_browser("marionette:%s:%d" % (args.host, args.port))
@@ -543,7 +612,30 @@ def main():
     vp.converge_inner_size(browser, args.width, args.height + STRIP,
                            vp.SETUP_TIMEOUT)
     vp.hide_scrollbars(browser)
-    origin_x, origin_y = find_origin(browser, grabber, args.height)
+    # Asked of the browser instead of taken from the caller, so the number the
+    # frame is measured with is the one the page is actually being drawn at.
+    # Reported so a sweep whose two sides disagree can be told from one whose
+    # sides agree on the wrong value.
+    scale = float(browser.script("return window.devicePixelRatio;"))
+    print("scale %g" % scale, file=sys.stderr, flush=True)
+    # What this side converged to, so compare_pages.sh can hold the two to
+    # the same viewport.
+    vp_dw, vp_dh, vp_aw, vp_ah = browser.script(vp.VIEWPORT_UNITS)
+    print("viewport %dx%d device %dx%d appunits"
+          % (vp_dw, vp_dh, vp_aw, vp_ah), file=sys.stderr, flush=True)
+    if args.scheme is not None:
+        seen = browser.script("return matchMedia('(prefers-color-scheme: dark)')"
+                              ".matches ? 'dark' : 'light';")
+        print("scheme %s" % seen, file=sys.stderr, flush=True)
+        if seen != args.scheme:
+            sys.exit("this side reports a %s color scheme and the plan asks "
+                     "for %s; the profile pref never reached the browser"
+                     % (seen, args.scheme))
+    if args.scale is not None and abs(scale - args.scale) > 1e-6:
+        sys.exit("this side is at a device pixel ratio of %g and the plan asks "
+                 "for %g; the profile pref never reached the browser"
+                 % (scale, args.scale))
+    origin_x, origin_y = find_origin(browser, grabber, args.height, scale)
 
     taken = 0
     with open(args.cells, encoding="utf-8") as handle:
@@ -564,6 +656,17 @@ def main():
                 browser.navigate(url)
                 vp.await_condition(browser, vp.PAGE_LOADED, vp.WORK_TIMEOUT,
                                    "the page never finished loading")
+                # A page whose script measures text during parsing gets the
+                # fallback face while its web font is still arriving, and the
+                # font is only in the cache once a load has fetched it. The
+                # side that is never restarted is always past that first load,
+                # so the two sides would be comparing different layouts. Load
+                # it again where a font came over the network, which is where
+                # the first answer could have been the fallback one.
+                if browser.script(vp.FONT_OVER_NETWORK):
+                    browser.navigate(url)
+                    vp.await_condition(browser, vp.PAGE_LOADED, vp.WORK_TIMEOUT,
+                                       "the page never finished its second load")
                 loaded = time.time()
                 if args.css:
                     browser.script(vp.EXTRA_CSS, [args.css])
@@ -586,11 +689,11 @@ def main():
                 # try is what tells that apart from a page that never paints.
                 try:
                     frame = handshake_frame(browser, grabber, origin_x, origin_y,
-                                            args.width, args.height,
+                                            args.width, args.height, scale,
                                             taken % 2 == 1)
                 except RuntimeError:
                     frame = handshake_frame(browser, grabber, origin_x, origin_y,
-                                            args.width, args.height,
+                                            args.width, args.height, scale,
                                             taken % 2 == 1, final=True)
                 grabbed = time.time()
                 # Through a temporary name, so a reader waiting for this

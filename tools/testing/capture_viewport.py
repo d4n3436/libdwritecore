@@ -127,12 +127,26 @@ SHAPE = ("return document.documentElement.scrollHeight + 'x' +"
 # rendering under comparison in the first place.
 MARK = """
 document.documentElement.style.scrollbarWidth = 'none';
-const d = document.createElement('div');
+// An element name no page selects, with its pseudo-elements refused.
+//
+// A div is not safe here. css-text/overflow-wrap/overflow-wrap-anywhere-001
+// positions `div::after` over its whole box in green, and the ten East Asian
+// counter tests put `content: counter(n, japanese-formal)` in one, so the
+// marker was given a generated box and painted out, and the grab failed on
+// both sides at once. all:initial cannot reach a generated box. 142 pages
+// under wt/external/wpt/css style div::after and three style *::after, which
+// the sheet below refuses. The sheet is adopted rather than appended, so the
+// page keeps the child count it had.
+const g = new CSSStyleSheet();
+g.replaceSync('#__dwc_origin_mark::before,#__dwc_origin_mark::after'
+            + '{content:none!important;display:none!important}');
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, g];
+const d = document.createElement('dwc-origin-mark');
 d.id = '__dwc_origin_mark';
-// all:initial first, because the page's own rules reach a bare div. A
-// `div { margin: 0 20px }` moves the marker, since left:0 positions the
-// margin box, and a border grows it; the crop then starts in the wrong
-// place or off the window entirely.
+// all:initial first, because the page's own rules still reach it through a
+// universal selector. A `* { margin: 0 20px }` moves the marker, since left:0
+// positions the margin box, and a border grows it; the crop then starts in
+// the wrong place or off the window entirely.
 // Two off-primary colors in vertical stripes, magenta on columns 0-3 and
 // green on 4-7. Neither half alone is enough: rgb(255,0,255) is `magenta`,
 // `fuchsia` and `#f0f` at once, and a page painting it in the corner captures
