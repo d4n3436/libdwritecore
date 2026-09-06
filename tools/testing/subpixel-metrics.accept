@@ -1,0 +1,13 @@
+# The semicolon's ink box under a synthetic oblique. Both sides take Skia's
+# computeFromPath, where skrifa answers with the shared empty SkPathData the
+# outline patch must not replace and DirectWrite still has an outline.
+SimSun|0.05|250|italic|inkDescent
+SimSun|0.05|300|italic|inkDescent
+SimSun|0.05|400|italic|inkDescent
+SimSun|0.05|500|italic|inkDescent
+SimSun|0.05|550|italic|inkDescent
+NSimSun|0.05|250|italic|inkDescent
+NSimSun|0.05|300|italic|inkDescent
+NSimSun|0.05|400|italic|inkDescent
+NSimSun|0.05|500|italic|inkDescent
+NSimSun|0.05|550|italic|inkDescent
