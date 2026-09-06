@@ -10,6 +10,8 @@
 #ifndef CLEARTYPE_SHIM_EXPORTS_H_INCLUDED
 #define CLEARTYPE_SHIM_EXPORTS_H_INCLUDED
 
+#include <cstdint>
+
 extern "C" {
 
 void CleartypeLogLine(const char* message);
@@ -158,6 +160,11 @@ void CleartypeBeginGlyphPath(void);
 // is valid until the next CleartypeBeginGlyphPath on this thread.
 unsigned CleartypeEndGlyphPath(const CleartypeGlyphPathPoint** points);
 
+// Bracket a Skia scaler call, so a FreeType render reached from inside one is
+// attributed to Skia rather than to the thread it runs on.
+void CleartypeEnterSkiaScaler(void);
+void CleartypeLeaveSkiaScaler(void);
+
 // What the Skia scaler about to draw on this thread was built with: the five
 // SkScalerContextRec fields SkScalerContextRec::getSingleMatrix makes the
 // total matrix out of. `post` is fPost2x2 in row order, or null to forget the
@@ -185,6 +192,18 @@ int CleartypeBlobPrefersMask(void);
 // that rounding.
 int CleartypeGlyphInkBox(void* candidate, double ft_size, int embolden, unsigned glyph,
                          double* out);
+
+// The horizontal origin gfxHarfBuzzShaper::GetGlyphVOrigin sets for one glyph
+// on Windows, in 16.16. Half the advance the shaper answers with there, which
+// carries no synthetic bold unless DirectWrite is simulating it on the face.
+// `candidate`, `ft_size` and `embolden` are read the way CleartypeGlyphInkBox
+// reads them.
+int CleartypeWindowsVOriginX(void* candidate, double ft_size, int embolden, unsigned glyph,
+                             int32_t* x);
+
+// Names the WebRender font instance the next glyph is loaded from, so the size
+// it holds answers for that glyph instead of an inversion of FreeType's 26.6.
+void CleartypeNoteWebRenderInstance(const void* instance);
 
 }  // extern "C"
 

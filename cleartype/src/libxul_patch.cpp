@@ -142,6 +142,58 @@
 // ReSharper disable CppTooWideScopeInitStatement
 // ReSharper disable CppUseStructuredBinding
 
+// The original load_glyph, and the stub that runs in front of it.
+//
+// The stub names the FontInstance to the shim and then jumps to the original,
+// so the tail call leaves the return value and any hidden return pointer
+// exactly as the caller laid them out and nothing needs to know the shape of
+// what load_glyph returns. Only the argument registers are saved, since that
+// is all a call can disturb that the original still needs.
+extern "C" {
+void* g_wr_load_glyph_orig = nullptr;
+void DwcWrLoadGlyphThunk(void);
+}
+
+__asm__(".text\n"
+        ".globl DwcWrLoadGlyphThunk\n"
+        ".hidden DwcWrLoadGlyphThunk\n"
+        ".type DwcWrLoadGlyphThunk, @function\n"
+        "DwcWrLoadGlyphThunk:\n"
+        "  .cfi_startproc\n"
+        "  push %rdi\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  push %rsi\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  push %rdx\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  push %rcx\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  push %r8\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  push %r9\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  sub $8, %rsp\n"
+        "  .cfi_adjust_cfa_offset 8\n"
+        "  mov %rdx, %rdi\n"
+        "  call CleartypeNoteWebRenderInstance@PLT\n"
+        "  add $8, %rsp\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %r9\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %r8\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %rcx\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %rdx\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %rsi\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  pop %rdi\n"
+        "  .cfi_adjust_cfa_offset -8\n"
+        "  jmp *g_wr_load_glyph_orig(%rip)\n"
+        "  .cfi_endproc\n"
+        ".size DwcWrLoadGlyphThunk, .-DwcWrLoadGlyphThunk\n");
+
 namespace {
 
 // Varargs and not a parameter pack, for the reason given above LogLine in
@@ -3263,7 +3315,9 @@ extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, v
     // The route after it, so the shim has seen this scaler's face by the time
     // it is chosen; internalMakeGlyph reads the flag only after
     // generateMetrics returns, so setting it there is still in time.
+    CleartypeEnterSkiaScaler();
     void* const result = g_generate_metrics(sret, self, glyph, alloc);
+    CleartypeLeaveSkiaScaler();
     DrawGlyphsFromPath(self);
     return result;
 }
@@ -3277,7 +3331,9 @@ extern "C" void DwcGenerateImage(void* self, const void* glyph, void* buffer);
 extern "C" void DwcGenerateImage(void* self, const void* glyph, void* buffer)
 {
     ReportScalerTextSize(self);
+    CleartypeEnterSkiaScaler();
     g_generate_image(self, glyph, buffer);
+    CleartypeLeaveSkiaScaler();
 }
 
 extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph);
@@ -3286,7 +3342,9 @@ extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph)
 {
     ReportScalerTextSize(self);
     CleartypeBeginGlyphPath();
+    CleartypeEnterSkiaScaler();
     void* const result = g_generate_path(sret, self, glyph);
+    CleartypeLeaveSkiaScaler();
     const CleartypeGlyphPathPoint* points = nullptr;
     const unsigned count = CleartypeEndGlyphPath(&points);
     if (count != 0 && result != nullptr) {
@@ -3592,6 +3650,312 @@ extern "C" bool DwcGetGlyphBounds(void* self, const uint16_t gid, double* bounds
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// The horizontal origin an upright glyph is drawn from in vertical text.
+//
+// gfxHarfBuzzShaper::GetGlyphVOrigin sets it to half the advance
+// GetGlyphHAdvance answers with, and the two platforms answer that from
+// different places. gfxDWriteFont::ProvidesGlyphWidths is false while
+// mUseSubpixelPositions holds and the face carries no bold simulation, so the
+// shaper reads the hmtx table and the advance carries no synthetic bold, which
+// gfxFont::Draw adds afterwards as cluster tracking. gfxFT2FontBase::
+// ProvidesGlyphWidths is true for every font and GetFTGlyphExtents adds the
+// embolden strength to the advance it returns, so half that strength lands on
+// the origin of every upright glyph.
+//
+// Only the x is replaced. The y comes from VORG or vmtx, which both platforms
+// read alike.
+// ---------------------------------------------------------------------------
+
+using GetGlyphVOriginFn = void (*)(void* self, uint32_t glyph, int32_t* x, int32_t* y);
+GetGlyphVOriginFn g_glyph_v_origin = nullptr;
+
+constexpr uint32_t kHheaTag = 0x68686561;    // 'hhea'
+constexpr uint32_t kOS2Tag = 0x4F532F32;     // 'OS/2'
+constexpr uint32_t kVheaTag = 0x76686561;    // 'vhea'
+constexpr uint32_t kPostTag = 0x706F7374;    // 'post'
+constexpr uint32_t kHmtxTag = 0x686D7478;    // 'hmtx'
+
+// gfxHarfBuzzShaper::GetGlyphVOrigin, the one function that reads the hhea
+// table, reads no other metrics table, and is called from a function nothing
+// calls.
+//
+// gfxFont::InitMetricsFromSfntTables reads OS/2 beside hhea,
+// gfxFont::CreateVerticalMetrics reads vhea, post and OS/2, and
+// gfxHarfBuzzShaper::LoadHmtxTable reads hmtx; a byte scan cannot always see
+// the second tag, since a cold block carrying it starts a function of its own.
+// The caller settles what is left. GetGlyphVOrigin is reached only through
+// HBGetGlyphVOrigin, a static handed to hb_font_funcs_set_glyph_v_origin_func
+// and called through the font funcs, so nothing in the image calls it, while
+// the other three are reached from ordinary member functions.
+uintptr_t FindGlyphVOrigin(const Image& image, const FunctionStarts& starts)
+{
+    uintptr_t hhea[kMaxGlyphFns], os2[kMaxBoundsFns], vhea[kMaxBoundsFns];
+    uintptr_t post[kMaxBoundsFns], hmtx[kMaxBoundsFns];
+    unsigned n_hhea = 0, n_os2 = 0, n_vhea = 0, n_post = 0, n_hmtx = 0;
+    if (!FunctionsHolding(image, starts, kHheaTag, hhea, &n_hhea, kMaxGlyphFns) ||
+        !FunctionsHolding(image, starts, kOS2Tag, os2, &n_os2, kMaxBoundsFns) ||
+        !FunctionsHolding(image, starts, kVheaTag, vhea, &n_vhea, kMaxBoundsFns) ||
+        !FunctionsHolding(image, starts, kPostTag, post, &n_post, kMaxBoundsFns) ||
+        !FunctionsHolding(image, starts, kHmtxTag, hmtx, &n_hmtx, kMaxBoundsFns)) {
+        Report("libxul: more functions carry a metrics table tag than can be accounted "
+               "for, so the vertical origin cannot be identified");
+        return 0;
+    }
+    DirectCallers below[kMaxGlyphFns];
+    unsigned n_below = 0;
+    for (unsigned i = 0; i < n_hhea; ++i) {
+        const uintptr_t candidate = hhea[i];
+        if (Holds(os2, n_os2, candidate) || Holds(vhea, n_vhea, candidate) ||
+            Holds(post, n_post, candidate) || Holds(hmtx, n_hmtx, candidate)) {
+            continue;
+        }
+        below[n_below++].target = candidate;
+    }
+    if (n_below == 0) {
+        Report("libxul: no function reads hhea and no other metrics table");
+        return 0;
+    }
+    CollectDirectCallers(image, starts, below, n_below);
+
+    // The one caller each survivor has, asked in turn whether anything calls it.
+    DirectCallers above[kMaxGlyphFns];
+    unsigned n_above = 0;
+    for (unsigned i = 0; i < n_below; ++i) {
+        if (below[i].overflowed || below[i].count != 1) {
+            continue;
+        }
+        above[n_above++].target = below[i].callers[0];
+    }
+    if (n_above == 0) {
+        Report("libxul: every function reading hhea alone has more than one caller");
+        return 0;
+    }
+    CollectDirectCallers(image, starts, above, n_above);
+
+    uintptr_t found = 0;
+    for (unsigned i = 0; i < n_below; ++i) {
+        if (below[i].overflowed || below[i].count != 1) {
+            continue;
+        }
+        bool orphan = false;
+        for (unsigned k = 0; k < n_above; ++k) {
+            if (above[k].target == below[i].callers[0]) {
+                orphan = !above[k].overflowed && above[k].count == 0;
+            }
+        }
+        if (!orphan) {
+            continue;
+        }
+        if (found != 0) {
+            Report("libxul: more than one function reads hhea alone from a caller "
+                   "nothing calls; leaving the vertical origin alone");
+            return 0;
+        }
+        found = below[i].target;
+    }
+    if (found == 0) {
+        Report("libxul: no function reads hhea alone from a caller nothing calls");
+    }
+    return found;
+}
+
+// The font the shaper is working with. gfxFontShaper holds it in the word after
+// the vtable pointer and gfxHarfBuzzShaper derives from it alone, so it is the
+// second word of the object. Answered only when the word looks like a font this
+// library already knows how to read.
+void* ShaperFont(void* self)
+{
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    if (self == nullptr || at == 0) {
+        return nullptr;
+    }
+    void* font = nullptr;
+    if (!ReadWithoutFaulting(static_cast<const void*>(static_cast<void**>(self) + 1),
+                             static_cast<void*>(&font), sizeof(font)) ||
+        font == nullptr) {
+        return nullptr;
+    }
+    return font;
+}
+
+extern "C" void DwcGetGlyphVOrigin(void* self, uint32_t glyph, int32_t* x, int32_t* y);
+
+extern "C" void DwcGetGlyphVOrigin(void* self, const uint32_t glyph, int32_t* x, int32_t* y)
+{
+    g_glyph_v_origin(self, glyph, x, y);
+    void* const font = ShaperFont(self);
+    if (font == nullptr || x == nullptr) {
+        return;
+    }
+    const size_t at = g_ftface_word.load(std::memory_order_relaxed);
+    void* shared = nullptr;
+    unsigned char flags_word[sizeof(void*)] = {};
+    double ft_size = 0.0;
+    if (!ReadWithoutFaulting(static_cast<const void*>(static_cast<void**>(font) + (at - 1)),
+                             static_cast<void*>(&shared), sizeof(shared)) ||
+        shared == nullptr ||
+        !ReadWithoutFaulting(WordAt(font, at + kMetricsFields), flags_word, sizeof(flags_word)) ||
+        !ReadWithoutFaulting(WordAt(font, at + kFTSizeWord), &ft_size, sizeof(ft_size))) {
+        return;
+    }
+    if (!(ft_size > 0.0) || !(ft_size < 65536.0) || flags_word[sizeof(int)] > 1) {
+        return;                              // not a boolean where one should be
+    }
+    const int embolden = flags_word[sizeof(int)];
+    int32_t windows = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        void* candidate = nullptr;
+        if (!ReadWithoutFaulting(static_cast<const void*>(static_cast<void**>(shared) + i),
+                                 static_cast<void*>(&candidate), sizeof(candidate))) {
+            return;
+        }
+        if (CleartypeWindowsVOriginX(candidate, ft_size, embolden, glyph, &windows) != 0) {
+            *x = windows;
+            return;
+        }
+    }
+}
+
+bool PatchGlyphVOrigin(const Image& image, const FunctionStarts& starts)
+{
+    const uintptr_t found = FindGlyphVOrigin(image, starts);
+    if (found == 0) {
+        return false;
+    }
+    g_glyph_v_origin = reinterpret_cast<GetGlyphVOriginFn>(found);
+    const unsigned patched =
+        RedirectCalls(image, starts, found, reinterpret_cast<void*>(&DwcGetGlyphVOrigin));
+    if (patched == 0) {
+        g_glyph_v_origin = nullptr;
+        Report("libxul: GetGlyphVOrigin at %#lx is not called directly anywhere", found);
+        return false;
+    }
+    Report("libxul: GetGlyphVOrigin %#lx now returns through this library (%u call site%s)",
+           found, patched, patched == 1 ? "" : "s");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// WebRender's own font size.
+//
+// gfxFont settles mAdjustedSize in the content process and the InitMetrics
+// hook claims it there, but WebRender rasterizes in the parent process, where
+// no gfxFont for the page's fonts exists. The size reaches FreeType only as
+// FT_Set_Char_Size's 26.6 value, and two sizes a fraction apart round onto one
+// of those: a whole app unit, and the sub- or superscript reduction of
+// another. Inverting that rounding cannot separate them, so the size is read
+// from the instance WebRender is rasterizing from.
+//
+// wr_glyph_rasterizer's load_glyph is the one function that reaches FreeType
+// for a glyph. It sets the transform, sets the char size, picks a strike and
+// loads the glyph, and nothing else in libxul calls all four.
+// ---------------------------------------------------------------------------
+
+// The FreeType entries load_glyph calls, and how many of them there are.
+constexpr const char* kLoadGlyphCalls[] = {"FT_Set_Char_Size", "FT_Set_Transform",
+                                           "FT_Load_Glyph", "FT_Select_Size"};
+constexpr unsigned kLoadGlyphCallCount = 4;
+// A function reaching one of these more than this many times is not the one.
+constexpr unsigned kMaxFtOwners = 32;
+
+uintptr_t FindWebRenderLoadGlyph(const Image& image, const FunctionStarts& starts)
+{
+    // libxul reaches FreeType through its GOT, so a call names the slot rather
+    // than the function, and the slot is found by the value in it.
+    uintptr_t slots[kLoadGlyphCallCount] = {};
+    for (unsigned i = 0; i < kLoadGlyphCallCount; ++i) {
+        void* fn = dlsym(RTLD_DEFAULT, kLoadGlyphCalls[i]);
+        if (fn == nullptr) {
+            return 0;
+        }
+        for (const unsigned char* p = image.relro.begin;
+             p + sizeof(void*) <= image.relro.end; p += sizeof(void*)) {
+            void* value = nullptr;
+            std::memcpy(&value, p, sizeof(value));
+            if (value == fn) {
+                slots[i] = reinterpret_cast<uintptr_t>(p);
+                break;
+            }
+        }
+        if (slots[i] == 0) {
+            return 0;
+        }
+    }
+
+    uintptr_t owners[kLoadGlyphCallCount][kMaxFtOwners] = {};
+    unsigned counts[kLoadGlyphCallCount] = {};
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        for (const unsigned char* q = r.begin; q + 6 <= r.end; ++q) {
+            if (q[0] != 0xFF || q[1] != 0x15) {
+                continue;
+            }
+            int32_t disp = 0;
+            std::memcpy(&disp, q + 2, sizeof(disp));
+            const uintptr_t target = reinterpret_cast<uintptr_t>(q) + 6 + disp;
+            for (unsigned k = 0; k < kLoadGlyphCallCount; ++k) {
+                if (target != slots[k] || counts[k] >= kMaxFtOwners) {
+                    continue;
+                }
+                const uintptr_t owner = starts.Enclosing(reinterpret_cast<uintptr_t>(q));
+                if (owner == 0) {
+                    continue;
+                }
+                bool seen = false;
+                for (unsigned m = 0; m < counts[k]; ++m) {
+                    seen = seen || owners[k][m] == owner;
+                }
+                if (!seen) {
+                    owners[k][counts[k]++] = owner;
+                }
+            }
+        }
+    }
+
+    uintptr_t found = 0;
+    for (unsigned m = 0; m < counts[0]; ++m) {
+        const uintptr_t candidate = owners[0][m];
+        bool all = true;
+        for (unsigned k = 1; k < kLoadGlyphCallCount; ++k) {
+            bool here = false;
+            for (unsigned n = 0; n < counts[k]; ++n) {
+                here = here || owners[k][n] == candidate;
+            }
+            all = all && here;
+        }
+        if (!all) {
+            continue;
+        }
+        // Two would mean the four calls no longer name one function.
+        if (found != 0) {
+            return 0;
+        }
+        found = candidate;
+    }
+    return found;
+}
+
+bool PatchWebRenderSize(const Image& image, const FunctionStarts& starts)
+{
+    const uintptr_t found = FindWebRenderLoadGlyph(image, starts);
+    if (found == 0) {
+        Report("libxul: WebRender's load_glyph not found; its sizes stay reconstructed");
+        return false;
+    }
+    g_wr_load_glyph_orig = reinterpret_cast<void*>(found);
+    const unsigned patched = RedirectCalls(image, starts, found,
+                                           reinterpret_cast<void*>(&DwcWrLoadGlyphThunk));
+    if (patched == 0) {
+        g_wr_load_glyph_orig = nullptr;
+        Report("libxul: WebRender's load_glyph at %#lx is not called directly anywhere", found);
+        return false;
+    }
+    Report("libxul: WebRender's load_glyph %#lx now names its size (%u call site%s)",
+           found, patched, patched == 1 ? "" : "s");
+    return true;
+}
+
 bool PatchGlyphBounds(const Image& image, const FunctionStarts& starts)
 {
     void* slots[kMaxBoundsFns];
@@ -3777,6 +4141,8 @@ void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(
     PatchUnderline(image, starts);
     PatchGlyphPath(image, starts);
     PatchGlyphBounds(image, starts);
+    PatchGlyphVOrigin(image, starts);
+    PatchWebRenderSize(image, starts);
     PatchPlatformMediaFeature(image, starts);
     PatchPostShapingFixup(image, starts);
 }
