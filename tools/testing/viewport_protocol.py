@@ -589,6 +589,13 @@ def wait_condition(browser, body, budget, args=()):
         time.sleep(POLL)
 
 
+# The neighbors of a target device size, in the order they are tried when the
+# target itself is not on the grid. One axis moves at a time first, since a
+# target is usually off the grid on one axis alone.
+SIZE_STEPS = ((0, -1), (0, 1), (-1, 0), (1, 0),
+              (-1, -1), (-1, 1), (1, -1), (1, 1))
+
+
 def force_viewport(browser, want_w, want_h):
     """Override the layout viewport where the window will not give the size.
 
@@ -640,14 +647,16 @@ def converge_inner_size(browser, want_w, want_h, deadline):
             want_dev_w = int(round(want_w * dpr))
             want_dev_h = int(round(want_h * dpr))
             # The window is asked for in whole CSS pixels and placed on a
-            # device grid, and the chrome between the outer and inner sizes is
-            # not a whole number of CSS pixels. That fixes the parity of every
-            # inner size the window can hold: where the chrome comes to an odd
-            # number of device pixels, only odd inner sizes exist, and a target
-            # computed from a whole CSS size is always even. Such a target is
-            # unreachable however long it is waited for, so it is stepped.
-            # Both sides carry the same constraint, so they step together and
-            # land on the same size.
+            # device grid, so the outer device sizes that exist are the
+            # roundings of whole CSS pixels times the ratio, and the chrome
+            # between the outer and inner sizes shifts that set without
+            # filling it in. At a ratio of 1.5 two outer CSS pixels span three
+            # device pixels and only two of the three are landed on, so one
+            # inner device size in three does not exist however long it is
+            # waited for. Such a target is stepped, over both axes, in a fixed
+            # order that both sides walk alike. Where the two still land
+            # apart, the viewport check in compare_pages.sh stops the sweep.
+            base_dev_w, base_dev_h = want_dev_w, want_dev_h
             tried = 0
         # The device size is what is agreed, since that is what a capture is of
         # and what every length the page derives from the viewport is built on.
@@ -657,11 +666,12 @@ def converge_inner_size(browser, want_w, want_h, deadline):
             continue
         agreed = 0
         if time.time() > end:
-            # A target the grid cannot express is stepped by one and tried
-            # again, once each way, before the size is given up on.
-            if tried < 2:
+            # A target the grid cannot express is stepped by one, each way and
+            # on each axis, before the size is given up on.
+            if tried < len(SIZE_STEPS):
+                want_dev_w = base_dev_w + SIZE_STEPS[tried][0]
+                want_dev_h = base_dev_h + SIZE_STEPS[tried][1]
                 tried += 1
-                want_dev_h += -1 if tried == 1 else 2
                 end = time.time() + deadline
                 continue
             sys.exit("window never held %dx%d device pixels (last %dx%d, inner %dx%d)"

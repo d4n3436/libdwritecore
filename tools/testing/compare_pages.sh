@@ -428,7 +428,17 @@ if [ "$DIRECT" = 1 ]; then
         [ "$alive" = 0 ] && break
         sleep 0.5
     done
-    if [ -n "$vp_a" ] && [ -n "$vp_b" ] && [ "$vp_a" != "$vp_b" ]; then
+    # A side that never reported one never converged, and every one of its
+    # sweepers has since exited. No cell can be captured now, so the plan
+    # ends here and prints what the sweepers said.
+    if [ -z "$vp_a" ] || [ -z "$vp_b" ]; then
+        echo "side ${LABELS[0]} or ${LABELS[1]} never reported a viewport, so no cell can be captured:" >&2
+        tail -n 3 "$SHOTS/${LABELS[0]}".*.log "$SHOTS/${LABELS[1]}".*.log 2>/dev/null \
+            | sed 's/^/    /' >&2
+        kill "${SWEEPERS[@]}" 2>/dev/null
+        exit 2
+    fi
+    if [ "$vp_a" != "$vp_b" ]; then
         echo "side ${LABELS[0]} converged to ${vp_a#viewport } and side ${LABELS[1]} to ${vp_b#viewport }; the two sides would be laid out at different sizes, so every block that fills the viewport would differ without a glyph taking part. Pick a size whose device size both windows can hold." >&2
         kill "${SWEEPERS[@]}" 2>/dev/null
         exit 2
@@ -469,6 +479,11 @@ if [ "$DIRECT" = 1 ]; then
                 sleep 0.05
             done
             if [ ! -f "$a" ] || [ ! -f "$b" ]; then
+                # The sweepers make the cell directory as they deliver into
+                # it, so a cell neither side reached has none, and the mark
+                # has nowhere to go. The loop below waits on that mark, so
+                # without the directory it waits forever.
+                mkdir -p "$cell"
                 : > "$cell/failed"
                 # A side that stopped delivering fails every cell after this
                 # one too, each at the full stall wait, so two in a row ends

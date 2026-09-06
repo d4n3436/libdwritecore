@@ -352,8 +352,11 @@ def main():
                     help="the second side's tag; the first plus W by default")
     ap.add_argument("--scroll", type=int, default=0,
                     help="scroll offset of the compared cell")
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--width", type=int, default=1920,
+                    help="the capture's width in device pixels, which is the "
+                         "plan's size times its scale")
+    ap.add_argument("--height", type=int, default=1080,
+                    help="the capture's height in device pixels")
     ap.add_argument("--limit", type=int, default=14)
     args = ap.parse_args()
     check_cell(args.shots, args.url, args.scroll)
