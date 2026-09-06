@@ -203,18 +203,16 @@ def main():
                     print("fail %s %s" % (index, why), flush=True)
                     # Nothing else marks a cell this side never delivered, and
                     # the caller waits on the mark.
-                    if sender is not None:
-                        open(os.path.join(cell, "failed"), "a").close()
+                    open(os.path.join(cell, "failed"), "a").close()
                     continue
                 print("ok " + index, flush=True)
     finally:
         # Closed so the pool knows this sweeper's share is done; it ends once
         # every sender has connected and then closed.
-        if sender is not None:
-            try:
-                sender.close()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            sender.close()
+        except Exception:  # noqa: BLE001
+            pass
         browser.close()
     return 0
 

@@ -2,8 +2,9 @@
 """
 What each pixel difference between two captures is actually made of.
 
-    tools/testing/attribute_diff.py <shots-dir> <tag> <page> <url>
-                                   [--a host:port] [--b host:port] [--url-b URL]
+    tools/testing/attribute_diff.py <url> --b [driver:]host:port
+                                   [--a host:port] [--url-b URL]
+                                   [--backend-a SPEC] [--backend-b SPEC]
 
 compare_viewport.py says where the differences are. This says what they are.
 Every element's box is taken from both machines and painted into a label map,
@@ -38,20 +39,20 @@ nothing at all.
 The two machines reach the page server at different addresses, so --url-b
 gives the second one its own URL.
 
-The captures and the browsers have to be the same ones, so run this straight
-after a sweep, before either side navigates away.
+Both sides are captured here, on the same load the boxes are read from, so the
+pixels and the geometry always describe one another. A marionette side is
+photographed from its screen and needs --backend-a or --backend-b to say
+which; a CDP side hands back its own viewport and needs neither.
 """
 
 import argparse
+import io
 import json
 import math
-import os
-import re
 import sys
 
 import numpy as np
 
-import compare_viewport as cv
 import viewport_protocol as vp
 
 # Every element, with the box it occupies and what it was asked to be drawn
@@ -103,13 +104,17 @@ def to_device(rows, scale):
     return rows
 
 
-def snapshot(browser, url, scroll=0):
+def settle(browser, url, scroll=0):
+    """Load the page and hold it, ready to be photographed and read."""
     browser.navigate(url)
     vp.await_condition(browser, vp.PAGE_LOADED, 60, "the page never finished loading")
     if scroll:
         browser.script(vp.SETTLE, [scroll])
         vp.await_condition(browser, vp.VIEWPORT_READY, 60,
                            "the viewport never settled after scrolling", [scroll])
+
+
+def snapshot(browser):
     if browser.driver == "cdp":
         browser.call("DOM.enable")
         browser.call("CSS.enable")
@@ -278,80 +283,70 @@ def classify(a, b, fa, fb, moved):
     return "raster", "same faces and box, nothing inside moved"
 
 
-def viewport_origin(base):
-    """Where the viewport starts in this side's clean shot.
+def decode(data):
+    """A CDP capture's bytes as pixels, composited the way crop() does.
 
-    A shot taken over CDP is the viewport and nothing else, and has no marked
-    companion; one photographed off a screen carries the marker's position in
-    the marked shot beside it.
+    Page.captureScreenshot leaves the canvas transparent wherever the page
+    painted no background of its own, and converting straight to RGB keeps
+    black under the transparency, so the side that captured opaque differs
+    everywhere.
     """
-    marked = base + "_marked.png"
-    if not os.path.exists(marked):
-        return 0, 0
-    x, y, _ = cv.origin(marked)
-    return x, y
+    from PIL import Image
+    shot = Image.open(io.BytesIO(data))
+    if shot.mode in ("RGBA", "LA") or "transparency" in shot.info:
+        ground = Image.new("RGBA", shot.size, (255, 255, 255, 255))
+        shot = Image.alpha_composite(ground, shot.convert("RGBA"))
+    return np.asarray(shot.convert("RGB"))
 
 
-def side_base(shots, tag, page):
-    """Where one side's screenshots are, under either name they are written by.
+def spec_port(spec, default):
+    """The port out of a `[driver:]host:port`, which the browser does not keep."""
+    tail = spec.rsplit(":", 1)
+    if len(tail) == 2 and tail[1].isdigit():
+        return int(tail[1])
+    return default
 
-    compare_pages.sh gives every cell its own directory and names the shots
-    after the side alone; capture_viewport.sh puts a whole run in one directory
-    and adds the page to tell them apart. The page is dropped when nothing is
-    written under it.
+
+def capture(browser, backend, port, url, scroll, width, height):
+    """This side's frame for the page, taken now and never written down.
+
+    A CDP browser hands back the viewport itself. A Marionette one is
+    photographed from its screen, which is what `backend` names, through the
+    same marker handshake a sweep uses.
     """
-    with_page = "%s/%s_%s" % (shots, tag, page)
-    if os.path.exists(with_page + "_marked.png") or \
-            os.path.exists(with_page + "_clean.png"):
-        return with_page
-    return "%s/%s" % (shots, tag)
-
-
-def check_cell(shots, url, scroll):
-    """Refuse a cell directory and a URL that name different pages.
-
-    The cell and the URL arrive as independent arguments and nothing else ties
-    them together, so cell1 with cell2's URL reopens the page that was named,
-    walks that DOM and charges the other image's pixels to it. The answer looks
-    like a finding. compare_pages.sh writes `<index> <path> <scroll>` per line
-    beside the cells, which says what each one actually holds.
-    """
-    match = re.match(r"cell(\d+)$", os.path.basename(shots.rstrip("/")))
-    if match is None:
-        return
-    index = match.group(1)
-    listing = os.path.join(os.path.dirname(shots.rstrip("/")), "cells")
-    if not os.path.exists(listing):
-        return
-    with open(listing) as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 2 or parts[0] != index:
-                continue
-            if parts[1] not in url:
-                sys.exit("cell%s holds %s, but the url given is %s"
-                         % (index, parts[1], url))
-            if len(parts) > 2 and int(parts[2]) != scroll:
-                sys.exit("cell%s was captured at scroll %s, not %d"
-                         % (index, parts[2], scroll))
-            return
+    settle(browser, url, scroll)
+    if browser.driver == "cdp":
+        return decode(vp.capture_direct(browser, url, width, height, scroll=scroll))
+    if not backend:
+        sys.exit("a marionette side is photographed from its screen, so it "
+                 "needs a backend: x11:<display>, libvirt:<domain> or "
+                 "guest:<host>[:port]")
+    import screen_grab
+    import sweep_pages_marionette as sweeper
+    scale = device_scale(browser)
+    grabber = screen_grab.open_grabber(backend, port)
+    css_h = int(round(height / scale))
+    x, y = sweeper.find_origin(browser, grabber, css_h, scale)
+    return sweeper.handshake_frame(browser, grabber, x, y,
+                                   int(round(width / scale)), css_h, scale, False)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("shots")
-    ap.add_argument("tag")
-    ap.add_argument("page")
     ap.add_argument("url")
     ap.add_argument("--url-b", default=None)
     ap.add_argument("--a", default="127.0.0.1:9222",
                     help="[driver:]host:port of the first side's driver")
     ap.add_argument("--b", required=True,
                     help="[driver:]host:port of the second side's driver")
-    ap.add_argument("--tag-b", default=None,
-                    help="the second side's tag; the first plus W by default")
+    ap.add_argument("--backend-a", default=None,
+                    help="how to photograph the first side's screen, for a "
+                         "marionette side: x11:<display>, libvirt:<domain> or "
+                         "guest:<host>[:port]")
+    ap.add_argument("--backend-b", default=None,
+                    help="the same for the second side")
     ap.add_argument("--scroll", type=int, default=0,
-                    help="scroll offset of the compared cell")
+                    help="scroll offset to compare at")
     ap.add_argument("--width", type=int, default=1920,
                     help="the capture's width in device pixels, which is the "
                          "plan's size times its scale")
@@ -359,20 +354,6 @@ def main():
                     help="the capture's height in device pixels")
     ap.add_argument("--limit", type=int, default=14)
     args = ap.parse_args()
-    check_cell(args.shots, args.url, args.scroll)
-
-    base = side_base(args.shots, args.tag, args.page)
-    other = side_base(args.shots, args.tag_b or args.tag + "W", args.page)
-    ax, ay = viewport_origin(base)
-    bx, by = viewport_origin(other)
-    a = cv.crop(base + "_clean.png", ax, ay, args.width, args.height).astype(int)
-    b = cv.crop(other + "_clean.png", bx, by, args.width, args.height).astype(int)
-    diff = (a != b).any(axis=2)
-    total = int(diff.sum())
-    print("%s: %d differing pixels, %.4f%% identical"
-          % (args.page, total, 100 * (1 - total / (args.width * args.height))))
-    if not total:
-        return 0
 
     ba = vp.open_browser(args.a)
     bb = vp.open_browser(args.b)
@@ -384,8 +365,27 @@ def main():
             return 2
         if scale_a != 1.0:
             print("boxes taken to device pixels at %g" % scale_a)
-        rows_a = to_device(snapshot(ba, args.url, args.scroll), scale_a)
-        rows_b = to_device(snapshot(bb, args.url_b or args.url, args.scroll), scale_b)
+
+        # Captured and read on the same load, so the boxes describe the frame
+        # they are charged against.
+        url_b = args.url_b or args.url
+        a = capture(ba, args.backend_a, spec_port(args.a, 2828), args.url,
+                    args.scroll, args.width, args.height).astype(int)
+        rows_a = to_device(snapshot(ba), scale_a)
+        b = capture(bb, args.backend_b, spec_port(args.b, 2828), url_b,
+                    args.scroll, args.width, args.height).astype(int)
+        rows_b = to_device(snapshot(bb), scale_b)
+
+        if a.shape != b.shape:
+            sys.exit("the two sides captured %dx%d and %dx%d; hold them to one size"
+                     % (a.shape[1], a.shape[0], b.shape[1], b.shape[0]))
+        diff = (a != b).any(axis=2)
+        total = int(diff.sum())
+        print("%s: %d differing pixels, %.4f%% identical"
+              % (args.url.rsplit("/", 1)[-1], total,
+                 100 * (1 - total / (a.shape[0] * a.shape[1]))))
+        if not total:
+            return 0
 
         # The tree, from the recorded-ancestor field, so a box whose own rect
         # agrees can still be caught holding something that moved.

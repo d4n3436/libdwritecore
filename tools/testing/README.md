@@ -40,19 +40,20 @@ finish a large plan sooner. Shards are one side, and their results are pooled.
 question here is the census, which enumerates the decisions a renderer made
 about fonts; a sweep photographs what it drew.
 
-**backend** is how a side's screen gets photographed, since a browser cannot
-take that shot of itself. An X display, a guest's emulated display, or a
-window inside a guest read over TCP.
+**backend** is how a side's screen gets photographed, since Firefox cannot
+take a shot of itself. An X display, a guest's emulated display, or a
+window inside a guest read over TCP. A Chromium side hands back its own
+viewport and photographs no screen.
 
 **marker** is an eight-pixel magenta square drawn at the viewport's top left
 corner. A screenshot covers a whole screen, and the marker is what says which
-pixel of it the viewport starts at. Every cell is shot twice, once with the
-marker and once without, and only the clean shot is compared.
+pixel of it the viewport starts at, so a Firefox cell is shot twice, once with
+the marker and once without, and only the clean shot is compared. A Chromium
+side asks the browser for its viewport and needs none of this.
 
 A sweep never writes those shots down. Each side hands its frame to the
 comparison over a socket, the pair meets in memory and only the report
 survives. Saving them was for reading them by eye, which nothing does now.
-`compare_pages.sh --no-frames` puts the old path back, and
 `capture_viewport.sh` still writes a pair on request, since the tools further
 down want pixels to work on.
 
@@ -121,16 +122,6 @@ its own and Marionette ports go two apart, each taking `PORT+1` for its
 capture server. Start them one at a time: bringing them all up at once peaks
 far above what they then hold.
 
-Point `TMPDIR` at a disk:
-
-    export TMPDIR=/var/tmp/dwc-shots
-
-A sweep writes no captures at all, so this is for the profiles and the
-per-cell reports. `--no-frames` puts the captures back, and where `/tmp` is a
-tmpfs those are held in RAM and the machine swaps. The Electron launcher keeps
-its own state on disk already, in `/var/tmp/electron-parity` or wherever
-`DWC_ELECTRON_STATE` points.
-
 ### 3. Write a plan
 
     size 1199 579
@@ -155,9 +146,9 @@ On a `cdp` side the backend is still parsed and has to be well formed, but
 nothing photographs a screen there.
 
 A comma list is shards of one side, not a second browser to compare against.
-All of a side's shards must be the same build; `compare_pages.sh` checks only
-the first port of each side, so a second shard started on another build goes
-unnoticed and its numbers are fiction.
+All of a side's shards must be the same build, and `compare_pages.sh` walks
+every port of both sides to check it, refusing the sweep and naming the odd
+one out.
 
 `accept` lists page globs whose difference is known not to be the shim's;
 those cells are still captured and printed, marked `accepted`, and kept out of
@@ -203,8 +194,8 @@ differing pixels, `--css RULES` adds a rule sheet to both sides at once.
 * **Same build on both sides, shards included.** For Firefox,
   `readprefs_marionette.py <host> <port> --graphics`: the WebRender feature
   status and source revision must agree, and a GPU against a software
-  WebRender is not a comparison. For Electron, `--binary` pins it, and the
-  shard check is yours to do.
+  WebRender is not a comparison. For Electron, `--binary` pins it. Either way
+  the sweep checks every shard before it starts.
 * **Byte-identical font files**, not the same family at the same version.
 * **The shim is stated deliberately.** A shell that already has it preloaded
   hands it to every browser it starts, so a run given no `--preload` is not
@@ -228,19 +219,24 @@ differing pixels, `--css RULES` adds a rule sheet to both sides at once.
 
 ## When a cell differs
 
-Work down until the difference has a name.
+Work down until the difference has a name. The last three ask the browsers
+themselves and need nothing on disk. The first two read a captured pair, and a
+sweep leaves none, so `capture_viewport.sh` is what makes one.
 
-    compare_viewport.py … --bands 24    # a layout offset, or pixels?
+    capture_viewport.sh <backend> <prefix> <host> <port> <url> <w> <h>
+    compare_viewport.py <w> <h> <prefix>_marked.png <prefix>_clean.png \
+                                <other>_marked.png <other>_clean.png --bands 24
     compare_viewport.py … --rows 0,820  # judge the part above an offset
     charpos.py <A> <B> --page <path> --prefixes <urlA> <urlB>
-    attribute_diff.py <shots> <tag> <page> <url> --a <A> --b <B>
+    attribute_diff.py <url> --a <A> --b <B> --backend-a <SPEC> --backend-b <SPEC>
     font_census.py …                    # which decision, not which pixel
 
 `--bands` reports the vertical shift that best aligns each band: zero means
 the pixels disagree, one or two means the content moved, and the row where it
 changes is the place to look. `charpos.py` diffs every character's rect, which
 separates metrics from raster in one shot. `attribute_diff.py` charges each
-differing pixel to the innermost element covering it. The census enumerates
+differing pixel to the innermost element covering it, capturing both sides
+itself so the pixels and the boxes come from one load. The census enumerates
 the decisions a renderer made; the sweep photographs what it drew.
 
 Re-run a suspect cell on its own before believing it. A cell that is identical
@@ -257,7 +253,7 @@ alone and differs in a sweep is the harness under load, not the shim.
 | `capture_viewport.sh` + `.py` | One cell by hand: sizes the browser, marks the origin, takes the two shots. `--driver marionette\|cdp`. |
 | `screen_grab.py` | Photographs a screen: `x11:<display>`, `libvirt:<domain>`, `guest:<host>`. Shared by the sweep and the single cell. |
 | `viewport_protocol.py` | The page state, size convergence and marker handshake both drivers share. |
-| `compare_viewport.py` | How far apart two captures are. Crops to the marker and diffs. |
+| `compare_viewport.py` | How far apart two captures are. Pairs the sweep's frames in memory, and diffs a saved pair from the command line. |
 | `charpos.py` | Per-character rects from both sides, diffed. Metrics against raster. |
 | `attribute_diff.py` | Which element each differing pixel belongs to. |
 | `font_census.py`, `census_per_language.sh` | Every font decision a renderer made, enumerated. The census restarts both browsers per language, since a renderer caches fallback by character. |
