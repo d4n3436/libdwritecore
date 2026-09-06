@@ -370,6 +370,18 @@ struct CommonFallbackRule
     // same columns.
     "pref(\"gfx.webrender.picture-tile-width\", 512);\n"
     "pref(\"widget.non-native-theme.use-theme-accent\", false);\n"
+    // The caret's width, which a scaled display makes visible.
+    //
+    // nsCaret::ComputeMetrics builds it as
+    // height * LookAndFeel CaretAspectRatio + CSSPixelsToAppUnits(CaretWidth)
+    // and floors that to whole device pixels. CSSPixelsToAppUnits counts sixty
+    // to a CSS pixel whatever the ratio, so at 1.25, 1.5 or 2 the floor is
+    // taken against forty-eight, forty or thirty. Windows' aspect ratio is
+    // zero and GTK's is its gtk-cursor-aspect-ratio, so the Linux caret clears
+    // the next whole pixel and comes out a pixel wider. The two agree at a
+    // ratio of one, where both floor to the same pixel, which is why this only
+    // shows on a scaled display. The pref is read as hundredths.
+    "pref(\"ui.caretAspectRatio\", 0);\n"
     "pref(\"font.name-list.serif.x-math\", \"Latin Modern Math, STIX Two Math, XITS Math, Cambria Math, Libertinus Math, DejaVu Math TeX Gyre, TeX Gyre Bonum Math, TeX Gyre Pagella Math, TeX Gyre Schola, TeX Gyre Termes Math, STIX Math, Asana Math, STIXGeneral, DejaVu Serif, DejaVu Sans, Times New Roman\");\n"
     "pref(\"font.name-list.sans-serif.x-math\", \"Arial\");\n"
     "pref(\"font.name-list.monospace.x-math\", \"Consolas\");\n"
@@ -552,6 +564,9 @@ struct FontSubstitute
     const char* actual;
 };
 
+// The name asked for and the name answered are meant to be scanned down the
+// column.
+// ReSharper disable CppUseDesignatedInitializers
 inline constexpr FontSubstitute kFontSubstitutes[] = {
     { "Arabic Transparent", "Arial" },
     { "Arial Baltic", "Arial" },
@@ -602,6 +617,7 @@ inline constexpr FontSubstitute kFontSubstitutes[] = {
     { "FangSong_GB2312", "FangSong" },
     { "KaiTi_GB2312", "KaiTi" },
 };
+// ReSharper restore CppUseDesignatedInitializers
 
 }  // namespace firefox_parity
 

@@ -82,6 +82,15 @@
 // offset at all - and one of them is Firefox's own == against a descent.
 #pragma GCC diagnostic ignored "-Wfloat-equal"
 
+// The type of an atomic is what says how the field is shared, so it is spelled
+// out rather than deduced.
+// ReSharper disable CppTemplateArgumentsCanBeDeduced
+
+// What is left groups an addition inside a mask, a shift inside a comparison
+// or one ternary inside another, where the precedence is the thing a reader
+// should not have to recall.
+// ReSharper disable CppRedundantParentheses
+
 // Each block here reads against the Firefox and Skia source it was translated
 // from, and both of these would reshape it away from the original.
 // ReSharper disable CppTooWideScopeInitStatement
@@ -129,7 +138,7 @@ bool LinkMapImportsFreeType()
     {
         const void* self_base;
         bool found;
-    } ask{self_base, false};
+    } ask{ .self_base = self_base, .found = false };
 
     dl_iterate_phdr(
         [](dl_phdr_info* info, size_t, void* data) {
@@ -489,6 +498,25 @@ void LogLine(const char* fmt, ...)
     }
 }
 
+// The faces a trace is being kept for.
+//
+// Summing a glyph's texture and formatting a line for it is real work in the
+// drawing thread, and paid on every glyph it comes to more than the writing
+// does. A run that behaves differently while it is watched says nothing about
+// the run that is not, so CLEARTYPE_LOG_FAMILY narrows the per-glyph lines to
+// the faces in question and leaves the rest of a page costing what it costs
+// with no log at all.
+char g_log_family[128] = "";
+
+bool LogFaceWanted(FT_Face face)
+{
+    if (g_log_family[0] == '\0') {
+        return true;
+    }
+    return face != nullptr && face->family_name != nullptr &&
+           std::strstr(face->family_name, g_log_family) != nullptr;
+}
+
 // Reports, at most once per face, why that face's glyphs are going to real
 // FreeType instead.
 void LogSkipOnce(FT_Face face, const char* reason)
@@ -583,6 +611,9 @@ void InitOptions()
             // O_APPEND is what makes concurrent writes atomic; O_CLOEXEC keeps
             // the descriptor out of anything this process spawns.
             g_log_fd = open(named, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        }
+        if (const char* family = std::getenv("CLEARTYPE_LOG_FAMILY")) {
+            (void)std::snprintf(g_log_family, sizeof(g_log_family), "%s", family);
         }
         LogLine("%s", g_version);
     }
@@ -719,6 +750,7 @@ bool WindowsMetrics()
 static thread_local FT_Face g_last_sfnt_face = nullptr;
 
 
+#if CLEARTYPE_FIREFOX_PARITY
 // The size gfxFT2FontBase::InitMetrics is measuring at, read out of the font
 // itself by libxul_patch.cpp. The face alone does not name an instance, since
 // several fonts share one face at different sizes and the face carries
@@ -726,6 +758,7 @@ static thread_local FT_Face g_last_sfnt_face = nullptr;
 static thread_local FT_Fixed g_claimed_em_26_6 = 0;
 // The same size before it was quantized, or 0. See the claimed-size table.
 static thread_local double g_claimed_em_px = 0.0;
+#endif
 
 
 
@@ -801,7 +834,6 @@ struct Factories
 {
     IDWriteFactory* factory = nullptr;
     IDWriteFactory2* factory2 = nullptr;  // optional; enables grid-fit control
-    IDWriteFactory3* factory3 = nullptr;  // optional; see AxesSwapped
 };
 
 Factories g_factories;
@@ -824,15 +856,9 @@ Factories GetFactories()
             if (SUCCEEDED(unknown->QueryInterface(iid2, &factory2))) {
                 created.factory2 = static_cast<IDWriteFactory2*>(factory2);
             }
-            void* factory3 = nullptr;
-            const GUID iid3 = DWRITE_UUIDOF(IDWriteFactory3);
-            if (SUCCEEDED(unknown->QueryInterface(iid3, &factory3))) {
-                created.factory3 = static_cast<IDWriteFactory3*>(factory3);
-            }
             g_factories = created;
-            LogLine("DWriteCore factory created (IDWriteFactory2 %s, IDWriteFactory3 %s)",
-                    created.factory2 ? "available" : "unavailable",
-                    created.factory3 ? "available" : "unavailable");
+            LogLine("DWriteCore factory created (IDWriteFactory2 %s)",
+                    created.factory2 ? "available" : "unavailable");
         } else {
             g_factory_failed = true;
             const char* why = DWriteCoreShimGetLastLoadError();
@@ -2007,34 +2033,25 @@ IDWriteFontFace* GetDWriteFaceLocked(FaceEntry* entry, IDWriteFactory* factory,
 //
 // DWRITE_MATRIX is row-vector (x' = x*m11 + y*m21), FT_Matrix is column
 // (x' = x*xx + y*xy), so the off-diagonal terms also swap position.
+//
+// The aspect goes on the two terms the x char size scaled. A caller that
+// hands FreeType two char sizes has already divided its matrix by both, one
+// per column, where the DWRITE_MATRIX Windows builds is divided by the y size
+// throughout: SkScalerContext_CairoFT::computeShapeMatrix normalizes by major
+// and minor and SkScalerContext_win_dw's fSkXform is the whole matrix over
+// scale.fY, and platform/unix/font.rs and platform/windows/font.rs split the
+// same way around compute_scale. Multiplying the x column by the ratio of the
+// two sizes puts it back on the y size's footing. In a row-vector matrix that
+// column is m11 and m12; the ratio is one unless the two sizes differ, which
+// is why only a shape with a zero diagonal shows it.
 DWRITE_MATRIX ToDWriteMatrix(const FT_Matrix& m, const float x_over_y)
 {
     DWRITE_MATRIX out = {};
     out.m11 = static_cast<FLOAT>(static_cast<double>(m.xx) / 65536.0) * x_over_y;
-    out.m12 = static_cast<FLOAT>(static_cast<double>(-m.yx) / 65536.0);
-    out.m21 = static_cast<FLOAT>(static_cast<double>(-m.xy) / 65536.0) * x_over_y;
+    out.m12 = static_cast<FLOAT>(static_cast<double>(-m.yx) / 65536.0) * x_over_y;
+    out.m21 = static_cast<FLOAT>(static_cast<double>(-m.xy) / 65536.0);
     out.m22 = static_cast<FLOAT>(static_cast<double>(m.yy) / 65536.0);
     return out;
-}
-
-// True when the transform maps the glyph's x axis onto the device y axis and
-// its y axis onto the device x, which is what a quarter turn does.
-//
-// DirectWrite grid-fits along the device y axis, so under a quarter turn it
-// fits what was the glyph's x. In CLEARTYPE_NATURAL, DWriteCore's
-// IDWriteFactory::CreateGlyphRunAnalysis fits the glyph's own y instead. Every
-// glyph with a stem then differs, the strokes ending up horizontal keeping
-// their natural width instead of snapping to a pixel row and the ones ending
-// up vertical carrying the snapped width of the upright glyph. The
-// IDWriteFactory3 overload with DWRITE_GRID_FIT_MODE_ENABLED fits along the
-// device axis and matches Windows, so that one case takes it.
-//
-// Only a swap qualifies. A diagonal transform already agrees, and DirectWrite
-// does not grid-fit a rotation that is not a quarter turn at all, so forcing
-// the fit on for a skew or a 45 degree rotation is wrong the other way.
-bool AxesSwapped(const DWRITE_MATRIX& m)
-{
-    return m.m11 == 0.0f && m.m22 == 0.0f && (m.m12 != 0.0f || m.m21 != 0.0f);
 }
 
 // FIREFOX PARITY. Recover the exact synthetic-oblique skew from the 16.16 one
@@ -2064,6 +2081,10 @@ bool AxesSwapped(const DWRITE_MATRIX& m)
 // and are either exact for upright horizontal text (xx, yy, ft_delta, the
 // subpixel dx, the cbox shift) or recovered elsewhere - see ExactEmSize for the
 // char size.
+// Whether a recovered shear arrived on its own or behind the quarter turn
+// vertical text is drawn under.
+enum class ObliqueForm { None, Upright, QuarterTurn };
+
 #if CLEARTYPE_FIREFOX_PARITY
 
 float SkewForAngle(const int angle_256)
@@ -2075,12 +2096,23 @@ float SkewForAngle(const int angle_256)
     return tanf(radians);
 }
 
-bool ExactObliqueSkew(const FT_Matrix& m, float* skew)
+ObliqueForm ExactObliqueSkew(const FT_Matrix& m, float* skew)
 {
-    if (m.xx != 0x10000 || m.yy != 0x10000 || m.yx != 0 || m.xy == 0) {
-        return false;
+    // Upright text sends the shear on its own. Vertical text sends the same
+    // shear behind the quarter turn the glyph is drawn under, and the product
+    // [[0,1],[-1,0]] * [[1,s],[0,1]] carries it in yy.
+    ObliqueForm form;
+    FT_Fixed sent;
+    if (m.xx == 0x10000 && m.yy == 0x10000 && m.yx == 0 && m.xy != 0) {
+        form = ObliqueForm::Upright;
+        sent = m.xy;
+    } else if (m.xx == 0 && m.xy == 0x10000 && m.yx == -0x10000 && m.yy != 0) {
+        form = ObliqueForm::QuarterTurn;
+        sent = -m.yy;
+    } else {
+        return ObliqueForm::None;
     }
-    const double received = static_cast<double>(m.xy) / 65536.0;
+    const double received = static_cast<double>(sent) / 65536.0;
     const double angle = std::atan(received) * (180.0 / M_PI) * 256.0;
     const long nearest = static_cast<long>(std::floor(angle + 0.5));
     for (long candidate = nearest - 1; candidate <= nearest + 1; ++candidate) {
@@ -2091,19 +2123,19 @@ bool ExactObliqueSkew(const FT_Matrix& m, float* skew)
         // `as FT_Fixed` in Rust truncates toward zero; the multiply by 65536 is
         // exact in f32, so doing it in double here cannot disagree.
         const FT_Fixed round_trip = static_cast<FT_Fixed>(std::trunc(static_cast<double>(value) * 65536.0));
-        if (round_trip == m.xy) {
+        if (round_trip == sent) {
             *skew = value;
-            return true;
+            return form;
         }
     }
-    return false;
+    return ObliqueForm::None;
 }
 
 #else  // !CLEARTYPE_FIREFOX_PARITY
 
 // Without Firefox to reproduce there is no sender whose quantization is known,
 // so the matrix is whatever the caller sent.
-inline bool ExactObliqueSkew(const FT_Matrix&, float*) { return false; }
+inline ObliqueForm ExactObliqueSkew(const FT_Matrix&, float*) { return ObliqueForm::None; }
 
 #endif
 
@@ -2930,17 +2962,32 @@ FT_Fixed RequestedEmSize(FT_Face face)
 // assumed to be 60, the unscaled value at device pixel ratio 1.
 constexpr int kAppUnitsPerCSSPixel = 60;
 
+// App units per device pixel, as this presentation counts them.
+//
+// AppUnitsPerCSSPixel is always 60; this is 60 only while a device pixel is a
+// CSS pixel, and 48, 40 or 30 at a device pixel ratio of 1.25, 1.5 or 2. It
+// stays 60 until the patch in libxul_patch.cpp reads one out of a shaped
+// text, so a build where that never happens behaves exactly as it did before.
+std::atomic<int> g_app_units_per_dev_px{60};
+
 bool ExactEmSize(const FT_Fixed em_size_26_6, double* exact)
 {
     if (em_size_26_6 <= 0) {
         return false;
     }
+    // How many app units this presentation puts in a device pixel. Sixty while
+    // a device pixel is a CSS pixel, and 48, 40 or 30 at a ratio of 1.25, 1.5
+    // or 2, which is the grid the size was laid out on. Recovering against 60
+    // on a scaled display lands on a size a fraction away from the one Windows
+    // measures and rasterizes, and a fraction is enough where the outline is
+    // grid-fitted.
+    const int per_px = g_app_units_per_dev_px.load(std::memory_order_relaxed);
     const long app_units =
-        static_cast<long>(std::floor(static_cast<double>(em_size_26_6) * kAppUnitsPerCSSPixel / 64.0 + 0.5));
+        static_cast<long>(std::floor(static_cast<double>(em_size_26_6) * per_px / 64.0 + 0.5));
     if (app_units <= 0) {
         return false;
     }
-    const double px = static_cast<double>(app_units) / kAppUnitsPerCSSPixel;
+    const double px = static_cast<double>(app_units) / per_px;
     // Both are floor for the same reason as above: app_units > 0 was checked
     // just now, so px is positive and truncation and floor agree.
     const FT_Fixed layout_quantized = static_cast<FT_Fixed>(std::floor(px * 64.0 + 0.5));
@@ -2966,12 +3013,20 @@ FT_Fixed CharSize26_6(const double px)
 
 // gfxFontStyle::AdjustForSubSuperscript, forwards.
 //
-// aAppUnitsPerDevPixel and AppUnitsPerCSSPixel are both 60, so the reduction
-// is decided on the size itself, narrowed to f32 the way the source narrows
-// it.
+// The size is in device pixels and the thresholds are CSS pixels, so the
+// source converts before it compares:
+//
+//     float cssSize = size * aAppUnitsPerDevPixel / AppUnitsPerCSSPixel();
+//
+// The two are equal only at a device pixel ratio of one. Above it the device
+// size is the larger number and comparing it against the thresholds picks a
+// different ratio, which is a different em and a different glyph. Narrowed to
+// f32 the way the source narrows it.
 double SubSuperSize(const double size)
 {
-    const auto css = static_cast<double>(static_cast<float>(size));
+    const int per_px = g_app_units_per_dev_px.load(std::memory_order_relaxed);
+    const auto css = static_cast<double>(static_cast<float>(
+        size * static_cast<double>(per_px) / static_cast<double>(kAppUnitsPerCSSPixel)));
     if (css < 20.0) {
         return size * 0.82;
     }
@@ -3005,8 +3060,8 @@ bool ReducedEmSize(const FT_Fixed em_size_26_6, double* exact)
     // from, thousands of them at a large size, and every glyph in a run asks
     // about the same size. Remembering the last answer turns a run into one
     // search.
-    static thread_local FT_Fixed memo_size = 0;
-    static thread_local double memo_px = 0.0;
+    thread_local FT_Fixed memo_size = 0;
+    thread_local double memo_px = 0.0;
     if (memo_size == em_size_26_6) {
         if (!(memo_px > 0.0)) {
             return false;
@@ -3054,35 +3109,119 @@ bool ReducedEmSize(const FT_Fixed em_size_26_6, double* exact)
 // it quantizes to.
 //
 // One face carries several at once, since a superscript run and the text
-// around it share it. The table is bounded and the oldest entry is dropped;
-// only sizes still in use are ever asked for.
+// around it share it, and a size is asked for when a glyph is drawn rather
+// than when it is claimed. A face keeps its own row, so claiming a size for
+// one face never drops another's, and a row is bounded and drops its oldest
+// entry. Rows are taken in turn once they run out, which loses the sizes of
+// whichever face has gone longest without one.
+constexpr size_t kClaimedFaces = 64;
+constexpr size_t kClaimedPerFace = 16;
+
 struct ClaimedSize
 {
-    FT_Face face;
     FT_Fixed size_26_6;
     double px;
+    // The mFTSize the font paired with this size, as a char size. They are the
+    // same value except where FindClosestSize moved it. See AdjustedSizeForFace.
+    FT_Fixed ft_26_6;
+    // Whether a font named this as its own mAdjustedSize. A size recorded as
+    // the mFTSize a font settled on is the face's size and not a font's, and
+    // names nothing to measure at.
+    bool from_adjusted;
+    // When the face was last set to this size. See TouchClaimedSize.
+    unsigned long long used;
 };
 
-ClaimedSize g_claimed_sizes[64] = {};
-size_t g_claimed_next = 0;
+struct ClaimedFace
+{
+    FT_Face face;
+    size_t next;
+    ClaimedSize sizes[kClaimedPerFace];
+};
+
+ClaimedFace g_claimed_faces[kClaimedFaces] = {};
+size_t g_claimed_next_face = 0;
+unsigned long long g_claim_clock = 0;
 pthread_mutex_t g_claimed_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void RecordClaimedSize(FT_Face face, const double px)
+// Both take g_claimed_mutex.
+ClaimedFace* FindClaimedFaceLocked(FT_Face face)
+{
+    for (ClaimedFace& row : g_claimed_faces) {
+        if (row.face == face) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+ClaimedFace* ClaimRowLocked(FT_Face face)
+{
+    if (ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        return row;
+    }
+    for (ClaimedFace& row : g_claimed_faces) {
+        if (row.face == nullptr) {
+            row.face = face;
+            return &row;
+        }
+    }
+    ClaimedFace* row = &g_claimed_faces[g_claimed_next_face];
+    g_claimed_next_face = (g_claimed_next_face + 1) % std::size(g_claimed_faces);
+    *row = ClaimedFace{};
+    row->face = face;
+    return row;
+}
+
+void RecordClaimedSize(FT_Face face, const double px, const double ft_px,
+                       const bool from_adjusted)
 {
     if (face == nullptr || !(px > 0.0) || !(px < 65536.0)) {
         return;
     }
     const FT_Fixed size_26_6 = CharSize26_6(px);
+    const FT_Fixed ft_26_6 = ft_px > 0.0 && ft_px < 65536.0 ? CharSize26_6(ft_px) : size_26_6;
     pthread_mutex_lock(&g_claimed_mutex);
-    for (ClaimedSize& slot : g_claimed_sizes) {
-        if (slot.face == face && slot.size_26_6 == size_26_6) {
+    ClaimedFace* row = ClaimRowLocked(face);
+    for (ClaimedSize& slot : row->sizes) {
+        if (slot.px > 0.0 && slot.size_26_6 == size_26_6) {
             slot.px = px;
+            slot.ft_26_6 = ft_26_6;
+            // Only ever raised. A font that named this size as its own is
+            // still one when the same value arrives again as a face's size.
+            slot.from_adjusted = slot.from_adjusted || from_adjusted;
+            slot.used = ++g_claim_clock;
             pthread_mutex_unlock(&g_claimed_mutex);
             return;
         }
     }
-    g_claimed_sizes[g_claimed_next] = ClaimedSize{ .face = face, .size_26_6 = size_26_6, .px = px };
-    g_claimed_next = (g_claimed_next + 1) % std::size(g_claimed_sizes);
+    row->sizes[row->next] = ClaimedSize{ .size_26_6 = size_26_6, .px = px,
+                                         .ft_26_6 = ft_26_6, .from_adjusted = from_adjusted,
+                                         .used = ++g_claim_clock };
+    row->next = (row->next + 1) % kClaimedPerFace;
+    pthread_mutex_unlock(&g_claimed_mutex);
+}
+
+// Notes that a face has been set to a size it was claimed at.
+//
+// gfxFT2FontBase::LockFTFace sets the face to mFTSize with equal width and
+// height whenever another owner had it last, so a font still on the page keeps
+// asking for its size and one whose page is gone stops. A face outlives both,
+// and this is what separates the sizes it still carries.
+void TouchClaimedSize(FT_Face face, const FT_Fixed size_26_6)
+{
+    if (face == nullptr || size_26_6 <= 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_claimed_mutex);
+    if (ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        for (ClaimedSize& slot : row->sizes) {
+            if (slot.px > 0.0 && slot.size_26_6 == size_26_6) {
+                slot.used = ++g_claim_clock;
+                break;
+            }
+        }
+    }
     pthread_mutex_unlock(&g_claimed_mutex);
 }
 
@@ -3090,15 +3229,292 @@ bool ClaimedSizeFor(FT_Face face, const FT_Fixed size_26_6, double* px)
 {
     bool found = false;
     pthread_mutex_lock(&g_claimed_mutex);
-    for (const ClaimedSize& slot : g_claimed_sizes) {
-        if (slot.face == face && slot.size_26_6 == size_26_6) {
-            *px = slot.px;
-            found = true;
-            break;
+    if (const ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        for (const ClaimedSize& slot : row->sizes) {
+            if (slot.px > 0.0 && slot.size_26_6 == size_26_6) {
+                *px = slot.px;
+                found = true;
+                break;
+            }
         }
     }
     pthread_mutex_unlock(&g_claimed_mutex);
     return found;
+}
+
+// Every distinct size the table holds for a face.
+size_t ClaimedSizesFor(FT_Face face, double* out, unsigned long long* used, const size_t room)
+{
+    size_t found = 0;
+    pthread_mutex_lock(&g_claimed_mutex);
+    if (const ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        for (const ClaimedSize& slot : row->sizes) {
+            if (!(slot.px > 0.0) || found == room) {
+                continue;
+            }
+            bool already = false;
+            for (size_t i = 0; i < found; ++i) {
+                already = already || out[i] == slot.px;
+            }
+            if (!already) {
+                out[found] = slot.px;
+                used[found] = slot.used;
+                ++found;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_claimed_mutex);
+    return found;
+}
+
+// The size Gecko is measuring at, where the face is set to another one.
+//
+// gfxFT2FontBase::FindClosestSize clamps mFTSize to a pixel and to a bitmap
+// strike, and GetFTGlyphExtents scales what it reads back by
+// GetAdjustedSize() / mFTSize afterwards. Windows measures at the adjusted
+// size itself, and the two are not one scale apart: gfxFont::PostShapingFixup
+// adds a tracking whose floor is a quarter of a pixel however small the size
+// is, and a whole app unit is a coarser step than the advances under a pixel
+// differ by.
+//
+// The pair is recorded together, so a claimed size whose mFTSize is the one the
+// face carries names the size the font behind it is really drawing at. A face
+// measured at a pixel and at a fraction of one carries a claim for each, and
+// both name the same mFTSize, so the most recent stands; a font at the size the
+// face is already set to leaves nothing to answer.
+bool AdjustedSizeForFace(FT_Face face, const FT_Fixed ft_26_6, double* adjusted)
+{
+    double best = 0.0;
+    pthread_mutex_lock(&g_claimed_mutex);
+    if (const ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        unsigned long long newest = 0;
+        for (const ClaimedSize& slot : row->sizes) {
+            if (!(slot.px > 0.0) || !slot.from_adjusted || slot.ft_26_6 != ft_26_6) {
+                continue;
+            }
+            if (best == 0.0 || slot.used > newest) {
+                best = slot.px;
+                newest = slot.used;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_claimed_mutex);
+    if (!(best > 0.0) || CharSize26_6(best) == ft_26_6) {
+        return false;
+    }
+    *adjusted = best;
+    return true;
+}
+
+// FT_F26Dot6(fScaleY * 64.0f + 0.5f) in SkScalerContext_CairoFT::Lock. The
+// cast truncates and the arithmetic is single precision.
+FT_Fixed SkiaCharSize26_6(const float px)
+{
+    // NOLINTNEXTLINE(bugprone-incorrect-roundings)  -- the truncation is the mirror
+    return static_cast<FT_Fixed>(px * 64.0f + 0.5f);
+}
+
+// The one product of a size and a whole number of 1024ths that quantizes to
+// the received value, if the size names exactly one. `units` is the number of
+// 1024ths, which is what separates two sizes that both name one. See
+// ScaledEmSize.
+bool ProductOfSize(const double size, const FT_Fixed em_size_26_6, double* px,
+                   long* units = nullptr)
+{
+    if (!(size > 0.0)) {
+        return false;
+    }
+    const double estimate = static_cast<double>(em_size_26_6) * 16.0 / size;
+    // Past this a 1024th is finer than the float holding the product, so the
+    // check below cannot separate two of them.
+    if (!(estimate > 0.0) || estimate > 16777216.0) {
+        return false;
+    }
+    // sk_relax rounds and the 26.6 value rounds again, so the 1024th the
+    // received value implies can be one out either way.
+    const long seed = lround(estimate);
+    bool found = false;
+    long answer_units = 0;
+    double answer = 0.0;
+    for (long step = -1; step <= 1; ++step) {
+        const long units_here = seed + step;
+        if (units_here <= 0) {
+            continue;
+        }
+        const float product = static_cast<float>(units_here) / 1024.0f * static_cast<float>(size);
+        if (SkiaCharSize26_6(product) != em_size_26_6) {
+            continue;
+        }
+        if (found && static_cast<double>(product) != answer) {
+            return false;
+        }
+        answer = static_cast<double>(product);
+        answer_units = units_here;
+        found = true;
+    }
+    if (found) {
+        *px = answer;
+        if (units != nullptr) {
+            *units = answer_units;
+        }
+    }
+    return found;
+}
+
+// The em behind a 26.6 value that Skia scaled by a device matrix.
+//
+// SkScalerContext::MakeRecAndEffects puts the device matrix into
+// SkScalerContextRec::fPost2x2 through sk_relax, which rounds every term to a
+// 1024th, and leaves fTextSize the font's own size. getSingleMatrix multiplies
+// the two, so a uniform device scale reaches SkScalerContext_CairoFT::Lock as
+// fTextSize times a whole number of 1024ths, and SkScalerContext_win_dw reads
+// the same rec and rasterizes at that same product. The product is the answer
+// and FT_Set_Char_Size's 26.6 rounding of it is all that has to be undone.
+//
+// The product is no longer a whole app unit, and a 26.6 step is wider than an
+// app unit, so ExactEmSize almost always finds one to answer with and it is
+// the wrong size. The search here runs over the sizes Gecko has named for the
+// face instead, which are the fTextSize the product could have been built
+// from, and over the 1024ths around the one the received value implies.
+//
+// A face outlives the fonts that name sizes for it, so its row can hold
+// several sizes whose products quantize alike, and the one nearest the value
+// received answers.
+//
+// Under 16 px of size a 1024th is finer than a 26.6 step, so two neighboring
+// 1024ths of one size quantize alike as well. Nothing else in
+// FT_Set_Char_Size carries which of them it was, and the two answers are half
+// a level of coverage apart on a color glyph's layers, so the search declines
+// and the inversions below answer instead.
+//
+// The largest of these scales is a color glyph's. gfxFont::RenderColorGlyph
+// draws one into a surface scaled by two and COLRFonts walks a paint graph
+// whose transform nodes scale again, so the layers of a 16 px emoji are
+// rasterized at over a hundred pixels.
+
+// The size Skia asks a scaler for when it wants a glyph's path.
+//
+// SkFont::getPaths hands the font to setupForAsPaths before anything else,
+// which replaces the size with SkFontPriv::kCanonicalTextSizeForPaths and
+// returns the ratio for the caller to scale the finished path by, and
+// SkStrikeSpec::MakeWithNoDevice then builds the strike under no device
+// matrix. So every path request reaches the scaler as this size with the axes
+// equal, whatever size the font is drawn at, and nothing about it came from a
+// device scale for the search below to recover.
+//
+// ScaledFontBase::GetPathForGlyphs is that call, and COLRFonts takes it for
+// every gradient layer's clip and for the box RenderColorGlyph rounds out, so
+// an emoji reaches it many times per glyph.
+constexpr double kSkiaPathSize = 64.0;
+
+// Whether a received char size is that one.
+bool IsSkiaPathSize(const FT_Fixed em_size_26_6, const float x_over_y)
+{
+    return em_size_26_6 == SkiaCharSize26_6(static_cast<float>(kSkiaPathSize)) &&
+           x_over_y >= 0.9999f && x_over_y <= 1.0001f;
+}
+
+// What the Skia scaler drawing on this thread was built with, or nothing.
+// See CleartypeSkiaScaler.
+struct SkiaScalerRec
+{
+    double text_size;
+    double pre_scale_x;
+    double pre_skew_x;
+    double post[4];
+    bool valid;
+};
+thread_local SkiaScalerRec g_skia_rec = {};
+
+// Its size alone, which is all the search over products needs.
+thread_local double g_skia_text_size = 0.0;
+
+// True when the search named a product, which it writes to `exact`.
+bool ScaledEmSize(FT_Face face, const FT_Fixed em_size_26_6, double* exact)
+{
+    if (em_size_26_6 <= 0) {
+        return false;
+    }
+    // The scaler's own fTextSize, where a hook has read one out. Every size
+    // below is a guess at that value, so nothing here can improve on it.
+    if (g_skia_text_size > 0.0 &&
+        ProductOfSize(g_skia_text_size, em_size_26_6, exact)) {
+        return true;
+    }
+    // Every size the face's row can hold, so which of them answers does not
+    // depend on the order they were recorded in.
+    double claimed[kClaimedPerFace];
+    unsigned long long used[kClaimedPerFace];
+    const size_t count = ClaimedSizesFor(face, claimed, used, std::size(claimed));
+    bool found = false;
+    double answer = 0.0;
+    unsigned long long answer_used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        double px = 0.0;
+        if (!ProductOfSize(claimed[i], em_size_26_6, &px)) {
+            continue;
+        }
+        // The size the face has been set to more recently answers. It is the
+        // one a font on the page is still drawing at, the other belonging to a
+        // page that is gone.
+        if (found && px != answer && used[i] < answer_used) {
+            continue;
+        }
+        answer = px;
+        answer_used = used[i];
+        found = true;
+    }
+    if (!found) {
+        return false;
+    }
+    *exact = answer;
+    return true;
+}
+
+// The ratio of a face's two char sizes, with the 26.6 rounding taken out of
+// both.
+//
+// ToDWriteMatrix folds the ratio into the terms the x char size scaled, so it
+// has to be the ratio of the sizes themselves. computeShapeMatrix takes major
+// as the length of the shape's x column, and sk_relax leaves that column a
+// pair of whole 1024ths of the size, so the length is a square root and only
+// its dominant term is a product the search can name.
+//
+// The two are the same value to the 26.6 the face received whenever the other
+// term is small enough: the length exceeds the dominant term by the square of
+// their ratio over two, which under half a 26.6 step is a difference the
+// received value cannot carry. A column that far from an axis is a real
+// rotation, where the length is a square root the search would answer with a
+// stray product, so those keep the ratio of the received sizes.
+//
+// The two sizes are equal for every shape that scales the axes alike, so
+// nothing is done for those and the ratio stays one.
+bool ExactAspect(FT_Face face, const FT_Matrix& shape, const double em_size, float* x_over_y)
+{
+    if (!(em_size > 0.0) || face->size == nullptr || face->units_per_EM == 0) {
+        return false;
+    }
+    const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+    const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
+    if (x_26_6 <= 0 || x_26_6 == y_26_6) {
+        return false;
+    }
+    const double column_x = std::fabs(static_cast<double>(shape.xx));
+    const double column_y = std::fabs(static_cast<double>(shape.yx));
+    const double length = std::hypot(column_x, column_y);
+    if (!(length > 0.0)) {
+        return false;
+    }
+    const double excess = (length - std::max(column_x, column_y)) / length;
+    if (!(excess * (static_cast<double>(x_26_6) / 64.0) < 1.0 / 128.0)) {
+        return false;
+    }
+    double x_exact = 0.0;
+    if (!ClaimedSizeFor(face, x_26_6, &x_exact) && !ScaledEmSize(face, x_26_6, &x_exact)) {
+        return false;
+    }
+    *x_over_y = static_cast<float>(x_exact / em_size);
+    return true;
 }
 
 // A face's slots, dropped with the face. The next allocation to land on that
@@ -3106,12 +3522,333 @@ bool ClaimedSizeFor(FT_Face face, const FT_Fixed size_26_6, double* px)
 void ForgetClaimedSizes(FT_Face face)
 {
     pthread_mutex_lock(&g_claimed_mutex);
-    for (ClaimedSize& slot : g_claimed_sizes) {
-        if (slot.face == face) {
-            slot = ClaimedSize{};
-        }
+    if (ClaimedFace* row = FindClaimedFaceLocked(face)) {
+        *row = ClaimedFace{};
     }
     pthread_mutex_unlock(&g_claimed_mutex);
+}
+
+// Defined with the WebRender search below, which asks the same question of a
+// shape.
+bool IsSignedPermutation(const FT_Matrix& m);
+
+// The em behind a char size Skia scaled by a shape.
+//
+// sk_relax rounds every term of SkScalerContextRec::fPost2x2 to a 1024th, so
+// getSingleMatrix is fTextSize times a matrix of whole 1024ths.
+// computeShapeMatrix takes major as the length of that matrix's first column
+// and minor as its determinant over that length, and a length is a square
+// root, which no single 1024th reaches. The search over products therefore
+// finds nothing for a rotated layer and the app unit inversion below it has
+// nothing to invert, so the em comes out a thousandth of a pixel from the one
+// Windows rasterizes at, which is a level of coverage on every edge.
+//
+// The integers are recoverable. Each column reaches FreeType divided by its
+// own scale, so its direction names the pair and the received 26.6 size names
+// which pair it is, exactly as the WebRender search below does it. The one
+// thing neither search can guess is the size itself, and for this route
+// CleartypeSkiaScaler carries it here from the scaler.
+//
+// SkiaScalerRun answers the same question without any of this, out of the rec
+// the same hook reads, and stands ahead of it. This is what is left for a
+// build whose scaler vtable was never found.
+
+// The scale and the transform SkScalerContext_win_dw hands DirectWrite, for a
+// device matrix whose terms are known exactly.
+//
+// SkScalerContextRec::getSingleMatrix multiplies the size into the relaxed
+// 2x2, computeMatrices removes the rotation by a Givens rotation and takes the
+// scale as what is left on the diagonal, and the remainder is the matrix
+// divided by it. Every step is in float, and the order matters: the same
+// quantities reached through the 16.16 shape FreeType was handed are a part in
+// 65536 out, which is a level of coverage on an edge a hundred pixels from the
+// origin.
+struct WindowsShapedRun
+{
+    float em_size;
+    float m11, m12, m21, m22;
+};
+
+// The total matrix SkScalerContextRec::getSingleMatrix builds, out of the five
+// fields it is made of.
+//
+// getLocalMatrix is SkFontPriv::MakeTextMatrix, a scale by the size and the
+// pre-scale with the pre-skew posted onto it, and getMatrixFrom2x2 is the
+// relaxed device matrix. postConcat puts the device matrix on the left, and
+// SkMatrix multiplies through sdot, which is a float multiply and add.
+void SkiaTotalMatrix(const SkiaScalerRec& rec, float* a00, float* a01, float* a10, float* a11)
+{
+    const auto size = static_cast<float>(rec.text_size);
+    const float l00 = size * static_cast<float>(rec.pre_scale_x);
+    const float l01 = static_cast<float>(rec.pre_skew_x) * size;
+    const float l11 = size;
+    const auto d00 = static_cast<float>(rec.post[0]);
+    const auto d01 = static_cast<float>(rec.post[1]);
+    const auto d10 = static_cast<float>(rec.post[2]);
+    const auto d11 = static_cast<float>(rec.post[3]);
+    // Row zero of the local matrix has no y term, so the two products that
+    // would use it are dropped rather than written as multiplies by zero.
+    *a00 = d00 * l00;
+    *a01 = d00 * l01 + d01 * l11;
+    *a10 = d10 * l00;
+    *a11 = d10 * l01 + d11 * l11;
+}
+
+// Whether the relaxed device matrix is the identity, which is every glyph a
+// page draws at its own size. Those reach FreeType as the size itself and are
+// already exact, so nothing below is asked of them.
+bool SkiaDeviceIsIdentity(const SkiaScalerRec& rec)
+{
+    return rec.post[0] == 1.0 && rec.post[1] == 0.0 && rec.post[2] == 0.0 && rec.post[3] == 1.0 &&
+           rec.pre_scale_x == 1.0 && rec.pre_skew_x == 0.0;
+}
+
+bool WindowsRunForMatrix(const float a00, const float a10, const float a01, const float a11,
+                         WindowsShapedRun* out)
+{
+    // computeMatrices only removes a rotation from a matrix that has one.
+    const bool skewed_or_flipped = a01 != 0.0f || a10 != 0.0f || a00 < 0.0f || a11 < 0.0f;
+    float ga_scale_x = a00;
+    float ga_scale_y = a11;
+    if (skewed_or_flipped) {
+        float cos_g = 1.0f;
+        float sin_g = 0.0f;
+        // SkComputeGivensRotation over the point A maps the horizontal
+        // baseline to, which is column one.
+        if (a10 == 0.0f) {
+            cos_g = std::copysign(1.0f, a00);
+            sin_g = 0.0f;
+        } else if (a00 == 0.0f) {
+            cos_g = 0.0f;
+            sin_g = -std::copysign(1.0f, a10);
+        } else if (std::fabs(a10) > std::fabs(a00)) {
+            const float t = a00 / a10;
+            const float u = std::copysign(std::sqrt(1.0f + t * t), a10);
+            sin_g = -1.0f / u;
+            cos_g = -sin_g * t;
+        } else {
+            const float t = a10 / a00;
+            const float u = std::copysign(std::sqrt(1.0f + t * t), a00);
+            cos_g = 1.0f / u;
+            sin_g = -cos_g * t;
+        }
+        ga_scale_x = cos_g * a00 - sin_g * a10;
+        ga_scale_y = sin_g * a01 + cos_g * a11;
+    }
+    // A matrix this flat draws nothing, and computeMatrices answers a scale of
+    // one and a pair of zero matrices for it rather than a size.
+    constexpr float kNearlyZero = 1.0f / 4096.0f;
+    if (!std::isfinite(ga_scale_x) || !std::isfinite(ga_scale_y) ||
+        std::fabs(ga_scale_x) <= kNearlyZero || std::fabs(ga_scale_y) <= kNearlyZero) {
+        return false;
+    }
+    // PreMatrixScale::kVertical takes both scales from the diagonal's second
+    // term, and sA is the matrix with that taken out. Which of the three ways
+    // it is taken out decides the last bit of every term, so all three are
+    // here.
+    const float scale = std::fabs(ga_scale_y);
+    out->em_size = scale;
+    if (!skewed_or_flipped && a00 == a11) {
+        out->m11 = 1.0f;
+        out->m12 = 0.0f;
+        out->m21 = 0.0f;
+        out->m22 = 1.0f;
+    } else if (!skewed_or_flipped) {
+        out->m11 = a00 / scale;
+        out->m12 = 0.0f;
+        out->m21 = 0.0f;
+        out->m22 = 1.0f;
+    } else {
+        // Through the reciprocal SkScalarInvert makes of it, which is not the
+        // same last bit as a divide.
+        const float inv = 1.0f / scale;
+        out->m11 = a00 * inv;
+        out->m12 = a10 * inv;
+        out->m21 = a01 * inv;
+        out->m22 = a11 * inv;
+    }
+    return true;
+}
+
+// The two char sizes and the shape SkScalerContext_CairoFT::Lock would have
+// handed FreeType, out of the same matrix. computeShapeMatrix works in double,
+// narrows the two scales to SkScalar for the request, and normalizes the
+// matrix by their reciprocals for the shape; a matrix that only scales the
+// axes gets no shape at all and the face keeps the identity.
+bool SkiaFaceStateForMatrix(const float a00, const float a01, const float a10, const float a11,
+                            FT_Fixed* x_26_6, FT_Fixed* y_26_6, FT_Matrix* shape)
+{
+    const double scale_x = static_cast<double>(a00), skew_x = static_cast<double>(a01),
+                 skew_y = static_cast<double>(a10), scale_y = static_cast<double>(a11);
+    const double det = scale_x * scale_y - skew_y * skew_x;
+    if (!std::isfinite(det)) {
+        return false;
+    }
+    double major = det != 0.0 ? std::hypot(scale_x, skew_y) : 0.0;
+    double minor = major != 0.0 ? std::fabs(det) / major : 0.0;
+    major = std::max(major, 1.0);
+    minor = std::max(minor, 1.0);
+    *x_26_6 = SkiaCharSize26_6(static_cast<float>(major));
+    *y_26_6 = SkiaCharSize26_6(static_cast<float>(minor));
+
+    constexpr FT_Matrix identity = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
+    *shape = identity;
+    const bool have_shape = a01 != 0.0f || a10 != 0.0f || a00 < 0.0f || a11 < 0.0f;
+    if (!have_shape) {
+        return true;
+    }
+    // preScale takes the reciprocals as doubles and multiplies the columns by
+    // them as floats, and SkScalarToFixed truncates the 16.16 product.
+    const auto inv_major = static_cast<float>(1.0 / major);
+    const auto inv_minor = static_cast<float>(1.0 / minor);
+    const auto fixed = [](const float v) {
+        return static_cast<FT_Fixed>(v * 65536.0f);
+    };
+    shape->xx = fixed(a00 * inv_major);
+    shape->yx = fixed(-(a10 * inv_major));
+    shape->xy = fixed(-(a01 * inv_minor));
+    shape->yy = fixed(a11 * inv_minor);
+    return true;
+}
+
+// The em and the transform Windows rasterizes this glyph with, out of the
+// scaler's own fields rather than out of what survived the trip through
+// FreeType.
+//
+// The char sizes and the shape the matrix implies both have to be the ones the
+// face was actually set to. Two layers of one color glyph can share a char
+// size and differ only in their rotation, so the sizes alone do not say
+// whether this rec belongs to the glyph being drawn or to a scaler that ran
+// earlier on this thread. The shape settles it.
+bool SkiaScalerRun(FT_Face face, double* em_size, float* x_over_y, WindowsShapedRun* run)
+{
+    if (!g_skia_rec.valid || face->size == nullptr || face->units_per_EM == 0) {
+        return false;
+    }
+    // A glyph drawn at the page's own size reaches FreeType as that size and
+    // needs none of this.
+    if (SkiaDeviceIsIdentity(g_skia_rec)) {
+        return false;
+    }
+    float a00 = 0.0f, a01 = 0.0f, a10 = 0.0f, a11 = 0.0f;
+    SkiaTotalMatrix(g_skia_rec, &a00, &a01, &a10, &a11);
+    FT_Fixed want_x = 0, want_y = 0;
+    FT_Matrix want_shape = {};
+    if (!SkiaFaceStateForMatrix(a00, a01, a10, a11, &want_x, &want_y, &want_shape)) {
+        return false;
+    }
+    if (want_x != MulFix(face->units_per_EM, face->size->metrics.x_scale) ||
+        want_y != MulFix(face->units_per_EM, face->size->metrics.y_scale)) {
+        return false;
+    }
+    FT_Matrix have_shape = {};
+    pthread_mutex_lock(&g_faces_mutex);
+    if (const FaceEntry* entry = FindFaceLocked(face)) {
+        constexpr FT_Matrix identity = { .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
+        have_shape = entry->transform_identity ? identity : entry->transform_matrix;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    // One unit of slack either way, because a mirror of a float multiply and a
+    // truncation is not obliged to land on the same last bit.
+    const auto near_enough = [](const FT_Fixed a, const FT_Fixed b) {
+        return a - b <= 1 && b - a <= 1;
+    };
+    if (!near_enough(want_shape.xx, have_shape.xx) || !near_enough(want_shape.xy, have_shape.xy) ||
+        !near_enough(want_shape.yx, have_shape.yx) || !near_enough(want_shape.yy, have_shape.yy)) {
+        return false;
+    }
+    if (!WindowsRunForMatrix(a00, a10, a01, a11, run)) {
+        return false;
+    }
+    // The transform carries both scales, so the ratio the aspect search would
+    // estimate is already in it.
+    *em_size = static_cast<double>(run->em_size);
+    *x_over_y = 1.0f;
+    return true;
+}
+
+bool SkiaShapedEmSize(const double size, const FT_Matrix& m, const FT_Fixed x_26_6,
+                      const FT_Fixed y_26_6, double* em_size, float* x_over_y,
+                      WindowsShapedRun* run)
+{
+    if (!(size > 0.0) || x_26_6 <= 0 || y_26_6 <= 0) {
+        return false;
+    }
+    // A shape that only permutes and flips the axes is already exact in
+    // 1024ths, and its scales are a pair of ones, so there is nothing to
+    // recover and an estimate here would name a transform a thousandth off.
+    if (IsSignedPermutation(m)) {
+        return false;
+    }
+    // The two columns in SkMatrix's terms. computeShapeMatrix writes the FT
+    // matrix with the y axis flipped, which is the same convention
+    // unix/font.rs uses.
+    const double a = static_cast<double>(m.xx) / 65536.0;
+    const double b = -static_cast<double>(m.yx) / 65536.0;
+    const double c = -static_cast<double>(m.xy) / 65536.0;
+    const double d = static_cast<double>(m.yy) / 65536.0;
+
+    const double x_px = static_cast<double>(x_26_6) / 64.0;
+    const double y_px = static_cast<double>(y_26_6) / 64.0;
+    const double x_est = x_px / size;
+    const double y_est = y_px / size;
+    const long seed_k1 = lround(1024.0 * a * x_est);
+    const long seed_k2 = lround(1024.0 * b * x_est);
+
+    // The seed before its neighbors, since a neighbor can satisfy every check
+    // while naming a different transform.
+    static constexpr long kNudge[3] = { 0, -1, 1 };
+    for (const long d1 : kNudge) {
+        for (const long d2 : kNudge) {
+            const long k1 = seed_k1 + d1, k2 = seed_k2 + d2;
+            if (k1 == 0 && k2 == 0) {
+                continue;
+            }
+            const double h = std::hypot(static_cast<double>(k1), static_cast<double>(k2));
+            const double x_scale = h / 1024.0;
+            if (SkiaCharSize26_6(static_cast<float>(size * x_scale)) != x_26_6) {
+                continue;
+            }
+            const long seed_k3 = lround(1024.0 * y_est * c);
+            const long seed_k4 = lround(1024.0 * y_est * d);
+            for (const long d3 : kNudge) {
+                for (const long d4 : kNudge) {
+                    const long k3 = seed_k3 + d3, k4 = seed_k4 + d4;
+                    const long det = k1 * k4 - k2 * k3;
+                    if (det == 0) {
+                        continue;
+                    }
+                    const double y_scale = std::fabs(static_cast<double>(det)) / (1024.0 * h);
+                    if (SkiaCharSize26_6(static_cast<float>(size * y_scale)) != y_26_6) {
+                        continue;
+                    }
+                    // Both columns have to read back as the shape FreeType was
+                    // handed, or these were the wrong integers.
+                    const double back_a = static_cast<double>(k1) / (1024.0 * x_scale);
+                    const double back_b = static_cast<double>(k2) / (1024.0 * x_scale);
+                    const double back_c = static_cast<double>(k3) / (1024.0 * y_scale);
+                    const double back_d = static_cast<double>(k4) / (1024.0 * y_scale);
+                    constexpr double kBack = 3.0 / 65536.0;
+                    if (std::fabs(back_a - a) > kBack || std::fabs(back_b - b) > kBack ||
+                        std::fabs(back_c - c) > kBack || std::fabs(back_d - d) > kBack) {
+                        continue;
+                    }
+                    // The scale and the remainder as Windows reaches them, out
+                    // of the same four integers.
+                    const auto term = [size](const long k) {
+                        return static_cast<float>(size) * (static_cast<float>(k) / 1024.0f);
+                    };
+                    if (!WindowsRunForMatrix(term(k1), term(k2), term(k3), term(k4), run)) {
+                        continue;
+                    }
+                    *em_size = static_cast<double>(run->em_size);
+                    *x_over_y = 1.0f;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 // The em size Windows rasterizes a transformed glyph at.
@@ -3167,7 +3904,7 @@ bool SearchTransformedEmSize(const double a, const double b, const double c, con
 
     // The seed is tried before its neighbors. A neighbor can satisfy every
     // check while naming a different transform, so the estimate wins ties.
-    static const long kNudge[3] = { 0, -1, 1 };
+    static constexpr long kNudge[3] = { 0, -1, 1 };
     for (const long d1 : kNudge) {
         for (const long d2 : kNudge) {
             const long k1 = seed_k1 + d1, k2 = seed_k2 + d2;
@@ -3270,10 +4007,31 @@ bool RetryWithoutSkew(const double guess, const double a, const double b, const 
     return false;
 }
 
+// True when the shape only permutes the glyph's axes and flips their signs,
+// which leaves every term exactly 0 or plus or minus one.
+bool IsSignedPermutation(const FT_Matrix& m)
+{
+    constexpr FT_Fixed kOne = 0x10000;
+    const bool diagonal = (m.xx == kOne || m.xx == -kOne) && (m.yy == kOne || m.yy == -kOne) &&
+                          m.xy == 0 && m.yx == 0;
+    const bool swapped = (m.xy == kOne || m.xy == -kOne) && (m.yx == kOne || m.yx == -kOne) &&
+                         m.xx == 0 && m.yy == 0;
+    return diagonal || swapped;
+}
+
 bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_Fixed y_26_6,
                             const double seed_px, RecoveredTransform* out)
 {
     if (x_26_6 <= 0 || y_26_6 <= 0 || !(seed_px > 0.0)) {
+        return false;
+    }
+    // Such a shape is already exact in 1024ths, so compute_scale answers a
+    // pair of ones and the em is the size FreeType was asked for. The search
+    // below seeds column one from the 26.6 size over the reported one, and at
+    // a size that is not a whole number of quarter pixels that ratio rounds a
+    // 1024th away from unity, which names a transform a thousandth off and an
+    // em with it.
+    if (IsSignedPermutation(m)) {
         return false;
     }
     // A synthetic oblique on its own leaves font.transform the identity, so
@@ -3281,7 +4039,7 @@ bool ExactTransformedEmSize(const FT_Matrix& m, const FT_Fixed x_26_6, const FT_
     // asked for. The skew takes column two off the 1024th grid, and the search
     // below then moves column one and names a size a fraction of a pixel from
     // the one WebRender sent.
-    if (float oblique = 0.0f; ExactObliqueSkew(m, &oblique)) {
+    if (float oblique = 0.0f; ExactObliqueSkew(m, &oblique) == ObliqueForm::Upright) {
         return false;
     }
     // Column one of the shape, in FontTransform's terms. unix/font.rs negates
@@ -3425,24 +4183,35 @@ float SnappedPixelAspect(FT_Face face)
     return static_cast<float>(SnapPixelAspect(raw, x_26_6, y_26_6));
 }
 
-// head.flags bit 3, "force ppem to integer values for all internal scaler
-// math". Windows rasterizes a face that sets it at a whole number of pixels
-// per em and one that leaves it clear at the size it was asked for, so a
-// glyph at 12.5px is the 12.5px glyph for the second and the 13px glyph for
-// the first. The layout size is the fractional one either way.
-bool FaceForcesIntegerPpem(FT_Face face)
-{
-    const ft_get_sfnt_table_fn real = real_FT_Get_Sfnt_Table();
-    if (real == nullptr) {
-        return false;
-    }
-    const auto* head = static_cast<const TT_Header*>(real(face, FT_SFNT_HEAD));
-    return head != nullptr && (head->Flags & 0x0008) != 0;
-}
-
 // Replaces `em_size` with the one Windows rasterizes at when `face` carries a
 // shape, and says whether it carried one. See ExactTransformedEmSize. Takes
 // g_faces_mutex, so nothing already holding it may call this.
+// The same for the Skia route, where the size comes from the scaler rather
+// than from a whole app unit. Both scales are recovered, so the ratio the
+// aspect search would otherwise estimate from the two rounded char sizes is
+// exact as well.
+bool ApplySkiaShapedEmSize(FT_Face face, double* em_size, float* x_over_y,
+                           WindowsShapedRun* run)
+{
+    if (face->size == nullptr || face->units_per_EM == 0 || !(g_skia_text_size > 0.0)) {
+        return false;
+    }
+    FT_Matrix shape = {};
+    bool transformed = false;
+    pthread_mutex_lock(&g_faces_mutex);
+    if (const FaceEntry* entry = FindFaceLocked(face)) {
+        transformed = !entry->transform_identity;
+        shape = entry->transform_matrix;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    if (!transformed) {
+        return false;
+    }
+    const FT_Fixed x_26_6 = MulFix(face->units_per_EM, face->size->metrics.x_scale);
+    const FT_Fixed y_26_6 = MulFix(face->units_per_EM, face->size->metrics.y_scale);
+    return SkiaShapedEmSize(g_skia_text_size, shape, x_26_6, y_26_6, em_size, x_over_y, run);
+}
+
 bool ApplyTransformedEmSize(FT_Face face, double* em_size)
 {
     if (face->size == nullptr || face->units_per_EM == 0) {
@@ -3514,6 +4283,11 @@ void RecordTransformDelta(FT_Face face)
 }
 #endif  // CLEARTYPE_FIREFOX_PARITY
 
+#if CLEARTYPE_FIREFOX_PARITY
+// Defined with the rasterizer the caller belongs to, below.
+bool FaceRastersThroughSkia(FT_Face face);
+#endif
+
 // The size the caller asked for: Firefox's mAdjustedSize, which is what both
 // gfxDWriteFont and platform/windows/font.rs compute from.
 //
@@ -3538,8 +4312,17 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
     // A size Gecko named for this face outranks the reconstruction, being the
     // value itself rather than an inversion of its rounding.
     double exact = 0.0;
-    if (ClaimedSizeFor(face, size_26_6, &exact) || ExactEmSize(size_26_6, &exact) ||
-        ReducedEmSize(size_26_6, &exact)) {
+    // NOLINTNEXTLINE(bugprone-branch-clone)  -- each condition names a different em
+    if (ClaimedSizeFor(face, size_26_6, &exact)) {
+        *em_size = exact;
+    } else if (FaceRastersThroughSkia(face) && IsSkiaPathSize(size_26_6, *x_over_y)) {
+        // A product of a named size can quantize to this one, and taking it
+        // would answer a path request with a size a 256th out. The size is
+        // its own answer.
+        *em_size = kSkiaPathSize;
+    } else if (FaceRastersThroughSkia(face) && ScaledEmSize(face, size_26_6, &exact)) {
+        *em_size = exact;
+    } else if (ExactEmSize(size_26_6, &exact) || ReducedEmSize(size_26_6, &exact)) {
         *em_size = exact;
     }
 #else
@@ -3553,10 +4336,10 @@ bool GetEmSizeWithRequest(FT_Face face, const FT_Fixed requested, double* em_siz
 // GetEmSizeWithRequest trusts a recorded request only when it rounds to the
 // ppem currently installed, which cannot separate two sizes a fraction apart
 // on one face.
+#if CLEARTYPE_FIREFOX_PARITY
 bool GetEmSizeClaimed(FT_Face face, const FT_Fixed requested, double* em_size,
                       float* x_over_y)
 {
-#if CLEARTYPE_FIREFOX_PARITY
     if (g_claimed_em_26_6 > 0) {
         if (!GetScaledEmSize(face, em_size, x_over_y)) {
             return false;
@@ -3571,9 +4354,9 @@ bool GetEmSizeClaimed(FT_Face face, const FT_Fixed requested, double* em_size,
         }
         return true;
     }
-#endif
     return GetEmSizeWithRequest(face, requested, em_size, x_over_y);
 }
+#endif
 
 bool GetEmSize(FT_Face face, double* em_size, float* x_over_y)
 {
@@ -3662,6 +4445,17 @@ double WinGlyphAdvance(const WinInstance& inst, const UINT16 glyph, const bool h
     return result;
 }
 
+// Set from a gfxShapedText by the libxul patch. Every advance Gecko stores is
+// a whole number of app units, and both the tracking below and the em size
+// recovered further up have to land on the same grid Gecko laid the text out
+// on.
+extern "C" void CleartypeSetAppUnitsPerDevPixel(const int units)
+{
+    if (units > 0 && units <= 240) {
+        g_app_units_per_dev_px.store(units, std::memory_order_relaxed);
+    }
+}
+
 // gfxFont::GetSyntheticBoldOffset: for size S below a threshold T of 48, the
 // glyphs fatten by 0.25 + 3S/4T, and by S/T above it.
 double WinSyntheticBoldOffset(const double size)
@@ -3691,7 +4485,7 @@ double WinSyntheticBoldAdvance(const WinInstance& inst, const double plain_advan
     if (!(inst.metrics.maxAdvance > inst.metrics.aveCharWidth)) {
         return plain_advance;
     }
-    constexpr int64_t app_units_per_px = 60;
+    const int64_t app_units_per_px = g_app_units_per_dev_px.load(std::memory_order_relaxed);
     // Windows rounds twice. SetGlyphsFromRun turns the plain 16.16 advance
     // into whole app units, and ApplyTrackingToClusters then adds NS_round of
     // the offset in app units. The offset goes in here as its nearest 16.16
@@ -4962,6 +5756,12 @@ void ApplyWindowsAdvance(FT_Face face)
         return;
     }
 
+    double adjusted = 0.0;
+    if (!AdjustedSizeForFace(face, MulFix(face->units_per_EM, face->size->metrics.y_scale),
+                             &adjusted)) {
+        adjusted = 0.0;
+    }
+
     // Resolve the system font collection before locking. Building it under
     // g_faces_mutex deadlocks; see WarmSystemCollection.
     WarmSystemCollection();
@@ -4978,12 +5778,30 @@ void ApplyWindowsAdvance(FT_Face face)
     WinInkBox box{};
     const bool have_box = face->glyph->format == FT_GLYPH_FORMAT_OUTLINE &&
                           WinGlyphInkBox(instance->dwrite_face, instance->funits_conv, glyph, &box);
+    // The advance Windows measures at the size the font is really drawing at,
+    // put where GetFTGlyphExtents' own scaling brings it back. The ink box
+    // above stays the one for the face's own size, which that scaling is right
+    // for, and is read first: a second instance moves the vector holding it.
+    double back_to_ft = 1.0;
+    if (adjusted > 0.0) {
+        const WinInstance* at_adjusted = GetWinInstanceLocked(entry, adjusted);
+        if (at_adjusted != nullptr && at_adjusted->valid && at_adjusted->dwrite_face != nullptr) {
+            const double at = WinGlyphAdvance(*at_adjusted, glyph, FT_HAS_MULTIPLE_MASTERS(face) != 0);
+            if (at >= 0.0) {
+                advance_px = at;
+                back_to_ft = em_size / adjusted;
+            }
+        }
+    }
     pthread_mutex_unlock(&g_faces_mutex);
     if (have_box) {
         SetGlyphInkBox(face->glyph, box);
     }
-    // Both arithmetics leave a whole number of 1/65536 px.
-    face->glyph->linearHoriAdvance = static_cast<FT_Fixed>(llround(advance_px * 65536.0));
+    // Both arithmetics leave a whole number of 1/65536 px. The scaling back is
+    // applied to the finished 16.16, so that GetFTGlyphExtents' rounding of the
+    // product lands on the value Windows holds rather than beside it.
+    face->glyph->linearHoriAdvance =
+        static_cast<FT_Fixed>(llround(static_cast<double>(llround(advance_px * 65536.0)) * back_to_ft));
     g_pending_advance.face = face;
     g_pending_advance.glyph_index = face->glyph->glyph_index;
 }
@@ -5059,6 +5877,14 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
     if (!GetEmSize(face, &em_size, &x_over_y) || !(em_size > 0.0)) {
         return;
     }
+    // See ApplyWindowsAdvance. The tracking Windows adds for a synthetic bold
+    // has a floor, so the advance under a pixel is not the advance at the
+    // face's own size scaled down.
+    double adjusted = 0.0;
+    if (!AdjustedSizeForFace(face, MulFix(face->units_per_EM, face->size->metrics.y_scale),
+                             &adjusted)) {
+        adjusted = 0.0;
+    }
     WarmSystemCollection();
     pthread_mutex_lock(&g_faces_mutex);
     FaceEntry* entry = FindFaceLocked(face);
@@ -5088,6 +5914,20 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         advance_px = WinBoldGlyphAdvanceLocked(entry, *instance,
                                                static_cast<UINT16>(face->glyph->glyph_index),
                                                FT_HAS_MULTIPLE_MASTERS(face) != 0);
+        if (adjusted > 0.0) {
+            const WinInstance* at_adjusted = GetWinInstanceLocked(entry, adjusted);
+            if (at_adjusted != nullptr && at_adjusted->valid &&
+                at_adjusted->dwrite_face != nullptr) {
+                const double at =
+                    WinBoldGlyphAdvanceLocked(entry, *at_adjusted,
+                                              static_cast<UINT16>(face->glyph->glyph_index),
+                                              FT_HAS_MULTIPLE_MASTERS(face) != 0);
+                if (at >= 0.0) {
+                    advance_px = at;
+                    extents_scale = em_size / adjusted;
+                }
+            }
+        }
     }
     pthread_mutex_unlock(&g_faces_mutex);
 
@@ -5134,7 +5974,8 @@ void ApplyWindowsBoldAdvance(const FT_Long a, const FT_Long b, const FT_Long pro
         return;
     }
     face->glyph->linearHoriAdvance =
-        static_cast<FT_Fixed>(llround(advance_px * extents_scale * 65536.0)) -
+        static_cast<FT_Fixed>(
+            llround(static_cast<double>(llround(advance_px * 65536.0)) * extents_scale)) -
         (static_cast<FT_Fixed>(strength) << 10);
 }
 
@@ -5280,7 +6121,7 @@ RasterCaller CurrentRasterCaller()
 // so it says which of Gecko's rasterizers is running and not merely where.
 bool OnBlobRasterThread()
 {
-    static const char* const kBlobThreadPrefixes[] = { "WRWorke", "WRScene", "WRRende" };
+    static constexpr const char* kBlobThreadPrefixes[] = { "WRWorke", "WRScene", "WRRende" };
     const char* name = ThisThreadName();
     if (name == nullptr) {
         return false;
@@ -5322,12 +6163,12 @@ bool OnBlobRasterThread()
 constexpr int kSkiaLibrarySlots = 4;
 std::atomic<void*> g_skia_libraries[kSkiaLibrarySlots];
 
-void RecordSkiaLibrary(const FT_Library library)
+void RecordSkiaLibrary(FT_Library library)
 {
     if (library == nullptr || !dwcft::ParityActive()) {
         return;
     }
-    void* const handle = static_cast<void*>(library);
+    auto* const handle = static_cast<void*>(library);
     for (std::atomic<void*>& slot : g_skia_libraries) {
         void* held = slot.load(std::memory_order_acquire);
         // A lost race leaves the winner's handle in `held`, so the same value
@@ -5342,12 +6183,31 @@ void RecordSkiaLibrary(const FT_Library library)
     }
 }
 
-bool IsSkiaLibrary(const FT_Library library)
+// A library that has been destroyed belongs to nobody, and there are four
+// slots. Left claimed, four libraries coming and going over a long-lived
+// process would fill the table, and every library opened after that would be
+// taken for WebRender's however many glyphs Skia drew through it. The address
+// can also be handed out again by the next FT_Init_FreeType.
+void ForgetSkiaLibrary(FT_Library library)
+{
+    if (library == nullptr) {
+        return;
+    }
+    auto* const handle = static_cast<void*>(library);
+    for (std::atomic<void*>& slot : g_skia_libraries) {
+        void* held = handle;
+        if (slot.compare_exchange_strong(held, nullptr, std::memory_order_acq_rel)) {
+            return;
+        }
+    }
+}
+
+bool IsSkiaLibrary(FT_Library library)
 {
     if (library == nullptr) {
         return false;
     }
-    void* const handle = static_cast<void*>(library);
+    auto* const handle = static_cast<void*>(library);
     for (const std::atomic<void*>& slot : g_skia_libraries) {
         if (slot.load(std::memory_order_acquire) == handle) {
             return true;
@@ -5363,6 +6223,8 @@ RasterCaller CallerForFace(FT_Face face)
     }
     return CurrentRasterCaller();
 }
+
+bool FaceRastersThroughSkia(FT_Face face) { return CallerForFace(face) == RasterCaller::Skia; }
 
 // SkScalerContext_win_dw.cpp get_gasp_range / is_gridfit_only / is_hinted /
 // has_bitmap_strike.
@@ -5423,34 +6285,17 @@ bool FaceIsHintedLocked(FaceEntry* entry)
 
 // Which of the two routes a blob glyph takes on Windows.
 //
-// SkScalerContext_DW::generateMetrics gets texture bounds for an ordinary
-// glyph, so the mask comes from DirectWrite and not from the outline. The
-// mask and an outline fill only part company where DirectWrite has something
-// to grid-fit onto: a hinted face at a hinted rendering mode, or a
-// non-uniform scale, which moves the fitted edges off the geometric ones.
-// Everywhere else the two agree, which is why the outline route this library
-// takes for every other blob glyph measures exact.
-//
-// So this names the one shape that has to come from the mask, an unhinted face
-// under a squeeze, which is what text-combine-upright asks Ahem for. A hinted
-// face keeps the outline route, where SkiaScanlineBitmap already reproduces
-// Skia's own scan converter.
+// SkScalerContext_DW::generateMetrics sets ScalerContextBits::DW and draws
+// from DirectWrite's mask whenever generateDWMetrics answers, and reaches
+// ScalerContextBits::PATH only where GetAlphaTextureBounds gives nothing
+// back. Hinting does not pick the route: is_hinted picks the rendering mode,
+// which SkiaDWParams answers.
 bool BlobPrefersDWriteMask(FT_Face face)
 {
     if (face == nullptr || face->size == nullptr || face->units_per_EM == 0) {
         return false;
     }
-    const float aspect = SnappedPixelAspect(face);
-    if (aspect >= 0.9999f && aspect <= 1.0001f) {
-        return false;
-    }
-    bool hinted = true;
-    pthread_mutex_lock(&g_faces_mutex);
-    if (FaceEntry* entry = FindFaceLocked(face)) {
-        hinted = FaceIsHintedLocked(entry);
-    }
-    pthread_mutex_unlock(&g_faces_mutex);
-    return !hinted;
+    return true;
 }
 
 bool HasBitmapStrikeInRangeLocked(FaceEntry* entry, const GaspRange& range)
@@ -5737,16 +6582,19 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     // Skia, whose shape is SkScalerContextRec's and never sat on WebRender's
     // 1024th grid.
 #if CLEARTYPE_FIREFOX_PARITY
+    // The same on the Skia route, where a color glyph's paint graph puts a
+    // rotation on nearly every layer.
+    bool shaped_em = false;
+    WindowsShapedRun shaped_run = {};
+    if (dwcft::ParityActive() && CallerForFace(face) == RasterCaller::Skia) {
+        // The scaler's own fields first, which need no recovery at all. The
+        // search over the shape stands in where no hook has read them, and
+        // where the rec belongs to some other scaler.
+        shaped_em = SkiaScalerRun(face, &em_size_d, &x_over_y, &shaped_run) ||
+                    ApplySkiaShapedEmSize(face, &em_size_d, &x_over_y, &shaped_run);
+    }
     if (dwcft::ParityActive() && CallerForFace(face) == RasterCaller::WebRender) {
-        // See FaceForcesIntegerPpem. A shape folds its own scale into the em
-        // and Windows rasterizes that product as it stands, so only an em no
-        // shape touched is taken to whole pixels. Skia rasterizes at the size
-        // it was given whatever the face says, so this is WebRender's route
-        // alone either way.
-        const bool shaped = ApplyTransformedEmSize(face, &em_size_d);
-        if (!shaped && FaceForcesIntegerPpem(face)) {
-            em_size_d = std::floor(em_size_d + 0.5);
-        }
+        ApplyTransformedEmSize(face, &em_size_d);
     }
 #endif
     const float em_size = static_cast<float>(em_size_d);
@@ -5854,8 +6702,9 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     // rasterization, so only the phase is dropped for a bitmap font, and only
     // when subpixel positioning is on at all.
     float exact_skew = 0.0f;
-    const bool exact_oblique =
-        dwcft::ParityActive() && ExactObliqueSkew(combined, &exact_skew);
+    const ObliqueForm oblique_form =
+        dwcft::ParityActive() ? ExactObliqueSkew(combined, &exact_skew) : ObliqueForm::None;
+    const bool exact_oblique = oblique_form != ObliqueForm::None;
 #if CLEARTYPE_FIREFOX_PARITY
     // The face, not the thread: blob images are rasterized through Skia on
     // WebRender's own workers, and those glyphs need SkScalerContext_win_dw's
@@ -5893,14 +6742,34 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     run.glyphAdvances = &advance;
     run.glyphOffsets = &offset;
 
+#if CLEARTYPE_FIREFOX_PARITY
+    // Only where the shaped search did not already answer with both scales.
+    if (skia_caller && !shaped_em) {
+        ExactAspect(face, combined, em_size_d, &x_over_y);
+    }
+#endif
     const bool identity_shape = MatrixIsIdentity(combined);
     const bool square_pixels = x_over_y >= 0.9999f && x_over_y <= 1.0001f;
     DWRITE_MATRIX transform = ToDWriteMatrix(combined, x_over_y);
-    if (exact_oblique) {
+#if CLEARTYPE_FIREFOX_PARITY
+    // Where the four integers behind the shape are known, the terms Windows
+    // divides out of them stand instead of the ones the 16.16 shape can carry.
+    if (shaped_em) {
+        transform.m11 = shaped_run.m11;
+        transform.m12 = shaped_run.m12;
+        transform.m21 = shaped_run.m21;
+        transform.m22 = shaped_run.m22;
+    }
+#endif
+    if (oblique_form == ObliqueForm::Upright) {
         // webrender_api/src/font.rs SyntheticItalics::to_skew, the f32 tangent
         // Windows receives rather than the 16.16 FreeType received.
         transform = ToDWriteMatrix(identity, x_over_y);
         transform.m21 = -exact_skew * x_over_y;
+    } else if (oblique_form == ObliqueForm::QuarterTurn) {
+        // The turn is kept and only the shear is put back, which ToDWriteMatrix
+        // leaves in m22 for this product.
+        transform.m22 = -exact_skew;
     }
     transform.dx = offset_x;
     transform.dy = offset_y;
@@ -5974,23 +6843,14 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
     }
 
     // GlyphRunAnalysis::create(&run, 1.0, transform, render_mode, measure_mode,
-    // 0.0, 0.0): the seven-argument overload. The IDWriteFactory2 overload is
-    // only reached when CLEARTYPE_GRID_FIT pinned a grid-fit mode, and the
-    // IDWriteFactory3 one when the transform swaps the axes; see AxesSwapped.
+    // 0.0, 0.0): the seven-argument overload, which is the one
+    // platform/windows/font.rs calls. The IDWriteFactory2 overload is only
+    // reached when CLEARTYPE_GRID_FIT pinned a grid-fit mode.
     IDWriteGlyphRunAnalysis* analysis = nullptr;
     HRESULT hr;
     const DWRITE_MATRIX* analysis_transform = pass_transform ? &transform : nullptr;
-    // CLEARTYPE_NATURAL alone. It is the only mode whose grid fit differs
-    // between the two routes under a quarter turn; NATURAL_SYMMETRIC and the
-    // GDI modes already answer the same either way, so sending them through
-    // the other overload would change nothing.
-    const bool fit_along_device_y = analysis_transform != nullptr &&
-                                    rendering_mode == DWRITE_RENDERING_MODE_CLEARTYPE_NATURAL &&
-                                    AxesSwapped(transform) && factories.factory3 != nullptr;
     if (use_factory2 && factories.factory2 != nullptr) {
         hr = factories.factory2->CreateGlyphRunAnalysis(&run, analysis_transform, rendering_mode, measuring_mode, grid_fit_mode, antialias_mode, 0.0f, 0.0f, &analysis);
-    } else if (fit_along_device_y) {
-        hr = factories.factory3->CreateGlyphRunAnalysis(&run, analysis_transform, static_cast<DWRITE_RENDERING_MODE1>(rendering_mode), measuring_mode, DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE, 0.0f, 0.0f, &analysis);
     } else {
         hr = factory->CreateGlyphRunAnalysis(&run, 1.0f, analysis_transform, rendering_mode, measuring_mode, 0.0f, 0.0f, &analysis);
     }
@@ -6103,7 +6963,7 @@ bool RasterizeThroughDWrite(FT_Face face, FT_UInt glyph_index, const FT_Outline*
             // blends them from linear coverage and preblends the gamma once
             // the bold is in place.
             ApplyAlphaGamma(texture, options);
-            if (LogEnabled()) {
+            if (LogEnabled() && LogFaceWanted(face)) {
                 unsigned long ink = 0;
                 for (const BYTE b : texture) {
                     ink += b;
@@ -6187,9 +7047,11 @@ thread_local unsigned g_in_real_freetype = 0;
 // FreeType translates and transforms scratch outlines in its own stack frame
 // while it works, and those are not the caller's glyph; see ForeignToCaller.
 thread_local const FT_Outline* g_loading_outline = nullptr;
+#if CLEARTYPE_FIREFOX_PARITY
 // The face this thread last loaded a glyph for. Names the font behind a Skia
 // scaler, which carries an SkTypeface and no FreeType face of its own.
 thread_local FT_Face g_last_loaded_face = nullptr;
+#endif
 
 struct InRealFreeType
 {
@@ -6340,6 +7202,9 @@ FT_Error FT_Done_FreeType(FT_Library library)
     const FT_Error error = real(library);
     if (error == 0 && library != nullptr) {
         ForgetLibrary(library);
+#if CLEARTYPE_FIREFOX_PARITY
+        ForgetSkiaLibrary(library);
+#endif
     }
     // After the sweep, so the counts match the label.
     if (error == 0) {
@@ -6810,6 +7675,14 @@ FT_Error FT_Set_Char_Size(FT_Face face, const FT_F26Dot6 char_width, const FT_F2
     RecordRequestedEmSize(face, PixelSize26_6(char_height != 0 ? char_height : char_width,
                                               vert_resolution != 0 ? vert_resolution
                                                                    : horz_resolution));
+#if CLEARTYPE_FIREFOX_PARITY
+    // Square by construction is what gfxFT2FontBase::LockFTFace asks for; a
+    // scaler that split the two axes is not naming a font's own size.
+    if (char_width == char_height) {
+        TouchClaimedSize(face, PixelSize26_6(char_height, vert_resolution != 0 ? vert_resolution
+                                                                               : horz_resolution));
+    }
+#endif
     ApplyWindowsMetrics(face, "FT_Set_Char_Size");
     return error;
 }
@@ -6964,6 +7837,67 @@ extern "C" int CleartypeWindowsStrikeout(double* strikeout_offset, double* strik
 #endif
 }
 
+// Windows' x-height and cap-height for the face last measured, or 0 when there
+// is none.
+//
+// gfxDWriteFont::ComputeMetrics writes xHeight and capHeight as the OS/2
+// sxHeight and sCapHeight times mFUnitsConvFactor, both left fractional.
+// gfxFT2FontBase::InitMetrics takes them from the FreeType face at the size
+// FreeType was given, which is a whole number of 1/64 px, so for any size that
+// is not one of those the two disagree by a fraction of a pixel.
+//
+// Small as that is, vertical-align: middle places an inline box against half
+// the parent's x-height, so a line carrying one differs by half the error, and
+// a page of such lines accumulates it until a row crosses a device pixel and
+// the text under it is drawn a pixel out. The other seventeen fields of the
+// metrics struct are already answered; these two are the pair that was left.
+//
+// Answers for every face, since nothing about the conversion is per-family.
+extern "C" int CleartypeWindowsXCapHeight(double* x_height, double* cap_height,
+                                          double* em_height, double* max_ascent,
+                                          double* max_descent)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    FT_Face face = g_last_sfnt_face;
+    if (face == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    if (entry == nullptr) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    double em_size = 0.0;
+    float x_over_y = 1.0f;
+    if (face->size == nullptr ||
+        !GetEmSizeClaimed(face, entry->requested_em_26_6, &em_size, &x_over_y) ||
+        !(em_size > 0.0)) {
+        pthread_mutex_unlock(&g_faces_mutex);
+        return 0;
+    }
+    const WinInstance* inst = GetWinInstanceLocked(entry, em_size);
+    int answered = 0;
+    if (inst != nullptr && inst->valid) {
+        const WinMetrics& m = inst->metrics;
+        const double fold = inst->descent_fold ? 0.5 : 0.0;
+        *x_height = m.xHeight;
+        *cap_height = m.capHeight;
+        *em_height = m.emHeight;
+        *max_ascent = m.maxAscent - fold;
+        *max_descent = m.maxDescent + fold;
+        answered = 1;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return answered;
+#else
+    (void)x_height; (void)cap_height; (void)em_height;
+    (void)max_ascent; (void)max_descent;
+    return 0;
+#endif
+}
+
 // The font-units-to-pixels factor, as each platform sets it.
 //
 // gfxFT2FontBase::InitMetrics writes
@@ -6977,6 +7911,47 @@ extern "C" int CleartypeWindowsStrikeout(double* strikeout_offset, double* strik
 // The FreeType value is returned as well, since the caller finds the field by
 // matching it. It comes from the instance, since the face carries whatever
 // size was set on it last.
+// The Windows maxAscent and maxDescent for the face InitMetrics is measuring,
+// at a size other than the one FreeType was set to.
+//
+// gfxFT2FontBase::FindClosestSize clamps mFTSize to a whole pixel, FreeType
+// having no size below one, so a font smaller than that is measured against a
+// whole pixel's FreeType metrics while gfxDWriteFont::ComputeMetrics rounds
+// the size it was given and reaches zero. mAdjustedSize is the only place the
+// size survives, and libxul_patch.cpp reads it out of the font to ask here.
+//
+// Called while the face is still claimed, so before CleartypeEndInitMetrics.
+extern "C" int CleartypeWindowsMetricsAtSize(const double size, double* asc, double* desc)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    if (!(size > 0.0) || asc == nullptr || desc == nullptr || !WindowsMetrics()) {
+        return 0;
+    }
+    FT_Face face = g_last_sfnt_face;
+    if (face == nullptr) {
+        return 0;
+    }
+    // Resolving the collection under g_faces_mutex deadlocks; see
+    // WarmSystemCollection.
+    WarmSystemCollection();
+    pthread_mutex_lock(&g_faces_mutex);
+    FaceEntry* entry = FindFaceLocked(face);
+    WinInstance* inst = entry != nullptr ? GetWinInstanceLocked(entry, size) : nullptr;
+    const bool ok = inst != nullptr && inst->valid;
+    if (ok) {
+        *asc = inst->metrics.maxAscent;
+        *desc = inst->metrics.maxDescent;
+    }
+    pthread_mutex_unlock(&g_faces_mutex);
+    return ok ? 1 : 0;
+#else
+    (void)size;
+    (void)asc;
+    (void)desc;
+    return 0;
+#endif
+}
+
 extern "C" int CleartypeWindowsUnitsPerPixel(double* linux_factor, double* windows_factor,
                                              double* em_height, double* max_ascent,
                                              double* max_descent)
@@ -7020,8 +7995,8 @@ extern "C" int CleartypeWindowsUnitsPerPixel(double* linux_factor, double* windo
         const WinMetrics& m = inst->metrics;
         const double fold = inst->descent_fold ? 0.5 : 0.0;
         const double x_scale = static_cast<double>(x_scale_26_6);
-        *linux_factor = static_cast<float>(x_scale / 65536.0 / 64.0);
-        *windows_factor = inst->funits_conv;
+        *linux_factor = static_cast<double>(static_cast<float>(x_scale / 65536.0 / 64.0));
+        *windows_factor = static_cast<double>(inst->funits_conv);
         *em_height = m.emHeight;
         *max_ascent = m.maxAscent - fold;
         *max_descent = m.maxDescent + fold;
@@ -7265,16 +8240,22 @@ extern "C" int CleartypeClaimFace(void* candidate, double ft_size)
     g_last_sfnt_face = face;
     // gfxFT2FontBase::LockFTFace converts mFTSize this way, so the instance
     // named here is the one the face was set to for this font.
-    g_claimed_em_26_6 = (ft_size > 0.0 && ft_size < 65536.0)
-                            ? static_cast<FT_Fixed>(ft_size * 64.0 + 0.5)
-                            : 0;
+    g_claimed_em_26_6 =
+        ft_size > 0.0 && ft_size < 65536.0
+            // NOLINTNEXTLINE(bugprone-incorrect-roundings)  -- LockFTFace truncates
+            ? static_cast<FT_Fixed>(ft_size * 64.0 + 0.5)
+            : 0;
     // mFTSize is FindClosestSize(face, GetAdjustedSize()), which is the
-    // adjusted size itself only for a scalable face; for a bitmap one it is
-    // whichever strike was chosen, and gfxFT2FontBase scales the metrics back
-    // up from it afterwards.
+    // adjusted size itself only for a scalable face at a whole pixel or more.
+    // For a bitmap face it is whichever strike was chosen, and below one pixel
+    // FindClosestSize clamps to 1.0 for every face, since FreeType would clamp
+    // the ppem there anyway; gfxFT2FontBase scales glyph extents back from it
+    // afterwards, but InitMetrics takes the ascent and descent from the
+    // clamped size without that correction. So a size under a pixel arrives
+    // here as 1.0 and the true one is only in mAdjustedSize.
     g_claimed_em_px = g_claimed_em_26_6 > 0 && FT_IS_SCALABLE(face) ? ft_size : 0.0;
     if (g_claimed_em_px > 0.0) {
-        RecordClaimedSize(face, g_claimed_em_px);
+        RecordClaimedSize(face, g_claimed_em_px, ft_size, /*from_adjusted=*/false);
     }
     return 1;
 #else
@@ -7297,7 +8278,10 @@ extern "C" int CleartypeClaimSize(void* candidate, double px)
     if (!known || !FT_IS_SCALABLE(face)) {
         return 0;
     }
-    RecordClaimedSize(face, px);
+    // What gfxFT2FontBase::FindClosestSize answers for a scalable face, which
+    // is the size itself and a pixel where the size is under one. The caller
+    // runs before InitMetrics, so mFTSize does not hold it yet.
+    RecordClaimedSize(face, px, px < 1.0 ? 1.0 : px, /*from_adjusted=*/true);
     return 1;
 #else
     (void)candidate;
@@ -7352,6 +8336,7 @@ extern "C" int CleartypeGlyphInkBox(void* candidate, double ft_size, int embolde
         // The size resolves out of the caller's own number and the table Gecko
         // filled when it named this font's face, so it does not depend on
         // which size the face happens to carry now.
+        // NOLINTNEXTLINE(bugprone-incorrect-roundings)  -- LockFTFace truncates
         const auto size_26_6 = static_cast<FT_Fixed>(ft_size * 64.0 + 0.5);
         double em_size = ft_size;
         double exact = 0.0;
@@ -7403,6 +8388,22 @@ void* FT_Get_Sfnt_Table(FT_Face face, const FT_Sfnt_Tag tag)
         return nullptr;
     }
     void* table = real(face, tag);
+#if CLEARTYPE_FIREFOX_PARITY
+    // Nothing in gfx/wr reads an sfnt table, so a library reached here is not
+    // WebRender's. Skia's cairo port reads head, post, PCLT and OS/2, and
+    // gfxFT2FontList and gfxFT2FontBase read them from cairo's faces as well.
+    //
+    // FT_Outline_Get_Bitmap cannot claim a library whose first glyph comes
+    // from an embedded strike, since such a glyph has no outline to hand it.
+    // A CJK face carrying a strike is exactly the case where being taken for
+    // WebRender draws the strike where SkScalerContext_win_dw draws the
+    // outline, so the run comes out bilevel; this claims the library before
+    // the glyph rather than from it. The shim's own table reads go straight to
+    // the real entry point and do not arrive here.
+    if (face != nullptr && face->glyph != nullptr) {
+        RecordSkiaLibrary(face->glyph->library);
+    }
+#endif
     if (face == nullptr || !WindowsMetrics()) {
         return table;
     }
@@ -7541,7 +8542,7 @@ static bool SkiaBlitsAsFatRect(const FT_Outline* outline, const FT_Bitmap* abitm
         }
         corners = 4;
     }
-    for (short i = 0; i < outline->n_points; ++i) {
+    for (int i = 0; i < outline->n_points; ++i) {
         if ((outline->tags[i] & FT_CURVE_TAG_ON) == 0) {
             return false;
         }
@@ -7602,7 +8603,7 @@ static FT_Error SkiaScanlineBitmap(ft_outline_get_bitmap_fn real, FT_Library lib
         return real(library, outline, abitmap);
     }
     std::vector<FT_Pos> saved(static_cast<size_t>(outline->n_points));
-    for (short i = 0; i < outline->n_points; ++i) {
+    for (int i = 0; i < outline->n_points; ++i) {
         saved[static_cast<size_t>(i)] = outline->points[i].y;
         // 26.6 units, so a quarter of a pixel is 16 of them. Rounded half away
         // from zero, which is what SkFDot6Round does to the supersampled
@@ -7611,7 +8612,7 @@ static FT_Error SkiaScanlineBitmap(ft_outline_get_bitmap_fn real, FT_Library lib
         outline->points[i].y = y >= 0 ? ((y + 8) & ~15) : -((-y + 8) & ~15);
     }
     const FT_Error err = real(library, outline, abitmap);
-    for (short i = 0; i < outline->n_points; ++i) {
+    for (int i = 0; i < outline->n_points; ++i) {
         outline->points[i].y = saved[static_cast<size_t>(i)];
     }
     return err;
@@ -7915,7 +8916,7 @@ private:
     // the transform reaches the points and nothing else, and every decision
     // above it was already made on the same floats Windows decided on. The
     // multiply order is SkMatrix::Affine_vpts.
-    void Record(const FT_Vector& quantized, const D2D1_POINT_2F& exact)
+    void Record(const FT_Vector& quantized, const D2D1_POINT_2F& exact) const
     {
         if (!g_glyph_path_usable) {
             return;
@@ -7946,9 +8947,9 @@ private:
 // from the FreeType outline. False when this face cannot answer, in which case
 // the caller falls through to the real walk; true with *cb_error carrying
 // whatever a callback returned, which is what FT_Outline_Decompose returns.
-bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
-                            const PendingOutline& pending, const FT_Outline_Funcs* funcs,
-                            void* user, int* cb_error)
+static bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
+                                   const PendingOutline& pending, const FT_Outline_Funcs* funcs,
+                                   void* user, int* cb_error)
 {
     // A pixel aspect other than 1 is a horizontal squeeze and is kept. Skia's
     // FreeType port splits the device matrix with PreMatrixScale::kFull, so
@@ -7997,11 +8998,26 @@ bool DecomposeThroughDWrite(FT_Face face, const FT_UInt glyph_index,
         return false;
     }
     IDWriteFontFace* dwrite_face = inst->dwrite_face;
+    // The analysis is kept alive by this, not read through it.
+    // ReSharper disable once CppLocalVariableWithNonTrivialDtorIsNeverUsed
     const HoldFace hold(dwrite_face);
     pthread_mutex_unlock(&g_faces_mutex);
 
     const auto gid = static_cast<UINT16>(glyph_index);
-    DecomposeSink sink(funcs, user, SkXformFromFTMatrix(face_matrix, SnappedPixelAspect(face)));
+    const float aspect = SnappedPixelAspect(face);
+    if (LogEnabled() && LogFaceWanted(face)) {
+        // Names the glyphs drawn from the outline, as the mask route names
+        // the ones it draws.
+        LogLine("path glyph %u face %p em %.4f aspect %.8f (the size alone says %.8f)"
+                " xform %.8f,%.8f,%.8f,%.8f",
+                static_cast<unsigned>(glyph_index), reinterpret_cast<void*>(face), em_size,
+                static_cast<double>(aspect), static_cast<double>(x_over_y),
+                static_cast<double>(face_matrix.xx) / 65536.0,
+                static_cast<double>(face_matrix.xy) / 65536.0,
+                static_cast<double>(face_matrix.yx) / 65536.0,
+                static_cast<double>(face_matrix.yy) / 65536.0);
+    }
+    DecomposeSink sink(funcs, user, SkXformFromFTMatrix(face_matrix, aspect));
     const HRESULT hr = dwrite_face->GetGlyphRunOutline(
         static_cast<FLOAT>(em_size), &gid, nullptr, nullptr, 1, FALSE, FALSE, &sink);
     if (FAILED(hr)) {
@@ -8060,6 +9076,30 @@ extern "C" int CleartypeBlobPrefersMask(void)
     return dwcft::ParityActive() && BlobPrefersDWriteMask(g_last_loaded_face) ? 1 : 0;
 #else
     return 0;
+#endif
+}
+
+extern "C" void CleartypeSkiaScaler(const double text_size, const double pre_scale_x,
+                                    const double pre_skew_x, const double* post)
+{
+#if CLEARTYPE_FIREFOX_PARITY
+    g_skia_text_size = text_size > 0.0 && text_size < 65536.0 ? text_size : 0.0;
+    g_skia_rec = SkiaScalerRec{};
+    if (post == nullptr || !(g_skia_text_size > 0.0)) {
+        return;
+    }
+    g_skia_rec.text_size = text_size;
+    g_skia_rec.pre_scale_x = pre_scale_x;
+    g_skia_rec.pre_skew_x = pre_skew_x;
+    for (size_t i = 0; i < 4; ++i) {
+        g_skia_rec.post[i] = post[i];
+    }
+    g_skia_rec.valid = true;
+#else
+    (void)text_size;
+    (void)pre_scale_x;
+    (void)pre_skew_x;
+    (void)post;
 #endif
 }
 

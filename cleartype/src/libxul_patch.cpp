@@ -117,6 +117,27 @@
 #include <unistd.h>
 
 
+// Every comparison this reports asks whether a value is exactly a particular
+// one, and two of them compare a box against the copy of it this library
+// wrote, where a tolerance would match a neighboring box and a bitwise test
+// would miss the two zeroes that differ only in sign.
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+
+// The bounds and the resolved addresses this file works from come from the
+// host, so a guard on one reads to the analysis as a guard that never holds
+// and a bound passed from a single call site reads as a constant. Both are
+// what keeps a mismatched build from being written to.
+// ReSharper disable CppDFAConstantConditions
+// ReSharper disable CppDFAConstantParameter
+
+// Making one of these const would only put a const_cast at the call that hands
+// the address on, since the shim's own entry points take a mutable pointer.
+// ReSharper disable CppLocalVariableMayBeConst
+
+// The type of an atomic is what says how the field is shared, so it is spelled
+// out rather than deduced.
+// ReSharper disable CppTemplateArgumentsCanBeDeduced
+
 // Declined for the same reason as in cleartype/src/freetype.cpp.
 // ReSharper disable CppTooWideScopeInitStatement
 // ReSharper disable CppUseStructuredBinding
@@ -340,6 +361,29 @@ struct FunctionStarts
         }
         return Start(lo);
     }
+
+    // How far the function starting here reaches, taken as the distance to the
+    // next start. The table is sorted and covers the text, so this is the
+    // function's own size wherever the next entry belongs to another function.
+    size_t Extent(const uintptr_t start) const
+    {
+        if (count == 0) {
+            return 0;
+        }
+        uint32_t lo = 0, hi = count - 1;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo + 1) / 2;
+            if (Start(mid) <= start) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (Start(lo) != start || lo + 1 >= count) {
+            return 0;
+        }
+        return static_cast<size_t>(Start(lo + 1) - start);
+    }
 };
 
 // One `lea reg, [rip + disp32]` whose target lands in [lo, hi).
@@ -471,6 +515,8 @@ using InitMetricsFn = void (*)(void* self);
 InitMetricsFn g_init_metrics = nullptr;
 
 // gfx/thebes/gfxFont.h: struct Metrics, nineteen gfxFloats in this order.
+constexpr unsigned kMetricsCapHeight = 0;
+constexpr unsigned kMetricsXHeight = 1;
 constexpr unsigned kMetricsStrikeoutSize = 2;
 constexpr unsigned kMetricsStrikeoutOffset = 3;
 constexpr unsigned kMetricsUnderlineSize = 4;
@@ -634,9 +680,7 @@ bool ReadThroughPipe(const void* addr, void* out, const size_t len)
                                  static_cast<size_t>(wrote) - have);
         if (got > 0) {
             have += static_cast<size_t>(got);
-        } else if (got < 0 && errno == EINTR) {
-            continue;
-        } else {
+        } else if (got == 0 || errno != EINTR) {
             break;
         }
     }
@@ -1027,8 +1071,6 @@ struct SurfacePropsShape
 
 // UpdateSurfaceProps' own arithmetic, so the comparisons below match the
 // numbers it wrote. It bounds the two differently.
-// ReSharper disable CppDFAConstantConditions
-// ReSharper disable CppDFAConstantParameter
 // ReSharper disable CppDFAUnreachableCode
 float GammaAsScalar(const int percent)
 {
@@ -1040,8 +1082,6 @@ float ContrastAsScalar(const int percent)
     return static_cast<float>(percent < 100 ? percent : 100) / 100.0f;
 }
 // ReSharper restore CppDFAUnreachableCode
-// ReSharper restore CppDFAConstantParameter
-// ReSharper restore CppDFAConstantConditions
 
 // kUnknown through kBGR_V, the whole of SkPixelGeometry.
 constexpr int32_t kPixelGeometryMax = 4;
@@ -1229,7 +1269,7 @@ double* FindAdjustedSize(void* self, const double* metrics, const double size)
     // ambiguous and nothing is written.
     std::atomic<size_t>& known = g_adjusted_size_delta;
 
-    auto* base = static_cast<double*>(self);
+    const auto* base = static_cast<const double*>(self);
     if (metrics < base + 3) {
         return nullptr;
     }
@@ -1268,6 +1308,18 @@ std::atomic<size_t> g_ftface_word{0};
 // mFTLoadFlags; bool mEmbolden; gfxFloat mFTSize;` puts it one word past the
 // struct, the int and the bool sharing that word.
 constexpr size_t kFTSizeWord = kMetricsFields + 1;
+
+// The address of the `words`th pointer-sized field of an object.
+//
+// The reads and writes below are all of a field at a word offset, and memcpy
+// takes void pointers, so handing it the word address directly is a conversion
+// through two levels of indirection that says nothing about what is copied.
+// Naming the address once keeps those calls reading as the field accesses they
+// are.
+void* WordAt(void* self, const size_t words)
+{
+    return static_cast<void*>(static_cast<void**>(self) + words);
+}
 
 bool SameBits(float a, float b);
 
@@ -1314,8 +1366,7 @@ void ClaimOwnFace(void* self)
     // installed last, so the size goes with the claim. A size out of range is
     // passed as zero and the shim falls back to the one the face carries.
     double ft_size = 0.0;
-    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord,
-                sizeof(ft_size));
+    std::memcpy(&ft_size, WordAt(self, at + kFTSizeWord), sizeof(ft_size));
     if (!(ft_size > 0.0) || !(ft_size < 65536.0)) {
         ft_size = 0.0;
     }
@@ -1390,8 +1441,7 @@ void ResetAdjustedSize(void* self)
         return;
     }
     double ft_size = 0.0;
-    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord,
-                sizeof(ft_size));
+    std::memcpy(&ft_size, WordAt(self, at + kFTSizeWord), sizeof(ft_size));
     if (!SameDouble(ft_size, 0.0)) {
         return;
     }
@@ -1430,7 +1480,7 @@ void RecordPriorFTSize(void* self, const double px)
         }
     }
     g_prior_ft_sizes[g_prior_ft_next] = PriorFTSize{.self = self, .px = px};
-    g_prior_ft_next = (g_prior_ft_next + 1) | 0;
+    g_prior_ft_next = g_prior_ft_next + 1;
     if (g_prior_ft_next >= sizeof(g_prior_ft_sizes) / sizeof(g_prior_ft_sizes[0])) {
         g_prior_ft_next = 0;
     }
@@ -1482,10 +1532,33 @@ extern "C" void DwcInitMetrics(void* self)
     const bool upp = CleartypeWindowsUnitsPerPixel(&linux_upp, &win_upp, &em, &asc, &desc) != 0;
     double ave = 0.0, adv = 0.0, cw_em = 0.0, cw_asc = 0.0, cw_desc = 0.0;
     const bool char_width = CleartypeWindowsCharWidth(&ave, &adv, &cw_em, &cw_asc, &cw_desc) != 0;
+    double xh = 0.0, ch = 0.0, xh_em = 0.0, xh_asc = 0.0, xh_desc = 0.0;
+    const bool xcap = CleartypeWindowsXCapHeight(&xh, &ch, &xh_em, &xh_asc, &xh_desc) != 0;
     double rounded = 0.0, unrounded = 0.0, sk_space = 0.0, sk_zero = 0.0, sk_ideo = 0.0;
     double sk_em = 0.0, sk_asc = 0.0, sk_desc = 0.0;
     const bool strike = CleartypeWindowsStrikeSize(&rounded, &unrounded, &sk_space, &sk_zero,
                                                    &sk_ideo, &sk_em, &sk_asc, &sk_desc) != 0;
+    // A font smaller than a pixel, measured against the size it was actually
+    // given rather than the whole pixel FreeType was clamped to.
+    //
+    // gfxFT2FontBase::FindClosestSize clamps mFTSize to 1.0 below a pixel and
+    // lets glyph extents scale back from it, but InitMetrics takes the ascent
+    // and descent from the clamped FreeType metrics with no such correction,
+    // so every size under a pixel comes out with a whole pixel of ascent where
+    // gfxDWriteFont::ComputeMetrics rounds to none. mAdjustedSize still holds
+    // the real size, and the two offsets that reach it are learned from
+    // ordinary fonts, where it and mFTSize agree.
+    double tiny_asc = 0.0, tiny_desc = 0.0;
+    bool tiny = false;
+    if (const size_t at_w = g_ftface_word.load(std::memory_order_relaxed),
+        back_w = g_adjusted_size_delta.load(std::memory_order_relaxed);
+        at_w != 0 && back_w != 0 && back_w <= at_w) {
+        double adjusted = 0.0;
+        std::memcpy(&adjusted, static_cast<double*>(self) + (at_w - back_w), sizeof(adjusted));
+        if (adjusted > 0.0 && adjusted < 1.0) {
+            tiny = CleartypeWindowsMetricsAtSize(adjusted, &tiny_asc, &tiny_desc) != 0;
+        }
+    }
     // All three are read together and the claim is then dropped. The answers
     // belong to this call alone, and a later InitMetrics that returns before
     // reading OS/2 would otherwise be handed this face's numbers.
@@ -1505,14 +1578,23 @@ extern "C" void DwcInitMetrics(void* self)
             std::memory_order_relaxed);
     }
 
+    // The sub-pixel ascent and descent, put back over what the clamped
+    // FreeType metrics produced. InitMetrics has already run, so its
+    // sTypoAscender fallback, which fires when both are zero, has fired
+    // against the clamped numbers and cannot undo these.
+    if (tiny) {
+        found[kMetricsMaxAscent] = tiny_asc;
+        found[kMetricsMaxDescent] = tiny_desc;
+        found[kMetricsMaxHeight] = tiny_asc + tiny_desc;
+    }
+
     // Where mAdjustedSize sits, learned even when nothing below writes it, so
     // that PreClaimOwnSize can read it on the next font. mFTSize is the same
     // value for a scalable face, which is what the pattern needs to match on.
     if (const size_t word = g_ftface_word.load(std::memory_order_relaxed);
         word != 0 && g_adjusted_size_delta.load(std::memory_order_relaxed) == 0) {
         double ft_size = 0.0;
-        std::memcpy(&ft_size, static_cast<void* const*>(self) + word + kFTSizeWord,
-                    sizeof(ft_size));
+        std::memcpy(&ft_size, WordAt(self, word + kFTSizeWord), sizeof(ft_size));
         if (ft_size > 0.0 && ft_size < 65536.0) {
             (void)FindAdjustedSize(self, found, ft_size);
         }
@@ -1535,12 +1617,10 @@ extern "C" void DwcInitMetrics(void* self)
             at != 0 ? FindAdjustedSize(self, found, unrounded) : nullptr;
         if (adjusted != nullptr) {
             double prior = 0.0;
-            std::memcpy(&prior, static_cast<void* const*>(self) + at + kFTSizeWord,
-                        sizeof(prior));
+            std::memcpy(&prior, WordAt(self, at + kFTSizeWord), sizeof(prior));
             RecordPriorFTSize(self, prior);
             *adjusted = rounded;
-            std::memcpy(static_cast<void**>(self) + at + kFTSizeWord, &rounded,
-                        sizeof(rounded));
+            std::memcpy(WordAt(self, at + kFTSizeWord), &rounded, sizeof(rounded));
             // Windows measures these three through the rounded instance and
             // InitMetrics through the unrounded one, so they are replaced
             // outright.
@@ -1574,6 +1654,42 @@ extern "C" void DwcInitMetrics(void* self)
     const bool overridden =
         leading && std::fabs(found[kMetricsExternalLeading] - linux_el) > 0.5;
 
+    if (xcap) {
+        // The field InitMetrics derives from the FreeType face rather than from
+        // the OS/2 table scaled. Everything that positions an inline box
+        // against the parent's x-height reads it, vertical-align: middle among
+        // them, so a fraction of a pixel here becomes a row of text elsewhere.
+        //
+        // capHeight sits beside it and is left alone. Writing the Windows one
+        // as well moves two runs of the Wikipedia page at scroll 600, which the
+        // Linux value renders identically, so only the field that was shown to
+        // diverge is answered. ch carries it for whoever needs it next.
+        // Only for the face this struct belongs to.
+        //
+        // FindMetrics locates the struct by the em, ascent and descent the
+        // leading and underline answered with, and this export answers from
+        // the face last measured on its own. The two are the same face for an
+        // ordinary InitMetrics and part company when one returns early, so the
+        // three are compared before anything is written; otherwise one face's
+        // x-height lands in another's metrics, which is a length no page
+        // agrees with on either platform.
+        const bool same_face =
+            std::fabs(xh_em - em) < 1e-9 && std::fabs(xh_asc - asc) < 1e-9 &&
+            std::fabs(xh_desc - desc) < 1e-9;
+        // Written in full, not to a threshold.
+        //
+        // Rounding the comparison to app units first looks safe, since layout
+        // keeps lengths in them and two x-heights that round alike are the
+        // same length to everything downstream. font-size-adjust is the
+        // exception: it divides the specified size by the face's own
+        // x-height ratio, so a difference too small to see in a length comes
+        // back multiplied. Ahem at 40px with font-size-adjust 0.9 resolves a
+        // device pixel apart from Windows when the fraction is dropped, and
+        // exactly with it.
+        if (same_face) {
+            found[kMetricsXHeight] = xh;
+        }
+    }
     if (leading && !overridden) {
         // gfxFT2FontBase::InitMetrics writes floor(size + 0.5) into emHeight
         // where gfxDWriteFont::ComputeMetrics writes the unrounded
@@ -1594,11 +1710,19 @@ extern "C" void DwcInitMetrics(void* self)
         found[kMetricsInternalLeading] = il;
         found[kMetricsExternalLeading] = el;
     }
-    if (upp && !SameDouble(linux_upp, win_upp)) {
+    if (upp) {
         // COLRFonts scales a paint graph's font units by this, and
         // gfxFont::CreateVerticalMetrics multiplies the OS/2 and vhea fields by
         // it, so the rounding FreeType's scale carries reaches a color glyph's
         // gradients and a vertical line box alike.
+        //
+        // Written whenever the face answered, not only when the two factors
+        // are a millionth apart. The field is a float and the fields it
+        // multiplies are whole font units, so two factors that agree to that
+        // tolerance still put a product either side of a rounding boundary: a
+        // CJK face with vhea gives a vertical line box a device pixel out at
+        // four sizes in seventeen, in both directions, which is the shape of a
+        // rounding split rather than an offset.
         if (float* factor = FindUnitsPerPixel(self, found, linux_upp)) {
             *factor = static_cast<float>(win_upp);
         }
@@ -2276,6 +2400,403 @@ bool PatchUnderline(const Image& image, const FunctionStarts& starts)
 }
 
 // ---------------------------------------------------------------------------
+// App units per device pixel.
+//
+// gfxFont::PostShapingFixup is where Windows widens a synthesized bold face,
+// through gfxShapedText::ApplyTrackingToClusters, which adds a whole number of
+// app units. The shim reproduces that widening inside the advance, because
+// nothing below the DOM applies it on this platform: mApplySyntheticBold is
+// set in gfxDWriteFonts.cpp and gfxMacFont.cpp and nowhere else, so the
+// FreeType path leaves it false and PostShapingFixup returns without doing
+// anything. Reproducing it needs the size of an app unit, and that is 60 to a
+// CSS pixel but 60/ratio to a device pixel, so a scaled display counts them
+// differently and the reproduction lands a unit out at every ratio above one.
+//
+// The number lives in gfxShapedText, which PostShapingFixup is handed. This
+// hook is only there to read it: it takes no decision, and the call goes
+// through to the original whatever it finds.
+//
+// The number is read from the copy gfxFont::ShapeText inlines the fixup into,
+// which is what runs here; the out-of-line copy belongs to gfxFT2Font and is
+// only located on the way to it.
+// ---------------------------------------------------------------------------
+
+// The function the shaping path reaches with the fixup inlined into it.
+//
+// Its name is not needed and its parameter list is not guessed: both call
+// sites set up six registers and push two more, and the last of those is a
+// zero-extended uint16. Eight integer arguments and no floating point ones, so
+// they forward exactly whatever they mean.
+using InlinedFixupFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                    uint64_t, uint64_t, uint64_t, uint64_t);
+InlinedFixupFn g_inlined_fixup = nullptr;
+
+std::atomic<bool> g_app_units_known{false};
+// The call sites standing in front of the fixup, kept so they can be put
+// back. Reading the count of app units needs the hook to run once; leaving it
+// in front of a function entered on every shaped run costs about twenty times
+// the shaping path, which is not a price the answer is worth. So the hook
+// removes itself as soon as it has read the number.
+unsigned char* g_fixup_sites[kMaxCallSites];
+unsigned g_fixup_sites_n = 0;
+uintptr_t g_fixup_original = 0;
+
+// gfx/thebes/gfxFont.h: gfxShapedText is polymorphic, then holds
+// mDetailedGlyphs, mLength, mFlags and mAppUnitsPerDevUnit in that order.
+constexpr size_t kShapedTextLength = 16;
+constexpr size_t kShapedTextAppUnits = 22;
+constexpr size_t kShapedTextProbe = 24;
+
+// Whether this pointer is a gfxShapedText, checked before it is believed.
+//
+// The compiler clones PostShapingFixup and drops the arguments it can see are
+// unused, so which register carries the shaped text is a property of the build
+// and not of the signature. Every candidate is therefore offered here and the
+// one that answers is the one used; a register holding something else fails on
+// its vtable, its length or its app units, and a register holding nothing at
+// all fails the read.
+bool ShapedTextAppUnits(const void* p, uint16_t* units)
+{
+    if (p == nullptr || (reinterpret_cast<uintptr_t>(p) & 7U) != 0 ||
+        !g_libxul_known.load(std::memory_order_acquire)) {
+        return false;
+    }
+    unsigned char buf[kShapedTextProbe];
+    if (!ReadWithoutFaulting(p, buf, sizeof(buf))) {
+        return false;
+    }
+    const void* vptr = nullptr;
+    std::memcpy(&vptr, buf, sizeof(vptr));
+    const auto* v = static_cast<const unsigned char*>(vptr);
+    if (v == nullptr || v < g_libxul.relro.begin || v >= g_libxul.relro.end) {
+        return false;                        // not a vtable in this library
+    }
+    // A pointer into the relocated data is not yet a vtable. The first slot of
+    // one holds a function, so it has to land in the library's own text; an
+    // ordinary struct whose first word happens to point into that segment
+    // fails here.
+    const void* first = nullptr;
+    if (!ReadWithoutFaulting(v, &first, sizeof(first))) {
+        return false;
+    }
+    bool in_text = false;
+    for (unsigned i = 0; i < g_libxul.text_count; ++i) {
+        const Region& t = g_libxul.text[i];
+        const auto* f = static_cast<const unsigned char*>(first);
+        in_text = in_text || (f >= t.begin && f < t.end);
+    }
+    if (!in_text) {
+        return false;
+    }
+    uint32_t length = 0;
+    std::memcpy(&length, buf + kShapedTextLength, sizeof(length));
+    uint16_t got = 0;
+    std::memcpy(&got, buf + kShapedTextAppUnits, sizeof(got));
+    // A text run is not billions of characters long, and no display counts
+    // more app units to a device pixel than it does to a CSS one.
+    if (length > (1U << 24) || got == 0 || got > 60) {
+        return false;
+    }
+    *units = got;
+    return true;
+}
+
+
+// The reading last handed to the shim; a rescale is a change in this.
+std::atomic<uint16_t> g_app_units_seen{0};
+
+extern "C" uint64_t DwcInlinedFixup(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                    uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8);
+extern "C" uint64_t DwcInlinedFixup(const uint64_t a1, const uint64_t a2, const uint64_t a3,
+                                    const uint64_t a4, const uint64_t a5, const uint64_t a6,
+                                    const uint64_t a7, const uint64_t a8)
+{
+    // The eighth argument is the only one read. A count of app units to a
+    // device pixel is 60 at a ratio of one and smaller above it, and never
+    // zero, so a value outside that is some other field and is left alone.
+    // One of the pointers is the shaped text the inlined fixup works on. Which
+    // one is a property of the build, so each is offered to the same check the
+    // shaped text has to pass, and a value is taken only from one that does.
+    // Probing costs a syscall per candidate, and this sits on the shaping
+    // path, so it is done once and then only occasionally.
+    //
+    // The first pass finds which argument carries the shaped text; after that
+    // only that one is looked at, and only every so often, which is what keeps
+    // a display rescaled under a running browser from going unnoticed without
+    // charging every run for the watch. A browser slowed down here does not
+    // render differently, but it does miss the capture handshake's deadlines,
+    // and those frames read as differences that are not there.
+    {
+        const uint64_t args[] = { a1, a2, a3, a4, a5, a6, a7, a8 };
+        // Which argument carried the shaped text, once it is known, and how
+        // many calls have gone by since it was last read. The count is what
+        // the watch costs on the calls in between.
+        static std::atomic<int> carrier{-1};
+        static std::atomic<unsigned> since{0};
+        constexpr unsigned kCallsBetweenReads = 256;
+
+        const int known = carrier.load(std::memory_order_relaxed);
+        if (known >= 0) {
+            if (since.fetch_add(1, std::memory_order_relaxed) + 1 >= kCallsBetweenReads) {
+                since.store(0, std::memory_order_relaxed);
+                const uint64_t v = args[known];
+                uint16_t units = 0;
+                if (v >= 0x10000 && v < 0x800000000000ULL && (v & 7U) == 0 &&
+                    ShapedTextAppUnits(reinterpret_cast<const void*>(v), &units) &&
+                    units != g_app_units_seen) {
+                    g_app_units_seen = units;
+                    CleartypeSetAppUnitsPerDevPixel(static_cast<int>(units));
+                    Report("libxul: app units per device pixel is now %u", units);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < 8; ++i) {
+                const uint64_t v = args[i];
+                // A syscall is what a probe costs, so an argument that cannot
+                // be a pointer is dismissed without one.
+                if (v < 0x10000 || v >= 0x800000000000ULL || (v & 7U) != 0) {
+                    continue;
+                }
+                uint16_t units = 0;
+                if (!ShapedTextAppUnits(reinterpret_cast<const void*>(v), &units)) {
+                    continue;
+                }
+                g_app_units_seen = units;
+                CleartypeSetAppUnitsPerDevPixel(static_cast<int>(units));
+                Report("libxul: app units per device pixel is %u", units);
+                carrier.store(static_cast<int>(i), std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+    return g_inlined_fixup(a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+// Every rip-relative reference to one address, by the function holding it.
+unsigned FunctionsReferencing(const Image& image, const FunctionStarts& starts,
+                              const uintptr_t what, uintptr_t* out, const unsigned max)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        for (const unsigned char* p = r.begin; p + 4 <= r.end; ++p) {
+            int32_t disp = 0;
+            std::memcpy(&disp, p, sizeof(disp));
+            // The displacement of these SSE loads is the last field of the
+            // instruction, so the next instruction begins right after it.
+            if (reinterpret_cast<uintptr_t>(p) + 4 +
+                    static_cast<uintptr_t>(static_cast<intptr_t>(disp)) != what) {
+                continue;
+            }
+            const uintptr_t fn = starts.Enclosing(reinterpret_cast<uintptr_t>(p));
+            bool seen = false;
+            for (unsigned k = 0; k < n; ++k) {
+                seen = seen || out[k] == fn;
+            }
+            if (!seen && fn != 0) {
+                if (n == max) {
+                    return max + 1;          // more than can be accounted for
+                }
+                out[n++] = fn;
+            }
+        }
+    }
+    return n;
+}
+
+// The functions holding a direct call to `to`.
+unsigned FunctionsDirectlyCalling(const Image& image, const FunctionStarts& starts,
+                                  const uintptr_t to, uintptr_t* out, const unsigned max)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < image.text_count; ++i) {
+        const Region& r = image.text[i];
+        for (const unsigned char* p = r.begin; p + 5 <= r.end; ++p) {
+            if (p[0] != 0xE8) {
+                continue;
+            }
+            int32_t disp = 0;
+            std::memcpy(&disp, p + 1, sizeof(disp));
+            if (reinterpret_cast<uintptr_t>(p) + 5 +
+                    static_cast<uintptr_t>(static_cast<intptr_t>(disp)) != to) {
+                continue;
+            }
+            const uintptr_t fn = starts.Enclosing(reinterpret_cast<uintptr_t>(p));
+            bool seen = false;
+            for (unsigned k = 0; k < n; ++k) {
+                seen = seen || out[k] == fn;
+            }
+            if (!seen && fn != 0) {
+                if (n == max) {
+                    return max + 1;
+                }
+                out[n++] = fn;
+            }
+        }
+    }
+    return n;
+}
+
+// PostShapingFixup, found through the one constant its arithmetic needs.
+//
+// gfxFont::GetSyntheticBoldOffset divides by a threshold of 48, and that
+// double occurs once in the whole library. The function holding it is small
+// and returns the offset; the small function that calls it is the fixup. Both
+// steps insist on exactly one candidate, so a build that inlines them
+// differently is left alone rather than guessed at.
+constexpr size_t kSmallFunction = 512;
+
+bool PatchPostShapingFixup(const Image& image, const FunctionStarts& starts)
+{
+    constexpr double kThreshold = 48.0;
+    // Every aligned copy of the threshold. The mapped image holds more than
+    // the one the file does, so the constant alone does not name the function;
+    // it only narrows where to look, and the chain below is what decides.
+    const unsigned char* where[8];
+    unsigned n_where = 0;
+    for (unsigned i = 0; i < image.rodata_count && n_where < 8; ++i) {
+        const Region& r = image.rodata[i];
+        for (const unsigned char* p = r.begin; p + sizeof(double) <= r.end; ++p) {
+            if ((reinterpret_cast<uintptr_t>(p) & 7U) != 0) {
+                continue;                    // a double the compiler emitted is aligned
+            }
+            double v = 0.0;
+            std::memcpy(&v, p, sizeof(v));
+            if (!SameDouble(v, kThreshold)) {
+                continue;
+            }
+            bool seen = false;
+            for (unsigned k = 0; k < n_where; ++k) {
+                seen = seen || where[k] == p;
+            }
+            if (!seen) {
+                if (n_where == 8) {
+                    Report("libxul: too many copies of the synthetic bold threshold; "
+                           "app units per device pixel stay at 60");
+                    return false;
+                }
+                where[n_where++] = p;
+            }
+        }
+    }
+    if (n_where == 0) {
+        Report("libxul: no synthetic bold threshold; app units per device pixel stay at 60");
+        return false;
+    }
+
+    // The offset function is small, returns the offset and is referenced by one
+    // of those copies. Exactly one such function must exist across them all.
+    uintptr_t offset_fn = 0;
+    for (unsigned w = 0; w < n_where; ++w) {
+        uintptr_t holders[8];
+        const unsigned n_hold = FunctionsReferencing(image, starts,
+                                                     reinterpret_cast<uintptr_t>(where[w]),
+                                                     holders, 8);
+        for (unsigned i = 0; i < n_hold && i < 8; ++i) {
+            const size_t extent = starts.Extent(holders[i]);
+            if (extent == 0 || extent > kSmallFunction) {
+                continue;
+            }
+            if (offset_fn != 0 && offset_fn != holders[i]) {
+                Report("libxul: more than one small function computes the synthetic "
+                       "bold offset; app units per device pixel stay at 60");
+                return false;
+            }
+            offset_fn = holders[i];
+        }
+    }
+    // The large function holding the inlined fixup, which is the copy that
+    // runs here. Patched through its callers, whose argument setup is what
+    // says how many there are.
+    for (unsigned w = 0; w < n_where; ++w) {
+        uintptr_t holders[8];
+        const unsigned n_hold = FunctionsReferencing(image, starts,
+                                                     reinterpret_cast<uintptr_t>(where[w]),
+                                                     holders, 8);
+        for (unsigned i = 0; i < n_hold && i < 8; ++i) {
+            if (starts.Extent(holders[i]) <= kSmallFunction) {
+                continue;
+            }
+            // This is the copy that runs, and the shaped text among its
+            // arguments carries the count. It is entered once per shaped run,
+            // so the hook reads the number and then puts these call sites
+            // back; the sites are remembered here for that.
+            if (EnvDisables("CLEARTYPE_APP_UNITS")) {
+                break;                       // for pricing the hook against no hook
+            }
+            g_inlined_fixup = reinterpret_cast<InlinedFixupFn>(holders[i]);
+            const unsigned n = RedirectCalls(image, starts, holders[i],
+                                             reinterpret_cast<void*>(&DwcInlinedFixup));
+            if (n == 0) {
+                g_inlined_fixup = nullptr;
+                break;
+            }
+            g_fixup_original = holders[i];
+            g_fixup_sites_n = 0;
+            for (unsigned t = 0; t < image.text_count; ++t) {
+                const Region& r = image.text[t];
+                for (const unsigned char* q = r.begin; q + 5 <= r.end; ++q) {
+                    if (q[0] != 0xE8) {
+                        continue;
+                    }
+                    int32_t disp = 0;
+                    std::memcpy(&disp, q + 1, sizeof(disp));
+                    const uintptr_t at = reinterpret_cast<uintptr_t>(q);
+                    if (at + 5 + static_cast<uintptr_t>(static_cast<intptr_t>(disp)) !=
+                        reinterpret_cast<uintptr_t>(&DwcInlinedFixup)) {
+                        continue;
+                    }
+                    if (g_fixup_sites_n < kMaxCallSites) {
+                        g_fixup_sites[g_fixup_sites_n++] = const_cast<unsigned char*>(q) + 1;
+                    }
+                }
+            }
+            Report("libxul: the inlined fixup at %#lx returns through this library "
+                   "until it has answered (%u call site%s, %u remembered)",
+                   holders[i], n, n == 1 ? "" : "s", g_fixup_sites_n);
+            break;
+        }
+        if (g_inlined_fixup != nullptr) {
+            break;
+        }
+    }
+
+    if (offset_fn == 0) {
+        Report("libxul: the synthetic bold offset is inlined everywhere; app units "
+               "per device pixel stay at 60");
+        return false;
+    }
+
+    uintptr_t callers[16];
+    const unsigned n_call = FunctionsDirectlyCalling(image, starts, offset_fn, callers, 16);
+    uintptr_t fixup = 0;
+    for (unsigned i = 0; i < n_call && i < 16; ++i) {
+        if (starts.Extent(callers[i]) <= kSmallFunction) {
+            if (fixup != 0) {
+                Report("libxul: more than one small function calls the synthetic bold "
+                       "offset; app units per device pixel stay at 60");
+                return false;
+            }
+            fixup = callers[i];
+        }
+    }
+    if (fixup == 0) {
+        Report("libxul: no small caller of the synthetic bold offset; app units per "
+               "device pixel stay at 60");
+        return false;
+    }
+
+
+
+    // Located, not redirected. gfxFcFont is what shapes on this desktop and
+    // gfxFont::ShapeText inlines the fixup into itself, so this out-of-line
+    // copy is the one gfxFT2Font calls and nothing here does. Standing in
+    // front of it would write into text that never executes.
+    (void)fixup;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // The glyph path.
 //
 // SkScalerContext_FreeType::generatePath builds the SkPath that everything
@@ -2396,7 +2917,7 @@ uintptr_t FindGeneratePath(const Image& image, const FunctionStarts& starts, voi
     // so a function reached from one is not the path walker.
     uintptr_t rasterizers[kMaxGlyphFns * 2];
     unsigned n_rasterizers = 0;
-    static const char* const kRasterEntries[] = { "FT_Render_Glyph", "FT_Outline_Get_Bitmap" };
+    static constexpr const char* kRasterEntries[] = { "FT_Render_Glyph", "FT_Outline_Get_Bitmap" };
     for (const char* const name : kRasterEntries) {
         void** const slot = GotSlot(image, name);
         uintptr_t found[kMaxGlyphFns];
@@ -2477,6 +2998,23 @@ bool SameBits(const float a, const float b)
 // listener list and four spans, so this reaches well past it.
 constexpr size_t kPathDataSearchBytes = 256;
 
+// Which answer the search below gave, said once for each.
+void ReportRepairOnce(const char* what, const unsigned count)
+{
+    static std::atomic<const char*> said[3];
+    for (auto& slot : said) {
+        const char* had = slot.load(std::memory_order_relaxed);
+        if (had == what) {
+            return;
+        }
+        if (had == nullptr &&
+            slot.compare_exchange_strong(had, what, std::memory_order_relaxed)) {
+            Report("libxul: glyph path repair: %s (%u points)", what, count);
+            return;
+        }
+    }
+}
+
 // Puts the unquantized coordinates into the finished path.
 //
 // Nothing here knows SkPathData's layout. The span is found by its contents.
@@ -2484,10 +3022,13 @@ constexpr size_t kPathDataSearchBytes = 256;
 // divided it by 64, and 1/64 is a power of two, so those floats are bit for
 // bit what the builder stored. A run of them as long as the walk, reached
 // through a pointer and a count sitting side by side, is the point array.
+//
+// A search that finds no array leaves every coordinate on the walk's 1/64
+// grid, which is why each outcome is reported.
 void RepairGlyphPath(void* sret, const CleartypeGlyphPathPoint* points, const unsigned count)
 {
     void* data = nullptr;
-    if (!ReadWithoutFaulting(sret, &data, sizeof(data)) || data == nullptr ||
+    if (!ReadWithoutFaulting(sret, static_cast<void*>(&data), sizeof(data)) || data == nullptr ||
         (reinterpret_cast<uintptr_t>(data) & 7u) != 0) {
         return;
     }
@@ -2505,7 +3046,7 @@ void RepairGlyphPath(void* sret, const CleartypeGlyphPathPoint* points, const un
     for (size_t at = 0; at + 2 * sizeof(void*) <= have; at += sizeof(void*)) {
         void* ptr = nullptr;
         size_t size = 0;
-        std::memcpy(&ptr, window + at, sizeof(ptr));
+        std::memcpy(static_cast<void*>(&ptr), window + at, sizeof(ptr));
         std::memcpy(&size, window + at + sizeof(void*), sizeof(size));
         if (size != count || ptr == nullptr ||
             (reinterpret_cast<uintptr_t>(ptr) & 3u) != 0) {
@@ -2528,13 +3069,16 @@ void RepairGlyphPath(void* sret, const CleartypeGlyphPathPoint* points, const un
             continue;
         }
         if (stored != nullptr) {
-            return;                    // two arrays read alike; write neither
+            ReportRepairOnce("two arrays read alike; neither was written", count);
+            return;
         }
         stored = candidate;
     }
     if (stored == nullptr) {
+        ReportRepairOnce("no array in the finished path reads as the walk's points", count);
         return;
     }
+    ReportRepairOnce("the walk's points were found and replaced with the exact ones", count);
 
     float left = points[0].exact_x, right = points[0].exact_x;
     float top = points[0].exact_y, bottom = points[0].exact_y;
@@ -2580,6 +3124,9 @@ void RepairGlyphPath(void* sret, const CleartypeGlyphPathPoint* points, const un
 using GenerateMetricsFn = void* (*)(void* sret, void* self, const void* glyph, void* alloc);
 GenerateMetricsFn g_generate_metrics = nullptr;
 
+using GenerateImageFn = void (*)(void* self, const void* glyph, void* buffer);
+GenerateImageFn g_generate_image = nullptr;
+
 // Asks Skia to draw this scaler's glyphs from their outlines.
 //
 // SkScalerContext_DW::generateMetrics falls through to ScalerContextBits::PATH
@@ -2607,6 +3154,12 @@ GenerateMetricsFn g_generate_metrics = nullptr;
 // fields, so the text size sits at 12 and says whether this is the object at
 // all.
 constexpr size_t kRecTextSizeAt = 12;
+// fRec is a uint32 id then nine floats, so the pre-scale and pre-skew follow
+// the size and the relaxed 2x2 follows them. getSingleMatrix is built out of
+// exactly these five.
+constexpr size_t kRecPreScaleXAt = 16;
+constexpr size_t kRecPreSkewXAt = 20;
+constexpr size_t kRecPost2x2At = 24;
 constexpr size_t kTypefaceAt = 64;
 constexpr size_t kPathEffectAt = 72;
 constexpr size_t kMaskFilterAt = 80;
@@ -2641,24 +3194,97 @@ void DrawGlyphsFromPath(void* self)
         return;                              // already set, or not a boolean
     }
     static_cast<unsigned char*>(self)[kImageFromPathAt] = 1;
+    static std::atomic_flag said = ATOMIC_FLAG_INIT;
+    if (!said.test_and_set(std::memory_order_relaxed)) {
+        Report("libxul: a blob scaler at %.2f px now draws its glyphs from the path",
+               static_cast<double>(text_size));
+    }
+}
+
+// What this scaler was built with, handed to the shim.
+//
+// SkScalerContext_CairoFT::Lock spends the product of the size and the device
+// matrix on FT_Set_Char_Size and hands the shape over separately, so what
+// reaches FreeType is that product rounded to a 26.6 and a matrix normalized
+// to 16.16. Neither carries the terms it was made of, and under 16 px of size
+// two neighboring 1024ths of the device matrix round to one char size, so the
+// product cannot be taken apart again. It never has to be: the five fields
+// getSingleMatrix builds the total matrix out of are in this object, and this
+// hook is already reading the bytes they sit in.
+//
+// The neighbors say whether this is the object at all, and the shim checks the
+// matrix against the char sizes the face actually received before using it.
+void ReportScalerTextSize(void* self)
+{
+    if (self == nullptr) {
+        CleartypeSkiaScaler(0.0, 0.0, 0.0, nullptr);
+        return;
+    }
+    unsigned char probe[kScalerProbeBytes];
+    float text_size = 0.0f;
+    float pre_scale_x = 0.0f;
+    float pre_skew_x = 0.0f;
+    float post[4] = {};
+    uintptr_t typeface = 0;
+    if (!ReadWithoutFaulting(self, probe, sizeof(probe))) {
+        CleartypeSkiaScaler(0.0, 0.0, 0.0, nullptr);
+        return;
+    }
+    std::memcpy(&text_size, probe + kRecTextSizeAt, sizeof(text_size));
+    std::memcpy(&pre_scale_x, probe + kRecPreScaleXAt, sizeof(pre_scale_x));
+    std::memcpy(&pre_skew_x, probe + kRecPreSkewXAt, sizeof(pre_skew_x));
+    std::memcpy(post, probe + kRecPost2x2At, sizeof(post));
+    std::memcpy(&typeface, probe + kTypefaceAt, sizeof(typeface));
+    bool usable = std::isfinite(text_size) && text_size > 0.0f && text_size <= 4096.0f &&
+                  typeface >= 0x10000 && (typeface & 7u) == 0 && std::isfinite(pre_scale_x) &&
+                  std::isfinite(pre_skew_x);
+    for (const float term : post) {
+        usable = usable && std::isfinite(term);
+    }
+    if (!usable) {
+        CleartypeSkiaScaler(0.0, 0.0, 0.0, nullptr);
+        return;
+    }
+    // The rec holds these as SkScalar, and the shim rebuilds the total matrix
+    // in double, as SkScalerContextRec::getSingleMatrix does.
+    const double terms[4] = { static_cast<double>(post[0]), static_cast<double>(post[1]),
+                              static_cast<double>(post[2]), static_cast<double>(post[3]) };
+    CleartypeSkiaScaler(static_cast<double>(text_size), static_cast<double>(pre_scale_x),
+                        static_cast<double>(pre_skew_x), terms);
 }
 
 extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, void* alloc);
 
 extern "C" void* DwcGenerateMetrics(void* sret, void* self, const void* glyph, void* alloc)
 {
-    // The real call first, so the shim has seen this scaler's face by the time
-    // the route is chosen; internalMakeGlyph reads the flag only after
-    // generateMetrics returns, so setting it here is still in time.
+    // The size before the call, since the glyph this scaler measures is loaded
+    // inside it.
+    ReportScalerTextSize(self);
+    // The route after it, so the shim has seen this scaler's face by the time
+    // it is chosen; internalMakeGlyph reads the flag only after
+    // generateMetrics returns, so setting it there is still in time.
     void* const result = g_generate_metrics(sret, self, glyph, alloc);
     DrawGlyphsFromPath(self);
     return result;
+}
+
+// A strike measures its glyphs when they are laid out and draws them when the
+// display list reaches them, and other scalers run on the thread in between.
+// So the size and the device matrix are read again here, where the mask this
+// scaler is about to fill in is the one the shim answers.
+extern "C" void DwcGenerateImage(void* self, const void* glyph, void* buffer);
+
+extern "C" void DwcGenerateImage(void* self, const void* glyph, void* buffer)
+{
+    ReportScalerTextSize(self);
+    g_generate_image(self, glyph, buffer);
 }
 
 extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph);
 
 extern "C" void* DwcGeneratePath(void* sret, void* self, const void* glyph)
 {
+    ReportScalerTextSize(self);
     CleartypeBeginGlyphPath();
     void* const result = g_generate_path(sret, self, glyph);
     const CleartypeGlyphPathPoint* points = nullptr;
@@ -2694,6 +3320,16 @@ bool PatchGlyphPath(const Image& image, const FunctionStarts& starts)
                    metrics);
         } else {
             g_generate_metrics = nullptr;
+        }
+    }
+
+    const auto raster = reinterpret_cast<uintptr_t>(slot[-1]);
+    if (raster != 0) {
+        g_generate_image = reinterpret_cast<GenerateImageFn>(raster);
+        if (WriteSlot(slot - 1, reinterpret_cast<void*>(&DwcGenerateImage))) {
+            Report("libxul: generateImage %#lx now returns through this library", raster);
+        } else {
+            g_generate_image = nullptr;
         }
     }
     return true;
@@ -2898,9 +3534,8 @@ void SubstituteInkBox(void* self, const uint16_t gid, double* bounds)
     // puts the flags and the bool in the word before the size.
     unsigned char flags_word[sizeof(void*)] = {};
     double ft_size = 0.0, adjusted = 0.0;
-    std::memcpy(flags_word, static_cast<void* const*>(self) + at + kMetricsFields,
-                sizeof(flags_word));
-    std::memcpy(&ft_size, static_cast<void* const*>(self) + at + kFTSizeWord, sizeof(ft_size));
+    std::memcpy(flags_word, WordAt(self, at + kMetricsFields), sizeof(flags_word));
+    std::memcpy(&ft_size, WordAt(self, at + kFTSizeWord), sizeof(ft_size));
     std::memcpy(&adjusted, static_cast<double*>(self) + (at - back), sizeof(adjusted));
     if (!(ft_size > 0.0) || !(adjusted > 0.0) || flags_word[sizeof(int)] > 1) {
         return;                              // not a boolean where one should be
@@ -3143,6 +3778,7 @@ void Apply(const char* path, const uintptr_t base, const ElfW(Phdr)* phdr, ElfW(
     PatchGlyphPath(image, starts);
     PatchGlyphBounds(image, starts);
     PatchPlatformMediaFeature(image, starts);
+    PatchPostShapingFixup(image, starts);
 }
 
 // What the callback brings back. dlpi_name points into the link map and stays

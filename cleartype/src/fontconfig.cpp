@@ -68,6 +68,11 @@
 #include "shim_exports.h"
 #include "windows_fonts.h"
 
+// A symbol the host does not export resolves to null, and every use below is
+// guarded on that. Nothing in this file can show the analysis a null, so it
+// reads each guard as one that never holds.
+// ReSharper disable CppDFAConstantConditions
+
 // Nothing declares the entry points below but their definitions. They replace
 // fontconfig's, whose real declarations are in a header this file does not
 // include - see the ABI block underneath.
@@ -702,13 +707,13 @@ FcFontSet* FcConfigGetFonts(FcConfig* config, const int set)
 // by comparing the family it asked for against the family it got, so renaming
 // the request to something nothing is called makes the match fail and Blink
 // moves on to the next family in the CSS list, which is what Windows does.
-constexpr const char* kNoSuchFamily = "DWriteCoreNoSuchFamily";
+constexpr auto* kNoSuchFamily = "DWriteCoreNoSuchFamily";
 
 // The cursive row of font_defaults.cc goes to a script Linux has no row for,
 // so cursive reaches here as the family the WebPreferences constructor holds.
 // locale_settings_win.grd reads Comic Sans MS for it.
-constexpr const char* kConstructorCursive = "Script";
-constexpr const char* kWindowsCursive = "Comic Sans MS";
+constexpr auto* kConstructorCursive = "Script";
+constexpr auto* kWindowsCursive = "Comic Sans MS";
 
 bool ReplaceFamily(FcPattern* pattern, const char* with)
 {
@@ -988,7 +993,7 @@ bool FamilyHasBoldFace(const FcPattern* p)
         bold = new std::vector<std::string>();
         // The real font set, since asking our own export here would re-enter
         // the call that got us here.
-        if (FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
+        if (const FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
             const auto* view = reinterpret_cast<const FontSetLayout*>(all);
             for (int i = 0; view->fonts != nullptr && i < view->nfont; ++i) {
                 int weight = 0;
@@ -1053,7 +1058,7 @@ bool FamilyHasLightFace(const FcPattern* p)
     pthread_mutex_lock(&light_mutex);
     if (light == nullptr) {
         light = new std::vector<std::string>();
-        if (FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
+        if (const FcFontSet* all = get_fonts(nullptr, kFcSetSystem); all != nullptr) {
             const auto* view = reinterpret_cast<const FontSetLayout*>(all);
             for (int i = 0; view->fonts != nullptr && i < view->nfont; ++i) {
                 int weight = 0;

@@ -42,6 +42,24 @@ int CleartypeWindowsStrikeout(double* strikeout_offset, double* strikeout_size,
                               double* em_height, double* max_ascent,
                               double* max_descent);
 
+// How many app units this presentation puts in a device pixel, read out of a
+// gfxShapedText by the libxul patch. 60 while a device pixel is a CSS pixel,
+// and 48, 40 or 30 at a device pixel ratio of 1.25, 1.5 or 2. The synthetic
+// bold tracking is a whole number of these, so it lands where Gecko's does
+// only when this is the presentation's own value.
+void CleartypeSetAppUnitsPerDevPixel(int units);
+
+// Windows' x-height and cap-height for the face last measured, or 0 when there
+// is none. Answers for every face. gfxDWriteFont::ComputeMetrics scales the
+// OS/2 sxHeight and sCapHeight by mFUnitsConvFactor and leaves them
+// fractional, and gfxFT2FontBase::InitMetrics reads them off a FreeType face
+// sized in whole 1/64 px, so the two part company at any other size. em,
+// ascent and descent come back as they do for the strikeout, so the caller can
+// locate the metrics struct by matching them.
+int CleartypeWindowsXCapHeight(double* x_height, double* cap_height,
+                               double* em_height, double* max_ascent,
+                               double* max_descent);
+
 // The font-units-to-pixels factor for the face last measured, or 0 when there
 // is none. linux_factor is what gfxFT2FontBase::InitMetrics writes into
 // gfxFont::mFUnitsConvFactor, FreeType's 16.16 x_scale taken to a float, and
@@ -52,6 +70,11 @@ int CleartypeWindowsStrikeout(double* strikeout_offset, double* strikeout_size,
 int CleartypeWindowsUnitsPerPixel(double* linux_factor, double* windows_factor,
                                   double* em_height, double* max_ascent,
                                   double* max_descent);
+
+// The Windows maxAscent and maxDescent for the face being measured, at a size
+// other than the one FreeType holds. See the definition for why a font under
+// one pixel needs it.
+int CleartypeWindowsMetricsAtSize(double size, double* asc, double* desc);
 
 // Windows' two leadings for the face last measured, or 0 when there is none.
 // Answers for every face, not only the bad-underline ones: InitMetrics derives
@@ -84,8 +107,9 @@ int CleartypeClaimFace(void* candidate, double ft_size);
 // Name the unquantized size a face is about to be measured at, before the
 // measuring starts. Kept so that the em can be recovered from the 26.6 char
 // size FreeType is given, which is all a size that is not a whole app unit
-// leaves behind. Answers zero for a pointer this library does not know as a
-// face, or one that is not scalable.
+// leaves behind, and so that a size FindClosestSize moved can still be found
+// from the one the face ends up carrying. Answers zero for a pointer this
+// library does not know as a face, or one that is not scalable.
 int CleartypeClaimSize(void* candidate, double px);
 
 // The whole-pixel size Windows rounds gfxFont::mAdjustedSize to for the face
@@ -132,7 +156,16 @@ void CleartypeBeginGlyphPath(void);
 // received it. Zero when nothing was recorded, which is the ordinary case for
 // a glyph this library cannot answer for. The array belongs to the shim and
 // is valid until the next CleartypeBeginGlyphPath on this thread.
-unsigned CleartypeEndGlyphPath(const struct CleartypeGlyphPathPoint** points);
+unsigned CleartypeEndGlyphPath(const CleartypeGlyphPathPoint** points);
+
+// What the Skia scaler about to draw on this thread was built with: the five
+// SkScalerContextRec fields SkScalerContextRec::getSingleMatrix makes the
+// total matrix out of. `post` is fPost2x2 in row order, or null to forget the
+// whole thing, which is what a call this library cannot read a scaler out of
+// passes. Recovering these from the char size FreeType was given is a search
+// that cannot always succeed; they are the values themselves.
+void CleartypeSkiaScaler(double text_size, double pre_scale_x, double pre_skew_x,
+                         const double* post);
 
 // Whether this thread is one of WebRender's blob rasterizers. Gecko replays a
 // blob image through DrawTargetSkia on those, which is the one place Skia
