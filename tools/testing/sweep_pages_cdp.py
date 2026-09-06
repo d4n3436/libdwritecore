@@ -35,7 +35,22 @@ def main():
     ap.add_argument("cells")
     ap.add_argument("--css", default=None,
                     help="extra rule sheet, applied to both sides alike")
+    ap.add_argument("--scheme", default=None, choices=("light", "dark"),
+                    help="the prefers-color-scheme this side is expected to "
+                         "report, checked after pin_color_scheme has set it")
+    ap.add_argument("--scale", type=float, default=None,
+                    help="the device pixel ratio this side is expected to be "
+                         "at. Only one is honored here, since this route pins "
+                         "deviceScaleFactor to it in force_viewport, and a "
+                         "plan asking for another is refused rather than swept "
+                         "at the wrong one")
     args = ap.parse_args()
+
+    if args.scale is not None and abs(args.scale - 1.0) > 1e-6:
+        sys.exit("this side captures over DevTools, which is pinned to a "
+                 "device pixel ratio of 1, and the plan asks for %g. The "
+                 "scaled route exists on the Marionette sides only."
+                 % args.scale)
 
     def connect():
         b = vp.CdpBrowser(args.host, args.port)
@@ -46,6 +61,14 @@ def main():
         return b
 
     browser = connect()
+    if args.scheme is not None:
+        seen = browser.script("return matchMedia('(prefers-color-scheme: dark)')"
+                              ".matches ? 'dark' : 'light';")
+        print("scheme %s" % seen, file=sys.stderr, flush=True)
+        if seen != args.scheme:
+            sys.exit("this side reports a %s color scheme and the plan asks "
+                     "for %s; set DWC_COLOR_SCHEME before starting it"
+                     % (seen, args.scheme))
     try:
         with open(args.cells, encoding="utf-8") as handle:
             for line in handle:
