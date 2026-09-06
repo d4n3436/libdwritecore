@@ -89,7 +89,6 @@
 #include <sys/syscall.h>
 #include <link.h>
 #include <sys/mman.h>
-#include <execinfo.h>
 #include <csignal>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -171,47 +170,6 @@ bool EnvDisables(const char* name)
     const char* v = std::getenv(name);
     return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
 }
-
-// DWC_STACK_TRAP=1 installs a SIGUSR2 handler that prints the receiving
-// thread's own stack to stderr. A hung renderer refuses ptrace, so the way to
-// read where its threads sit is to signal every task in /proc/<pid>/task and
-// collect the prints.
-__attribute__((constructor)) void InstallStackTrap()
-{
-    if (std::getenv("DWC_STACK_TRAP") == nullptr) {
-        return;
-    }
-    struct sigaction sa = {};
-    sa.sa_handler = [](int) {
-        void* frames[64];
-        const int n = backtrace(frames, 64);
-        backtrace_symbols_fd(frames, n, 2);
-        (void)!write(2, "---- end of thread ----\n", 24);
-    };
-    sigemptyset(&sa.sa_mask);
-    (void)sigaction(SIGUSR2, &sa, nullptr);
-}
-
-// The half for crashes. Crashpad replaces whatever handler a constructor
-// installs, so this one is re-installed from the first scaler hook call,
-// which runs long after crashpad settled in.
-void InstallCrashTrap()
-{
-    if (std::getenv("DWC_STACK_TRAP") == nullptr) {
-        return;
-    }
-    struct sigaction sa = {};
-    sa.sa_handler = [](int) {
-        void* frames[64];
-        const int n = backtrace(frames, 64);
-        (void)!write(2, "---- crash ----\n", 16);
-        backtrace_symbols_fd(frames, n, 2);
-        _exit(139);
-    };
-    sigemptyset(&sa.sa_mask);
-    (void)sigaction(SIGSEGV, &sa, nullptr);
-}
-
 
 // ---------------------------------------------------------------------------
 // The image, meaning its executable segments and relocated read-only data.
@@ -2228,10 +2186,6 @@ std::unordered_map<const void*, bool> g_plain_fontations;
 // Read under g_font_mutex like everything beside the bytes.
 bool PlainFontationsLocked(void* typeface, const std::vector<uint8_t>& font)
 {
-    static const bool off = EnvDisables("DWC_PLAIN_FONTATIONS");
-    if (off) {
-        return false;
-    }
     auto found = g_plain_fontations.find(typeface);
     if (found == g_plain_fontations.end()) {
         found = g_plain_fontations.emplace(typeface,
@@ -2762,26 +2716,6 @@ void PointBounds(const path_abi::Point* p, const size_t count, float* out)
 // place, whatever the verbs say, and the safe answer is skrifa's path.
 constexpr float kMaxPointDelta = 1.0f;
 
-// Whether the two verb sequences describe the same path with only quads and
-// cubics traded, which is the one disagreement check_quadratic can produce:
-// DirectWrite hands Skia a cubic, and Skia folds it back to a quadratic only
-// when the control points land within 10 ULPs. Any other difference is a
-// different outline and not something to rewrite.
-bool CurveOnlyDifference(const uint8_t* a, const uint8_t* b, const size_t count)
-{
-    for (size_t i = 0; i < count; ++i) {
-        if (a[i] == b[i]) {
-            continue;
-        }
-        const bool curves = (a[i] == path_abi::kQuad || a[i] == path_abi::kCubic) &&
-                            (b[i] == path_abi::kQuad || b[i] == path_abi::kCubic);
-        if (!curves) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // One line per power of two, so a page says how many outlines came from
 // DirectWrite without a line per glyph.
 void Replaced(const uint16_t glyph, const float worst, const bool regrown)
@@ -2895,8 +2829,7 @@ bool ReplacePathData(void* path, const PathView& v, const std::vector<uint8_t>& 
 static bool SimulatesOblique(const skia_abi::Rec& rec, const std::vector<uint8_t>& font,
                              const uint32_t face_index)
 {
-    static const bool off = EnvDisables("DWC_OBLIQUE_SIM");
-    return !off && rec.pre_skew_x != 0.0f && font_facts::HasEbdt(font, face_index);
+    return rec.pre_skew_x != 0.0f && font_facts::HasEbdt(font, face_index);
 }
 
 // The subpixel position SkScalerContext_DW puts in the matrix before walking a
@@ -2935,11 +2868,8 @@ static skia_abi::Rec WithoutSkew(skia_abi::Rec rec)
 
 void OnChromiumPath(void* result, void* context, const void* glyph)
 {
-    static const bool enabled = !EnvDisables("DWC_DW_OUTLINE");
-    static const bool log = std::getenv("DWC_PATH_LOG") != nullptr;
-    static const bool realloc = !EnvDisables("DWC_PATH_REGROW");
     if (result == nullptr || context == nullptr || glyph == nullptr ||
-        !chromium_patch::ParityWanted() || !enabled) {
+        !chromium_patch::ParityWanted()) {
         return;
     }
     auto* out = static_cast<unsigned char*>(result);
@@ -3049,15 +2979,6 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
              .y = remaining.skew_y * p.x + remaining.scale_y * p.y};
     }
 
-    // Windows draws the glyph from DirectWrite's outline whatever the verbs
-    // are. A differing sequence falls through to the whole-path replacement,
-    // which carries its own, and the bounds check below holds either way.
-    if (log && (dw_verbs.size() != v.verb_count ||
-                !CurveOnlyDifference(dw_verbs.data(), v.verbs, v.verb_count))) {
-        Report("path: glyph %u verbs differ (%zu/%zu against %zu/%zu); replacing whole",
-               g.GlyphId(), dw_verbs.size(), dw_points.size(), v.verb_count, v.point_count);
-    }
-
     float bounds[4];
     PointBounds(dw_points.data(), dw_points.size(), bounds);
 
@@ -3073,10 +2994,6 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
             worst = std::max(worst, std::abs(dw_points[i].y - v.points[i].y));
         }
         if (worst > kMaxPointDelta) {
-            if (log) {
-                Report("path: glyph %u is %.3f px away from skrifa's; kept skrifa's",
-                       g.GlyphId(), static_cast<double>(worst));
-            }
             return;
         }
         std::memcpy(v.points, dw_points.data(), dw_points.size() * sizeof(path_abi::Point));
@@ -3093,13 +3010,6 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
     // the same length and the object cannot hold both. With no point to pair
     // off against, the two outlines are held to be the same glyph in the same
     // place by their bounds.
-    if (!realloc) {
-        if (log) {
-            Report("path: glyph %u needs %zu points where %zu fit; kept skrifa's", g.GlyphId(),
-                   dw_points.size(), v.point_count);
-        }
-        return;
-    }
     float worst = 0;
     // An empty incumbent has no bounds to compare.
     if (!substituted && v.point_count != 0) {
@@ -3109,17 +3019,10 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
             worst = std::max(worst, std::abs(bounds[i] - existing[i]));
         }
         if (worst > kMaxPointDelta) {
-            if (log) {
-                Report("path: glyph %u is %.3f px away from skrifa's; kept skrifa's", g.GlyphId(),
-                       static_cast<double>(worst));
-            }
             return;
         }
     }
     if (!ReplacePathData(out + path_abi::kGeneratedPath, v, dw_verbs, dw_points, bounds)) {
-        if (log) {
-            Report("path: glyph %u holds a listener, so its path stays skrifa's", g.GlyphId());
-        }
         return;
     }
     // The path is no longer the one the font would draw, which is what this
@@ -3135,8 +3038,6 @@ void OnChromiumPath(void* result, void* context, const void* glyph)
 // work runs after it, in OnChromiumMetrics.
 void OnChromiumMetricsPre(void* context, const void* glyph)
 {
-    static const bool trap = [] { InstallCrashTrap(); return true; }();
-    (void)trap;
     if (!g_patched.load(std::memory_order_acquire) || context == nullptr || glyph == nullptr) {
         return;
     }
@@ -3275,31 +3176,6 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         skia_abi::Read<uint8_t>(result, skia_abi::kMetricsMaskFormat);
     const auto metrics_bits =
         skia_abi::Read<uint16_t>(result, skia_abi::kMetricsExtraBits);
-    if (static const bool tell_bits = std::getenv("DWC_METRICS_LOG") != nullptr; tell_bits) {
-        static std::atomic<int> told{0};
-        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
-            Report("  box: glyph %u mask=%u bits=%u substituted=%d", g.GlyphId(),
-                   static_cast<unsigned>(metrics_mask), static_cast<unsigned>(metrics_bits),
-                   use != font.get() ? 1 : 0);
-        }
-    }
-    // A color glyph keeps the box the bounds walk measured, so that box and
-    // the subpixel position it was measured at are what say whether the walk
-    // saw the position at all.
-    if (static const bool tell_color = std::getenv("DWC_COLOR_BOX_LOG") != nullptr;
-        tell_color && metrics_mask == skia_abi::kARGB32) {
-        static std::atomic<int> told{0};
-        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
-            float box[4] = {};
-            std::memcpy(box, static_cast<const unsigned char*>(result) + skia_abi::kMetricsBounds,
-                        sizeof(box));
-            Report("  color box: glyph %u (%.4f %.4f %.4f %.4f) sub %.3f,%.3f size %.3f",
-                   g.GlyphId(), static_cast<double>(box[0]), static_cast<double>(box[1]),
-                   static_cast<double>(box[2]), static_cast<double>(box[3]),
-                   static_cast<double>(g.SubX()) / 4.0, static_cast<double>(g.SubY()) / 4.0,
-                   static_cast<double>(d.text_size_render));
-        }
-    }
     // A substituted face is asked for its box too, and it is the box that
     // decides where the mask is drawn.
     if (metrics_mask != skia_abi::kARGB32 &&
@@ -3311,22 +3187,6 @@ void OnChromiumMetrics(void* result, void* context, const void* glyph)
         bool got = dwrite_raster::GlyphBounds(face_key, *use, g, flat, d, d.rendering_mode,
                                               d.texture_type, &left, &top, &right, &bottom,
                                               face_index, simulate_bold, simulate_oblique);
-        static const bool tell = std::getenv("DWC_METRICS_LOG") != nullptr;
-        if (tell) {
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
-                Report("  bounds: glyph %u %s %d,%d,%d,%d mode=%s tex=%s size=%.3f "
-                       "skew=%.4f mask=%u flags=0x%x branch=%s gridfit=%d",
-                       g.GlyphId(), got ? "ok" : "declined", left, top, right, bottom,
-                       windows_path::RenderingModeName(d.rendering_mode),
-                       windows_path::TextureTypeName(d.texture_type),
-                       static_cast<double>(d.text_size_render),
-                       static_cast<double>(rec.pre_skew_x),
-                       static_cast<unsigned>(rec.mask_format),
-                       static_cast<unsigned>(rec.flags), d.branch,
-                       static_cast<int>(d.grid_fit_mode));
-            }
-        }
         // An empty rect is Skia's signal to ask for the aliased texture,
         // where a glyph too small for ClearType coverage still has a box.
         // generateMetrics skips the retry when it already asked for that one.
@@ -3577,13 +3437,6 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
         ColorGlyphPhase(rec, g, &phase_x, &phase_y, &sub_x, &sub_y);
         colr_outline::SetPhase(phase_x, phase_y, sub_x, sub_y);
         colr_outline::SetSource(face_key, use, face_index, d.text_size_render);
-        if (std::getenv("DWC_COLR_PHASE") != nullptr) {
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
-                Report("  colr glyph %u subx=%d suby=%d size=%.3f", g.GlyphId(), g.SubX(),
-                       g.SubY(), static_cast<double>(d.text_size_render));
-            }
-        }
     }
 
     const skia_abi::PreBlend preblend = skia_abi::PreBlend::From(context);
@@ -3599,47 +3452,6 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
         Report("%s glyph %u (%ux%u) mask=%u scaler=%u: %llu so far",
                drawn ? "DirectWrite drew" : "declined", g.GlyphId(), g.width, g.height,
                g.mask_format, g.scaler_bits, static_cast<unsigned long long>(seen));
-    }
-    // A picture of the first few masks, to show the bytes are a glyph and not
-    // a misaligned buffer.
-    if (drawn && std::getenv("CHROMIUM_PATCH_SHOW_MASK") != nullptr) {
-        static std::atomic<int> shown{0};
-        if (shown.fetch_add(1, std::memory_order_relaxed) < 2 &&
-            g.mask_format == skia_abi::kLCD16) {
-            Report("LCD mask for glyph %u (%ux%u), R/G/B per pixel:", g.GlyphId(), g.width,
-                   g.height);
-            const auto* px = static_cast<const uint16_t*>(image_buffer);
-            for (int row = 0; row < g.height; ++row) {
-                char line[200];
-                int at = 0;
-                for (int x = 0; x < g.width && at < 190; ++x) {
-                    const uint16_t v = px[static_cast<size_t>(row) * g.width + static_cast<size_t>(x)];
-                    const unsigned r = (v >> 11) & 0x1f;
-                    const unsigned gg = (v >> 5) & 0x3f;
-                    const unsigned b = v & 0x1f;
-                    // One hex digit each, so a color fringe shows as differing
-                    // digits within a pixel.
-                    at += std::snprintf(line + at, sizeof(line) - static_cast<size_t>(at),
-                                        "%x%x%x ", r >> 1, gg >> 2, b >> 1);
-                }
-                line[at] = '\0';
-                Report("  |%s|", line);
-            }
-        } else if (shown.load(std::memory_order_relaxed) <= 2 &&
-                   g.mask_format == skia_abi::kA8) {
-            Report("mask for glyph %u (%ux%u):", g.GlyphId(), g.width, g.height);
-            const auto* px = static_cast<const uint8_t*>(image_buffer);
-            for (int row = 0; row < g.height; ++row) {
-                char line[160];
-                int at = 0;
-                for (int x = 0; x < g.width && at < 150; ++x) {
-                    const uint8_t v = px[static_cast<size_t>(row) * g.width + static_cast<size_t>(x)];
-                    line[at++] = " .:-=+*#%@"[v * 9 / 255];
-                }
-                line[at] = '\0';
-                Report("  |%s|", line);
-            }
-        }
     }
     return drawn;
 }

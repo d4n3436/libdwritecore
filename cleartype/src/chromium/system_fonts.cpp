@@ -58,14 +58,6 @@ extern "C" void chromium_system_size_thunk();
 
 namespace {
 
-void Say(const char* what)
-{
-    if (std::getenv("DWC_SYSTEM_FONTS_LOG") == nullptr) {
-        return;
-    }
-    (void)std::fprintf(stderr, "chromium-patch: system fonts: %s\n", what);
-}
-
 // CSSValueID, from core/css/css_value_keywords.json5 in declaration order.
 // The system font keywords are kCaption through kStatusBar, which is the
 // range CSSParserFastPaths::IsValidSystemFont accepts.
@@ -486,10 +478,6 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
     // Linux size agrees with neither platform, so every step below refuses
     // unless the code it is about to overwrite matches byte for byte, and the
     // family is only written once the size calls have been.
-    if (const char* off = std::getenv("DWC_SYSTEM_FONTS");
-        off != nullptr && (std::strcmp(off, "0") == 0 || std::strcmp(off, "off") == 0)) {
-        return;
-    }
     Region text;
     Region rodata[8];
     unsigned rodata_count = 0;
@@ -512,11 +500,9 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
     }
     const unsigned char* arial = FindArial(rodata, rodata_count);
     if (arial == nullptr) {
-        Say("the default UI family name is not in the image");
         return;
     }
     if (!FindFamilyGetter(text, arial)) {
-        Say("no guarded getter builds the default UI family name");
         return;
     }
     const auto* getter = reinterpret_cast<const unsigned char*>(g_found.family);
@@ -527,36 +513,25 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
     const bool inlined = FindFamilySite(text, guard, atom);
     unsigned char* thunk = inlined ? nullptr : FindSystemFamilyThunk(text, getter);
     if (!inlined && thunk == nullptr) {
-        Say("the system font branch of the family converter is not recognized");
         return;
     }
     if (!FindSizeFunction(text)) {
-        Say("the system font size resolver is not recognized");
         return;
     }
     const auto* default_size = reinterpret_cast<const unsigned char*>(g_found.default_size);
     const unsigned char* stub = WriteSizeStub(text);
     if (stub == nullptr) {
-        Say("no room in the image for the size stub");
         return;
     }
     const unsigned retargeted = RetargetSizeCalls(text, default_size, stub);
     if (retargeted == 0) {
-        Say("no call to the default size follows the keyword arithmetic");
         return;
     }
     // Both or neither: a family without its size, or the other way round,
     // renders the keyword at a size that never went with it.
     if (!(inlined ? WriteFamilyCall(g_found.family_site) : WriteFamilyJump(thunk))) {
-        Say("the family branch would not open for writing");
         return;
     }
-    if (std::getenv("DWC_SYSTEM_FONTS_LOG") != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: system fonts: %u size calls retargeted\n",
-                           retargeted);
-    }
-    Say("menu, small-caption and status-bar now answer as Windows does");
 }
 
 }  // namespace system_fonts

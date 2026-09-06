@@ -61,23 +61,6 @@
 
 namespace {
 
-// NOLINTNEXTLINE(cert-dcl50-cpp)
-void Say(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-
-// NOLINTNEXTLINE(cert-dcl50-cpp)
-void Say(const char* fmt, ...)
-{
-    if (std::getenv("DWC_STATIC_FC_LOG") == nullptr) {
-        return;
-    }
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    (void)std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    (void)std::fprintf(stderr, "chromium-patch: static fontconfig: %s\n", buf);
-}
-
 // How many code points stand for a range when asking whether a family covers
 // it. Enough to tell a family that has the script from one holding a few
 // borrowed letters.
@@ -255,9 +238,6 @@ std::vector<std::string> TopoSort(const std::vector<std::string>& nodes,
             out.insert(out.end(), stuck.begin(), stuck.end());
             return out;
         }
-        Say("cycle: %s before %s dropped (%llu)", weakest->first.first.c_str(),
-            weakest->first.second.c_str(),
-            static_cast<unsigned long long>(weakest->second));
         edges.erase(weakest);
     }
 }
@@ -326,7 +306,6 @@ const std::vector<std::string>& Order()
             }
         }
         std::vector<std::string> sorted = TopoSort(have.families, std::move(edges));
-        Say("%zu families ordered", sorted.size());
         return sorted;
     }();
     return order;
@@ -512,7 +491,6 @@ std::string WeightRules()
         return {};
     }
     std::string out;
-    unsigned ruled = 0;
     for (const std::string& family : families) {
         // Only what the configuration offers. The names come from the host,
         // so a name carrying the one character XML reserves is skipped.
@@ -524,15 +502,9 @@ std::string WeightRules()
         // one keeps a real italic face.
         for (const auto& [style, slant] : {std::pair{0, 0}, std::pair{kStyleItalic, 100},
                                            std::pair{kStyleOblique, 110}}) {
-            if (std::string ranges = WeightRanges(family, style, slant); !ranges.empty()) {
-                out += ranges;
-                ++ruled;
-            } else {
-                Say("%s slant %d: no weight ranges", family.c_str(), slant);
-            }
+            out += WeightRanges(family, style, slant);
         }
     }
-    Say("%u weight rules over %zu families", ruled, families.size());
     return out;
 }
 
@@ -742,7 +714,6 @@ std::string RulesBlock()
             out += "</string></edit>\n";
         }
         out += "  </match>\n";
-        Say("lang %s answers Han with %s", row.tag, first);
     }
 
     out += "  <match target=\"pattern\">\n";
@@ -960,19 +931,9 @@ int ServeConfig()
             document = Document();
             g_building = false;
             if (!document.empty()) {
-                Say("pid %d serving %zu bytes for %s", getpid(), document.size(),
-                    ConfigPath().c_str());
                 // The order exists now, so the tags the hook names families by
                 // can be answered.
                 fallback_hook::Install();
-                // The order is worked out from what this machine has, so the
-                // only way to read it back is from the process that built it.
-                if (const char* to = std::getenv("DWC_STATIC_FC_DUMP"); to != nullptr) {
-                    if (FILE* f = std::fopen(to, "we"); f != nullptr) {
-                        (void)std::fwrite(document.data(), 1, document.size(), f);
-                        (void)std::fclose(f);
-                    }
-                }
             }
         }
     }

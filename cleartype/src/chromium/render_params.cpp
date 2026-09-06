@@ -36,7 +36,6 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
     auto* bytes = static_cast<unsigned char*>(rec);
     auto mask_format = skia_abi::Read<uint8_t>(bytes, skia_abi::kRecMaskFormat);
     auto flags = skia_abi::Read<uint16_t>(bytes, skia_abi::kRecFlags);
-    const uint8_t arrived_mask = mask_format;
 
     // kGenA8FromLCD says the surface cannot show subpixel text at all, and
     // Windows does not override it either. MakeRecAndEffects also sets it for
@@ -50,10 +49,6 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
     // grayscale, on both platforms, so Windows measures that glyph through
     // DWRITE_TEXTURE_ALIASED_1x1 and promoting it back to LCD16 here would add
     // the ClearType 3x1 texture's one pixel of padding on each side.
-    static const bool paths_off = [] {
-        const char* v = std::getenv("DWC_AS_PATHS");
-        return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
-    }();
     // The size is what names that strike. setupForAsPaths pins it to the
     // canonical 64 and folds the real size into the matrix, so a rec at any
     // other size never came from it. Hinting none does not name it on its own:
@@ -62,7 +57,6 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
     // still wants the ClearType mask Windows fills.
     const auto rec_text_size = skia_abi::Read<float>(bytes, skia_abi::kRecTextSize);
     const bool as_paths =
-        !paths_off &&
         rec_text_size == static_cast<float>(skia_abi::kCanonicalTextSizeForPaths) &&
         ((flags_before_filter & skia_abi::kHintingMask) >> skia_abi::kHintingShift) ==
             skia_abi::kHintingNone &&
@@ -153,14 +147,6 @@ void ApplyWindowsParams(void* rec, const uint16_t flags_before_filter,
     std::memcpy(bytes + skia_abi::kRecMaskFormat, &mask_format, sizeof(mask_format));
     std::memcpy(bytes + skia_abi::kRecFlags, &flags, sizeof(flags));
 
-    if (static const bool log = std::getenv("DWC_REC_LOG") != nullptr; log) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: rec: size %.2f mask %u flags %#x -> "
-                           "mask %u flags %#x plain=%d\n",
-                           static_cast<double>(text_size), arrived_mask,
-                           flags_before_filter, mask_format, flags,
-                           plain_fontations ? 1 : 0);
-    }
 }
 
 namespace {
@@ -353,10 +339,6 @@ uintptr_t FunctionHolding(const Image& image, const std::vector<uintptr_t>& star
 void AnswerTheQuery(const Image& image, const std::vector<uintptr_t>& starts,
                     const uintptr_t base)
 {
-    if (const char* off = std::getenv("DWC_SCALE_PARAMS");
-        off != nullptr && (std::strcmp(off, "0") == 0 || std::strcmp(off, "off") == 0)) {
-        return;
-    }
     std::vector<std::pair<uintptr_t, unsigned>> named;
     FindStrings(image, kQueryName, 0, &named);
     uintptr_t site = 0;
@@ -375,13 +357,6 @@ void AnswerTheQuery(const Image& image, const std::vector<uintptr_t>& starts,
     const uintptr_t entry = FunctionHolding(image, starts, site);
     if (entry == 0) {
         Say("no function start below the name the query traces itself under");
-        return;
-    }
-    if (std::getenv("CHROMIUM_PATCH_DRYRUN") != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: render params: would take over the calls to "
-                           "GetFontRenderParams +%#lx\n",
-                           entry - base);
         return;
     }
     g_query = reinterpret_cast<QueryFn>(entry);
@@ -535,14 +510,6 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
         return;
     }
 
-    // Reported as an offset, to be checked against a disassembly on disk.
-    if (std::getenv("CHROMIUM_PATCH_DRYRUN") != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: render params: would replace +%#lx, "
-                           "runner-up reads %d\n",
-                           best - base, second_n);
-        return;
-    }
     const char* why = nullptr;
     if (code_patch::WriteDetour(reinterpret_cast<void*>(best),
                                 reinterpret_cast<void*>(&ChromiumFontRenderParams), &why)) {

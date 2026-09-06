@@ -276,15 +276,6 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
         values.push_back({.axisTag = static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(c.axis)),
                           .value = c.value});
     }
-    if (std::getenv("DWC_VAR_LOG") != nullptr) {
-        (void)std::fprintf(stderr, "chromium-patch: var [%d]: passing:", getpid());
-        for (const DWRITE_FONT_AXIS_VALUE& v : values) {
-            const uint32_t t = __builtin_bswap32(v.axisTag);
-            (void)std::fprintf(stderr, " %c%c%c%c=%g", t >> 24, (t >> 16) & 0xff,
-                               (t >> 8) & 0xff, t & 0xff, static_cast<double>(v.value));
-        }
-        (void)std::fprintf(stderr, "\n");
-    }
     IDWriteFontFace5* varied = nullptr;
     const HRESULT hr = resource->CreateFontFace(
         sims, values.data(), static_cast<UINT32>(values.size()), &varied);

@@ -162,13 +162,6 @@ int DWriteWantsUpright(const char* family, const int weight, const int style)
         dwrite_raster::FamilyMatchFace(family, weight, style, &got_weight, &got_italic)
             ? (got_italic ? 0 : 1)
             : -1;
-    if (std::getenv("DWC_FAMILY_MATCH_LOG") != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: family match: dwrite %s at %d style %d -> "
-                           "weight %d %s (upright=%d)\n",
-                           family, weight, style, got_weight,
-                           got_italic ? "italic" : "upright", upright);
-    }
     if (count < std::size(seen) &&
         std::strlen(family) < sizeof(seen[0].family)) {
         (void)std::snprintf(seen[count].family, sizeof(seen[count].family), "%s", family);
@@ -312,16 +305,6 @@ void ReorderForWindows(const void* pattern, void* sorted)
     // first, which is the common case.
     if (winner <= 0) {
         return;
-    }
-    if (std::getenv("DWC_FAMILY_MATCH_LOG") != nullptr) {
-        unsigned char* was = nullptr;
-        unsigned char* now = nullptr;
-        get_string(set->fonts[0], "file", 0, &was);
-        get_string(set->fonts[winner], "file", 0, &now);
-        (void)std::fprintf(stderr, "[family_match] %s fc_weight=%d wanted=%.1f  %s -> %s\n",
-                     family, fc_weight, static_cast<double>(wanted),
-                     was ? reinterpret_cast<const char*>(was) : "?",
-                     now ? reinterpret_cast<const char*>(now) : "?");
     }
     void* chosen = set->fonts[winner];
     for (int i = winner; i > 0; --i) {

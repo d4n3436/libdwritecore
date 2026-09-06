@@ -299,12 +299,6 @@ void Mint(unsigned char* bytes, const size_t length, const size_t count,
                 g_learned[g_learned_count++] = {.pref = pref, .resource = id};
             }
         }
-        if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
-            (void)std::fprintf(stderr,
-                               "chromium-patch: generic families: resource %u "
-                               "minted as %s (%s)\n",
-                               id, wanted[i]->windows, wanted[i]->prefs[0]);
-        }
     }
     // The sentinel keeps its id and holds the end of the data.
     WriteU16(out + (count + want) * kEntrySize, ReadU16(table + count * kEntrySize));
@@ -366,13 +360,6 @@ unsigned PatchBundle(void* base, const size_t length)
             std::memset(bytes + start + wanted, ',', size - wanted);
             if (shrunk_count < kShrunkMax) {
                 shrunk[shrunk_count++] = {.entry = i, .size = static_cast<uint32_t>(wanted)};
-            }
-            if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
-                (void)std::fprintf(stderr,
-                                   "chromium-patch: generic families: resource "
-                                   "%u now %s (%s)\n",
-                                   ReadU16(entry), s.windows,
-                                   s.prefs[0] != nullptr ? s.prefs[0] : "-");
             }
             for (const char* pref : s.prefs) {
                 if (pref != nullptr && g_learned_count < kLearnedMax) {
@@ -766,15 +753,6 @@ bool IsBrowserProcess()
     return n > 0;
 }
 
-void Note(const char* what, const char* which)
-{
-    static const bool on = std::getenv("DWC_GENERIC_LOG") != nullptr;
-    if (on) {
-        (void)std::fprintf(stderr, "chromium-patch: generic families: %s %s\n",
-                           what, which);
-    }
-}
-
 // Hands the spare rows to the scripts Windows covers that this build does not.
 // Runs after every bundle patch, because the resources arrive one pack at a
 // time and a row can only be written once its resource has been seen; a row
@@ -882,31 +860,14 @@ void PatchFontDefaults()
         std::memset(at + sizeof(pref) + sizeof(id), 0,
                     kRowSize - sizeof(pref) - sizeof(id));
         ++rows;
-        Note("row written for", wanted);
     }
 
     if (!pointed) {
         pointed = PointLoopAt(first, end, table, rows);
-        if (!pointed) {
-            Note("the loop that reads the table could not be repointed, so the "
-                 "added rows go", "unread");
-        }
     } else {
         MoveLoopEnd(table + rows * kRowSize);
     }
 
-    if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
-        for (unsigned i = 0; i < rows; ++i) {
-            const char* held = nullptr;
-            std::memcpy(static_cast<void*>(&held), table + i * kRowSize, sizeof(held));
-            int id = 0;
-            std::memcpy(&id, table + i * kRowSize + sizeof(held), sizeof(id));
-            (void)std::fprintf(stderr,
-                               "chromium-patch: generic families: pid %d row "
-                               "%s -> %d\n",
-                               getpid(), held != nullptr ? held : "?", id);
-        }
-    }
 }
 
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);

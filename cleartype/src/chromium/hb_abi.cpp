@@ -339,13 +339,6 @@ Table& Symbols()
     return table;
 }
 
-void Say(const char* what)
-{
-    if (std::getenv("DWC_BOLD_SHAPING_LOG") != nullptr) {
-        (void)std::fprintf(stderr, "chromium-patch: bold shaping: %s\n", what);
-    }
-}
-
 }  // namespace
 
 void ResolveAtLoad()
@@ -355,22 +348,15 @@ void ResolveAtLoad()
     }
     g_resolved = true;
 
-    // Forces the compiled-in route on a build that links HarfBuzz shared,
-    // which exercises the replacement against the interposed one. Only Blink's
-    // call site differs between them.
-    const bool as_static = std::getenv("DWC_BOLD_SHAPING_STATIC") != nullptr;
-
     // The executable's own imports decide this, not the global scope. Other
     // libraries in the process carry HarfBuzz for their own drawing, and
     // interposing for one of those reaches none of Blink's shaping while
     // handing this library hb_font_t objects from a HarfBuzz whose layout it
     // never probed.
-    if (!as_static && ImageImports(kWitness) &&
+    if (ImageImports(kWitness) &&
         (dlsym(RTLD_NEXT, kWitness) != nullptr ||
          (Beside() != nullptr && dlsym(Beside(), kWitness) != nullptr))) {
         g_where = Linkage::kInterposable;
-        Say("HarfBuzz is a shared library, so the interposed entry points are "
-            "the ones Blink calls");
         return;
     }
 
@@ -380,8 +366,6 @@ void ResolveAtLoad()
     Symbols() = Collect("hb_", true);
     if (Symbols().contains(kWitness)) {
         g_where = Linkage::kInImage;
-        Say("HarfBuzz is compiled into the binary and its symbol table names "
-            "it, so hb_shape is replaced where it stands");
         return;
     }
 
@@ -398,14 +382,10 @@ void ResolveAtLoad()
         (void)std::snprintf(line, sizeof(line),
                             "HarfBuzz is compiled into %s and its symbol table names it, "
                             "so hb_shape is replaced where it stands", library.c_str());
-        Say(line);
         return;
     }
 
     g_where = Linkage::kAbsent;
-    Say("HarfBuzz is compiled into the binary and stripped of its names, so "
-        "shaping cannot be reached; a bold fallback run keeps the regular "
-        "face's positioning");
 }
 
 bool ExecutableImports(const char* symbol)

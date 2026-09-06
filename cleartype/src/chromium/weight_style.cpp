@@ -122,14 +122,6 @@ bool Replacement(const void* font_ref, const void* coords, FontStyle* style)
     const bool ok = g_original(font_ref, coords, style);
     if (ok && style != nullptr && style->weight == kRegular) {
         style->weight = kReported;
-        static int said = 0;
-        if (said < 4 && std::getenv("DWC_WEIGHT_LOG") != nullptr) {
-            ++said;
-            (void)std::fprintf(stderr,
-                               "chromium-patch: weight style [%d]: regular face #%d now "
-                               "reports %d\n",
-                               getpid(), said, kReported);
-        }
     }
     return ok;
 }
@@ -138,8 +130,7 @@ bool Replacement(const void* font_ref, const void* coords, FontStyle* style)
 
 void InstallAtLoad()
 {
-    if (!chromium_patch::ParityWanted() ||
-        dwcft::IsOffValue(std::getenv("DWC_WEIGHT_600"))) {
+    if (!chromium_patch::ParityWanted()) {
         return;
     }
     void* entry = nullptr;
@@ -151,11 +142,6 @@ void InstallAtLoad()
         }
     }
     if (entry == nullptr) {
-        if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
-            (void)std::fprintf(stderr,
-                               "chromium-patch: weight style [%d]: no %s in this process\n",
-                               getpid(), kEntryTail);
-        }
         return;
     }
     const code_patch::TextSpan image = code_patch::TextHolding(entry);
@@ -168,23 +154,13 @@ void InstallAtLoad()
         reinterpret_cast<void*>(&Replacement));
     if (moved == 0) {
         g_original = nullptr;
-        if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
-            (void)std::fprintf(stderr,
-                               "chromium-patch: weight style [%d]: no call site for %p\n",
-                               getpid(), entry);
-        }
         return;
-    }
-    if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
-        (void)std::fprintf(stderr, "chromium-patch: weight style [%d]: %u call site(s)\n",
-                           getpid(), moved);
     }
 }
 
 void InstallFontconfig()
 {
-    if (!chromium_patch::ParityWanted() ||
-        dwcft::IsOffValue(std::getenv("DWC_WEIGHT_600"))) {
+    if (!chromium_patch::ParityWanted()) {
         return;
     }
     const auto found = hb_abi::SymbolsWithPrefix("FcPattern");
@@ -219,12 +195,6 @@ void InstallFontconfig()
     if (moved == 0) {
         g_fc_integer = nullptr;
         return;
-    }
-    if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: weight style [%d]: fontconfig weight, %u call "
-                           "site(s)\n",
-                           getpid(), moved);
     }
 }
 

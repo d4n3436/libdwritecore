@@ -918,27 +918,6 @@ void Remember(const void* charset, const char* family)
     ++g_known_count;
 }
 
-// Names a Han list for the log.
-const char* HanName(const char* const* h)
-{
-    if (h == kKatakanaOrHiragana) { return "kana"; }
-    if (h == kHangul) { return "hangul"; }
-    if (h == kSimplifiedHan) { return "simplified"; }
-    if (h == kTraditionalHan) { return "traditional"; }
-    return h == nullptr ? "none" : "other";
-}
-
-// One line per decision in the CJK range, under DWC_FALLBACK_LOG.
-void LogPick(unsigned codepoint, const char* stage, const char* family)
-{
-    if (std::getenv("DWC_FALLBACK_LOG") == nullptr || codepoint < 0x3100 ||
-        codepoint > 0xFFFF) {
-        return;
-    }
-    (void)std::fprintf(stderr, "chromium-patch: fallback: pid=%d U+%04X %s -> %s\n",
-                       static_cast<int>(getpid()), codepoint, stage, family);
-}
-
 const char* FamilyOf(const void* charset)
 {
     for (unsigned i = 0; i < g_known_count; ++i) {
@@ -1075,17 +1054,6 @@ void OrderForHan(const void* pattern, FcFontSet* set)
         }
         front = MoveToFront(set, row.family, front);
     }
-    if (std::getenv("DWC_FALLBACK_LOG") != nullptr) {
-        unsigned char* first = nullptr;
-        (void)get_string(set->fonts[0], "family", 0, &first);
-        (void)std::fprintf(stderr,
-                           "chromium-patch: fallback: order lang=%s han=%s, %d of %d "
-                           "moved, now %s\n",
-                           locale != nullptr ? locale : "(none)", HanName(han), front,
-                           set->nfont,
-                           first != nullptr ? reinterpret_cast<const char*>(first)
-                                            : "(unnamed)");
-    }
 }
 
 const void* CharSetOfFamily(const char* family)
@@ -1194,7 +1162,6 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         if (real(candidate, codepoint) == 0) {
             break;              // installed but does not cover it
         }
-        LogPick(codepoint, "script", script.families[i]);
         return HasFamily(charset, script.families[i]) ? 1 : 0;
     }
     // No script font covers it, so Windows walks its last-resort list, which is
@@ -1214,7 +1181,6 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
             candidate == nullptr || real(candidate, codepoint) == 0) {
             continue;
         }
-        LogPick(codepoint, "last", name);
         return HasFamily(charset, name) ? 1 : 0;
     }
     // Nothing hardcoded covers it, which is where Windows falls through to
@@ -1230,11 +1196,9 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
         if (candidate == nullptr || real(candidate, codepoint) == 0) {
             break;              // not installed here, or does not cover it
         }
-        LogPick(codepoint, "dwrite", row.family);
         return HasFamily(charset, row.family) ? 1 : 0;
     }
     // No row for it, so fontconfig keeps the answer.
-    LogPick(codepoint, "none", "(fontconfig)");
     return answer;              // none of them, so leave fontconfig's answer
 }
 

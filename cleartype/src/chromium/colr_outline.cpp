@@ -73,16 +73,6 @@ using DrawFn = bool (*)(const void*, const void*, uint16_t, void*);
 using FillGlyphRadialFn = void (*)(void*, uint16_t, const Transform*, const RadialParams*, void*,
                                    uint8_t);
 
-// fontations_ffi::ColorStop, and the two bridge calls that walk them. Walking
-// consumes the iterator, so this only runs under DWC_COLR_STOPS, where the
-// glyph that is drawn afterwards is not the point.
-struct ColorStop
-{
-    float stop;
-    uint16_t palette_index;
-    float alpha;
-};
-
 // fontations_ffi::ClipBox, the glyph's COLRv1 bounding box in the size asked
 // for.
 struct ClipBox
@@ -103,12 +93,6 @@ using FillGlyphLinearFn = void (*)(void*, uint16_t, const Transform*, const void
                                    uint8_t);
 using PushClipGlyphFn = void (*)(void*, uint16_t);
 using FillParamsFn = void (*)(void*, const void*, void*, uint8_t);
-
-using NextStopFn = bool (*)(void*, ColorStop*);
-using NumStopsFn = size_t (*)(const void*);
-
-NextStopFn g_next_stop = nullptr;
-NumStopsFn g_num_stops = nullptr;
 
 DrawFn g_draw = nullptr;
 ClipBoxFn g_clip_box = nullptr;
@@ -243,15 +227,6 @@ uint16_t UnitsPerEm(const std::vector<uint8_t>& font, const uint32_t face_index)
     return 0;
 }
 
-void Say(const char* what, const unsigned long value)
-{
-    if (std::getenv("DWC_COLR_LOG") == nullptr) {
-        return;
-    }
-    (void)std::fprintf(stderr, "chromium-patch: colr outline [%d]: %s %lu\n", getpid(), what,
-                       value);
-}
-
 // Put DWriteCore's outline into the two vectors, in the units the caller asked
 // for. SkScalerContext_DW takes the layer outline at the render size and
 // divides that back out, so the same outline scaled by upem/size is what its
@@ -275,14 +250,7 @@ bool Substitute(const uint16_t glyph, void* verbs, void* points)
     // on the float values Windows draws, since a power-of-two em makes the
     // upem factor exact.
     const float to_em = 1.0f / s.render_size;
-    float upem = static_cast<float>(s.upem);
-    if (const char* k = std::getenv("DWC_COLR_SCALE"); k != nullptr) {
-        char* end = nullptr;
-        const double scale = std::strtod(k, &end);
-        if (end != k) {
-            upem *= static_cast<float>(scale);
-        }
-    }
+    const float upem = static_cast<float>(s.upem);
     for (path_abi::Point& p : dw_points) {
         p.x = p.x * to_em * upem;
         p.y = p.y * to_em * upem;
@@ -317,101 +285,10 @@ bool Replacement(const void* outlines, const uint16_t glyph, const float size, c
     // A color layer is the only thing asked for at units per em; every other
     // path comes through at the render size and already carries DirectWrite's
     // outline, swapped in at the SkPath by the raster hook.
-    if (ok && t_source.upem != 0 && size == static_cast<float>(t_source.upem) &&
-        !dwcft::IsOffValue(std::getenv("DWC_COLR_OUTLINE"))) {
-        const bool swapped = Substitute(glyph, verbs, points);
-        {
-            static uint16_t seen_ids[32] = {};
-            static int seen_n = 0;
-            bool fresh_id = true;
-            for (int i = 0; i < seen_n; ++i) {
-                if (seen_ids[i] == glyph) { fresh_id = false; break; }
-            }
-            if (fresh_id && seen_n < 32 && std::getenv("DWC_COLR_LOG") != nullptr) {
-                seen_ids[seen_n] = glyph;
-                ++seen_n;
-                (void)std::fprintf(stderr,
-                                   "chromium-patch: colr outline [%d]: layer glyph %u -> %s\n",
-                                   getpid(), glyph, swapped ? "swapped" : "KEPT");
-            }
-        }
-        static int told = 0;
-        if (told < 8 && std::getenv("DWC_COLR_LOG") != nullptr) {
-            ++told;
-            (void)std::fprintf(stderr,
-                               "chromium-patch: colr outline [%d]: layer %u at upem %.0f "
-                               "render %.3f -> %s\n",
-                               getpid(), glyph, static_cast<double>(size),
-                               static_cast<double>(t_source.render_size),
-                               swapped ? "swapped" : "kept");
-        }
-    }
-    if (std::getenv("DWC_COLR_LOG") != nullptr) {
-        static int said = 0;
-        static float seen[16] = {};
-        static int seen_count = 0;
-        bool fresh = true;
-        for (int i = 0; i < seen_count; ++i) {
-            if (seen[i] == size) { fresh = false; break; }
-        }
-        if (fresh && seen_count < 16) { seen[seen_count++] = size; }
-        if (fresh && said < 16) {
-            ++said;
-            (void)std::fprintf(stderr,
-                               "chromium-patch: colr outline [%d]: glyph %u at size %.3f -> %s\n",
-                               getpid(), glyph, static_cast<double>(size), ok ? "ok" : "no");
-        }
+    if (ok && t_source.upem != 0 && size == static_cast<float>(t_source.upem)) {
+        (void)Substitute(glyph, verbs, points);
     }
     return ok;
-}
-
-// A layer is the glyph plus its outer radius, since one glyph carries several
-// gradients. Keeps a page of one emoji to one line per layer.
-bool FirstTimeSeen(const uint16_t glyph, const float radius)
-{
-    static uint64_t seen[32] = {};
-    static int count = 0;
-    uint32_t bits = 0;
-    std::memcpy(&bits, &radius, sizeof(bits));
-    const uint64_t key = (static_cast<uint64_t>(glyph) << 32) | bits;
-    for (int i = 0; i < count; ++i) {
-        if (seen[i] == key) {
-            return false;
-        }
-    }
-    if (count < 32) {
-        seen[count++] = key;
-    }
-    return true;
-}
-
-void SayRadial(const uint16_t glyph, const Transform& t, const RadialParams& r)
-{
-    (void)std::fprintf(stderr,
-                       "chromium-patch: colr paint [%d]: glyph %u radial "
-                       "c0=(%.6f,%.6f) r0=%.6f c1=(%.6f,%.6f) r1=%.6f "
-                       "xform=[%.6f %.6f %.6f %.6f %.6f %.6f]\n",
-                       getpid(), glyph, static_cast<double>(r.x0), static_cast<double>(r.y0),
-                       static_cast<double>(r.r0), static_cast<double>(r.x1),
-                       static_cast<double>(r.y1), static_cast<double>(r.r1),
-                       static_cast<double>(t.xx), static_cast<double>(t.xy),
-                       static_cast<double>(t.yx), static_cast<double>(t.yy),
-                       static_cast<double>(t.dx), static_cast<double>(t.dy));
-}
-
-void SayStops(const uint16_t glyph, void* stops)
-{
-    if (g_next_stop == nullptr || stops == nullptr) {
-        return;
-    }
-    (void)std::fprintf(stderr, "chromium-patch: colr stops [%d]: glyph %u, %zu stops:", getpid(),
-                       glyph, g_num_stops != nullptr ? g_num_stops(stops) : 0);
-    ColorStop stop{};
-    for (int i = 0; i < 16 && g_next_stop(stops, &stop); ++i) {
-        (void)std::fprintf(stderr, "  %.6f/pal%u/a%.6f", static_cast<double>(stop.stop),
-                           stop.palette_index, static_cast<double>(stop.alpha));
-    }
-    (void)std::fprintf(stderr, "\n");
 }
 
 // SkScalerContext_DW::drawColorV1Image draws every layer as a clip on the
@@ -426,11 +303,10 @@ void SayStops(const uint16_t glyph, void* stops)
 // Bounds mode keeps the original call, which joins the same box either way.
 bool SplitFills(void* self)
 {
-    static const bool split_off = dwcft::IsOffValue(std::getenv("DWC_COLR_FILLCLIP"));
     // Only for glyphs the parity path owns. A COLRv1 web font renders through
     // plain Fontations on Windows too, and its shortcut fills stay whole
     // there, so a walk with no source set keeps the painter untouched.
-    if (split_off || self == nullptr || t_source.upem == 0) {
+    if (self == nullptr || t_source.upem == 0) {
         return false;
     }
     auto** vtable = *static_cast<void***>(self);
@@ -445,16 +321,6 @@ void FillGlyphRadialHook(void* self, const uint16_t glyph, const Transform* tran
         return;
     }
 
-    static const bool say = std::getenv("DWC_COLR_PAINT") != nullptr;
-    // Walking the stops consumes the iterator, so the layer this call was about
-    // draws empty. Only under DWC_COLR_STOPS, where that is the point.
-    static const bool say_stops = std::getenv("DWC_COLR_STOPS") != nullptr;
-    if (say && transform != nullptr && params != nullptr && FirstTimeSeen(glyph, params->r1)) {
-        SayRadial(glyph, *transform, *params);
-        if (say_stops) {
-            SayStops(glyph, stops);
-        }
-    }
     if (transform != nullptr && SplitFills(self)) {
         ops->push_clip_glyph(self, glyph);
         ops->push_transform(self, transform);
@@ -485,39 +351,6 @@ void FillGlyphSweepHook(void* self, const uint16_t glyph, const Transform* t, co
     ops->fill_glyph_sweep(self, glyph, t, params, stops, extend);
 }
 
-int g_depth = 0;
-
-void PushTransformHook(void* self, const Transform* t)
-{
-    const PainterOps* ops = OpsFor(self);
-    if (ops == nullptr) {
-        return;
-    }
-
-    if (t != nullptr && g_depth < 24) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: colr xform [%d]: depth %d [%.6f %.6f %.6f %.6f "
-                           "%.6f %.6f]\n",
-                           getpid(), g_depth, static_cast<double>(t->xx),
-                           static_cast<double>(t->xy), static_cast<double>(t->yx),
-                           static_cast<double>(t->yy), static_cast<double>(t->dx),
-                           static_cast<double>(t->dy));
-    }
-    ++g_depth;
-    ops->push_transform(self, t);
-}
-
-void PopTransformHook(void* self)
-{
-    const PainterOps* ops = OpsFor(self);
-    if (ops == nullptr) {
-        return;
-    }
-
-    --g_depth;
-    ops->pop_transform(self);
-}
-
 void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, const void* params,
                          void* stops, const uint8_t extend)
 {
@@ -526,18 +359,6 @@ void FillGlyphLinearHook(void* self, const uint16_t glyph, const Transform* t, c
         return;
     }
 
-    static const bool say = std::getenv("DWC_COLR_XFORM") != nullptr;
-    if (const auto* p = static_cast<const float*>(params); say && t != nullptr && p != nullptr) {
-        (void)std::fprintf(stderr,
-                           "chromium-patch: colr linear [%d]: glyph %u p0=(%.4f,%.4f) "
-                           "p1=(%.4f,%.4f) p2=(%.4f,%.4f) xform=[%.6f %.6f %.6f %.6f %.6f %.6f]\n",
-                           getpid(), glyph, static_cast<double>(p[0]), static_cast<double>(p[1]),
-                           static_cast<double>(p[2]), static_cast<double>(p[3]),
-                           static_cast<double>(p[4]), static_cast<double>(p[5]),
-                           static_cast<double>(t->xx), static_cast<double>(t->xy),
-                           static_cast<double>(t->yx), static_cast<double>(t->yy),
-                           static_cast<double>(t->dx), static_cast<double>(t->dy));
-    }
     if (t != nullptr && SplitFills(self)) {
         ops->push_clip_glyph(self, glyph);
         ops->push_transform(self, t);
@@ -577,8 +398,7 @@ void PushClipRectangleHook(void* self, float x_min, float y_min, float x_max, fl
         return;
     }
 
-    static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
-    if (!clip_off && t_source.upem != 0 && t_source.render_size > 0) {
+    if (t_source.upem != 0 && t_source.render_size > 0) {
         auto** vtable = *static_cast<void***>(self);
         if (!reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode])(self)) {
             const float s = t_source.render_size / static_cast<float>(t_source.upem);
@@ -615,9 +435,7 @@ bool ClipBoxReplacement(const void* font_ref, const void* coords, const uint16_t
                         const float size, ClipBox* out)
 {
     const bool ok = g_clip_box(font_ref, coords, glyph, size, out);
-    static const bool phase_off = dwcft::IsOffValue(std::getenv("DWC_COLR_SUBPIXEL")) ||
-                                  dwcft::IsOffValue(std::getenv("DWC_COLR_BOXPHASE"));
-    if (!ok || out == nullptr || phase_off ||
+    if (!ok || out == nullptr ||
         (t_source.phase_x == 0.0f && t_source.phase_y == 0.0f)) {
         return ok;
     }
@@ -685,13 +503,8 @@ void PatchPainter(void* painter)
     vtable[kPushClipRectangle] = reinterpret_cast<void*>(&PushClipRectangleHook);
     vtable[kFillGlyphLinear] = reinterpret_cast<void*>(&FillGlyphLinearHook);
     vtable[kFillGlyphSweep] = reinterpret_cast<void*>(&FillGlyphSweepHook);
-    if (std::getenv("DWC_COLR_XFORM") != nullptr) {
-        vtable[kPushTransform] = reinterpret_cast<void*>(&PushTransformHook);
-        vtable[kPopTransform] = reinterpret_cast<void*>(&PopTransformHook);
-    }
     (void)mprotect(base, static_cast<size_t>(page) * 2, PROT_READ);
     ops.ready.store(true, std::memory_order_release);
-    Say("painter vtable patched, fill_glyph_radial slot", kFillGlyphRadial);
 }
 
 // Push the glyph's subpixel position as a transform over the whole walk, which
@@ -738,30 +551,15 @@ void PopPhase(void* painter)
 bool DrawReplacement(const void* font_ref, const void* coords, const uint16_t glyph, void* painter)
 {
     PatchPainter(painter);
-    static const bool clip_off = dwcft::IsOffValue(std::getenv("DWC_COLR_CLIP"));
-    static const bool phase_off = dwcft::IsOffValue(std::getenv("DWC_COLR_SUBPIXEL"));
-    const bool phased = !phase_off && painter != nullptr && PushPhase(painter);
+    const bool phased = painter != nullptr && PushPhase(painter);
     t_phased = phased;
     ClipBox box{};
-    if (!clip_off && g_clip_box != nullptr && painter != nullptr && t_source.upem != 0 &&
+    if (g_clip_box != nullptr && painter != nullptr && t_source.upem != 0 &&
         t_source.render_size > 0) {
         auto** vtable = *static_cast<void***>(painter);
         const auto bounds_mode = reinterpret_cast<IsBoundsModeFn>(vtable[kIsBoundsMode]);
         if (!bounds_mode(painter) &&
             g_clip_box(font_ref, coords, glyph, static_cast<float>(t_source.upem), &box)) {
-            if (std::getenv("DWC_COLR_CLIPLOG") != nullptr) {
-                static std::atomic told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) < 4) {
-                    (void)std::fprintf(stderr,
-                                       "chromium-patch: colr clip [%d]: glyph %u upem %u box "
-                                       "(%.3f %.3f %.3f %.3f)\n",
-                                       getpid(), glyph, t_source.upem,
-                                       static_cast<double>(box.x_min),
-                                       static_cast<double>(box.y_min),
-                                       static_cast<double>(box.x_max),
-                                       static_cast<double>(box.y_max));
-                }
-            }
             const auto push = reinterpret_cast<PushClipRectFn>(vtable[kPushClipRectangle]);
             const auto pop = reinterpret_cast<PopClipFn>(vtable[kPopClip]);
             // Windows clips with SkCanvas::clipRect's default, which is not
@@ -833,14 +631,12 @@ void InstallAtLoad()
             name.compare(name.size() - (sizeof(kEntryTail) - 1), sizeof(kEntryTail) - 1,
                          kEntryTail) == 0) {
             if (entry != nullptr && entry != address) {
-                Say("the bridge entry point is not unique, count", 2);
                 return;
             }
             entry = address;
         }
     }
     if (entry == nullptr) {
-        Say("no fontations bridge in this process, address", 0);
         return;
     }
     void* draw = nullptr;
@@ -863,7 +659,6 @@ void InstallAtLoad()
         if (drew == 0) {
             g_draw = nullptr;
         }
-        Say("draw_colr_glyph call sites rewritten", drew);
     }
     g_original = reinterpret_cast<PathFn>(entry);
     const unsigned moved = code_patch::RedirectCalls(
@@ -871,24 +666,17 @@ void InstallAtLoad()
         reinterpret_cast<void*>(&Replacement));
     if (moved == 0) {
         g_original = nullptr;
-        Say("no call site was rewritten, entry", reinterpret_cast<uintptr_t>(entry));
         return;
     }
     for (const auto& [name, address] : hb_abi::SymbolsWithPrefix(kBridgePrefix)) {
         if (name.size() > 19 && name.compare(name.size() - 19, 19, "get_colrv1_clip_box") == 0) {
             g_clip_box = reinterpret_cast<ClipBoxFn>(address);
-        } else if (name.size() > 15 &&
-                   name.compare(name.size() - 15, 15, "next_color_stop") == 0) {
-            g_next_stop = reinterpret_cast<NextStopFn>(address);
-        } else if (name.size() > 15 && name.compare(name.size() - 15, 15, "num_color_stops") == 0) {
-            g_num_stops = reinterpret_cast<NumStopsFn>(address);
         }
     }
     if (g_clip_box != nullptr) {
-        const unsigned boxed = code_patch::RedirectCalls(
+        (void)code_patch::RedirectCalls(
             image.text, image.size, reinterpret_cast<const unsigned char*>(g_clip_box),
             reinterpret_cast<void*>(&ClipBoxReplacement));
-        Say("get_colrv1_clip_box call sites rewritten", boxed);
     }
 
     // The vector shims, one set per element type.
@@ -919,8 +707,6 @@ void InstallAtLoad()
     if (g_points.data == nullptr) {
         g_points.data = g_verbs.data;
     }
-    Say("installed, call sites rewritten", moved);
-    Say("  vector shims ready", g_verbs.Ready() && g_points.Ready() ? 1 : 0);
 }
 
 }  // namespace colr_outline

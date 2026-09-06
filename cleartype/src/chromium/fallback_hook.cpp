@@ -168,13 +168,6 @@ bool Hook(const int marked, const void* locale, void* out)
     if (g_original == nullptr) {
         return false;
     }
-    if (std::getenv("DWC_FALLBACK_LOG") != nullptr) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            Say("answering here, first character U+%04X", static_cast<unsigned>(marked));
-        }
-    }
     // The renderer marks the character when the run asking is bold, since the
     // weight does not survive the mojo call and the character is the only
     // thing that reaches here per query. See bold_weight.cpp.
@@ -265,10 +258,6 @@ bool Hook(const int marked, const void* locale, void* out)
         if (g_layout == Layout::kUnknown) {
             return g_original(c, locale, out);
         }
-        if (std::getenv("DWC_FALLBACK_LOG") != nullptr) {
-            Say("the locale reads as the %s layout",
-                g_layout == Layout::kFirstByte ? "first-byte" : "last-byte");
-        }
     }
     char tagged[64];
     const char* const mark = bold ? static_fontconfig::kBoldTag : "";
@@ -293,13 +282,6 @@ bool Hook(const int marked, const void* locale, void* out)
     alignas(16) unsigned char held[kStringSize];
     if (!WriteShortString(held, tagged, g_layout)) {
         return g_original(c, locale, out);
-    }
-    if (bold && std::getenv("DWC_FALLBACK_LOG") != nullptr) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            Say("first bold answer, U+%04X under %s", static_cast<unsigned>(c), tagged);
-        }
     }
     return g_original(c, held, out);
 }
@@ -485,10 +467,6 @@ void Install()
         return;
     }
     once = true;
-    if (const char* off = std::getenv("DWC_NO_FALLBACK_HOOK");
-        off != nullptr && off[0] != '\0') {
-        return;
-    }
     Image image{};
     if (dl_iterate_phdr(NoteImage, &image) == 0 || image.text_begin == nullptr) {
         return;
@@ -523,10 +501,6 @@ void Install()
         Say("gfx::GetFallbackFontForChar at %p stays as it was: %s",
             static_cast<const void*>(entry), why);
         return;
-    }
-    if (std::getenv("DWC_FALLBACK_LOG") != nullptr) {
-        Say("gfx::GetFallbackFontForChar %p answered per character, %zu bytes moved",
-            static_cast<const void*>(entry), taken);
     }
 }
 

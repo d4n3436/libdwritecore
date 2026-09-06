@@ -27,7 +27,7 @@ nothing at all.
               DOM. The label says the substitution is in play on these pixels,
               not that it failed. A difference here is usually the shaping
               ceiling, since Blink shapes with the regular face's tables
-              either way. DWC_BOLD_FALLBACK=0 is the control
+              either way
   share       same faces, different numbers of glyphs from each
   metrics     the element's own box differs, or something inside it moved
   raster      same faces, same box, nothing inside moved, and no substituted

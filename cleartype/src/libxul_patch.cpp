@@ -2773,9 +2773,6 @@ bool PatchPostShapingFixup(const Image& image, const FunctionStarts& starts)
             // arguments carries the count. It is entered once per shaped run,
             // so the hook reads the number and then puts these call sites
             // back; the sites are remembered here for that.
-            if (EnvDisables("CLEARTYPE_APP_UNITS")) {
-                break;                       // for pricing the hook against no hook
-            }
             g_inlined_fixup = reinterpret_cast<InlinedFixupFn>(holders[i]);
             const unsigned n = RedirectCalls(image, starts, holders[i],
                                              reinterpret_cast<void*>(&DwcInlinedFixup));

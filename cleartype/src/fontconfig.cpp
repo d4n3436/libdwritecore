@@ -1109,7 +1109,7 @@ FcResult FcPatternGetInteger(const FcPattern* p, const char* object, const int n
     // bolder face is the one selected and its own weight is what gets read.
     if (result == kFcResultMatch && value != nullptr && *value == kFcWeightRegular &&
         Answers(object, n, "weight") && chromium_patch::ParityWanted() &&
-        !dwcft::IsOffValue(std::getenv("DWC_WEIGHT_600")) && !FamilyHasBoldFace(p)) {
+        !FamilyHasBoldFace(p)) {
         *value = kFcWeightRegular - 1;
     }
 #if CLEARTYPE_FIREFOX_PARITY

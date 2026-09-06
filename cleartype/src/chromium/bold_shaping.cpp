@@ -57,24 +57,6 @@
 
 namespace {
 
-void Report(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-
-// A parameter pack would give up the printf format checking above.
-// NOLINTNEXTLINE(cert-dcl50-cpp)
-void Report(const char* fmt, ...)
-{
-    static const bool on = std::getenv("DWC_BOLD_SHAPING_LOG") != nullptr;
-    if (!on) {
-        return;
-    }
-    va_list args;
-    va_start(args, fmt);
-    (void)std::fprintf(stderr, "[hbbold] ");
-    (void)std::vfprintf(stderr, fmt, args);
-    (void)std::fprintf(stderr, "\n");
-    va_end(args);
-}
-
 // SkFont, from include/core/SkFont.h. Its members are sk_sp<SkTypeface>,
 // then three SkScalars, then three bytes of enum, and nothing before them.
 constexpr size_t kFontTypeface = 0;
@@ -143,7 +125,6 @@ const void* SkFontIn(const void* data)
         const auto* font = static_cast<const unsigned char*>(data) + offset;
         if (LooksLikeSkFont(font)) {
             g_font_offset = offset;
-            Report("HarfBuzzFontData holds its SkFont at +%zu", offset);
             return font;
         }
     }
@@ -332,9 +313,6 @@ Substitute Build(hb_font_t* font, const Bound& bound,
     const unsigned int bold_upem = hb.face_upem(face);
     if (regular_glyphs != bold_glyphs || regular_upem != bold_upem ||
         hb.var_axes(face) != 0 || hb.var_axes(regular) != 0) {
-        Report("declined: %u/%u glyphs, %u/%u upem, %u/%u axes", regular_glyphs,
-               bold_glyphs, regular_upem, bold_upem, hb.var_axes(regular),
-               hb.var_axes(face));
         hb.face_destroy(face);
         return out;
     }
@@ -357,8 +335,6 @@ Substitute Build(hb_font_t* font, const Bound& bound,
     // destructor with them and neither does this.
     hb.font_set_funcs(sub, bound.klass, bound.data, nullptr);
 
-    Report("substituting a %u-glyph bold face, %zu bytes", bold_glyphs,
-           bold.bytes->size());
     out.parent = parent;
     out.font = sub;
     out.face = face;
@@ -405,8 +381,6 @@ hb_font_t* SubstituteFor(hb_font_t* font)
         // so its tables are the ones already in use.
         if (bold.bytes != nullptr && !bold.simulate) {
             made = Build(font, bound, bold);
-        } else {
-            Report("no bold face for this typeface");
         }
     }
 
@@ -517,16 +491,11 @@ void LearnFontLayout()
     // Either field appearing twice means the wrong one could be read, so the
     // whole route is declined rather than half trusted.
     if (klass_seen != 1 || data_seen != 1) {
-        Report("hb_font_t holds klass %u time(s) and the user data %u, so its "
-               "layout is not settled and nothing is read from it",
-               klass_seen, data_seen);
         return;
     }
     g_klass_offset = klass_at;
     g_data_offset = data_at;
     g_layout_known = true;
-    Report("hb_font_t holds its funcs at +%zu and their user data at +%zu",
-           klass_at, data_at);
 }
 
 // Hold the measured offsets against a binding Blink recorded. Only a build
@@ -540,13 +509,7 @@ void CheckFontLayout(hb_font_t* font, const Bound& recorded)
         return;
     }
     said = true;
-    if (read.klass == recorded.klass && read.data == recorded.data) {
-        Report("the binding read off the font matches the one recorded");
-    } else {
-        Report("the binding read off the font is %p/%p but Blink bound %p/%p, "
-               "so the offsets are wrong for this build",
-               static_cast<void*>(read.klass), read.data,
-               static_cast<void*>(recorded.klass), recorded.data);
+    if (read.klass != recorded.klass || read.data != recorded.data) {
         g_layout_known = false;
     }
 }
@@ -577,7 +540,6 @@ void InstallAtLoad()
 
     const Funcs& hb = Real();
     if (!hb.complete()) {
-        Report("some of HarfBuzz did not resolve, so nothing is swapped");
         return;
     }
     LearnFontLayout();
@@ -589,7 +551,6 @@ void InstallAtLoad()
     // offsets, since nothing records the binding here. Without them it would
     // decline every run.
     if (!g_layout_known) {
-        Report("hb_font_t's layout is not known, so hb_shape is left alone");
         return;
     }
     void* at = hb_abi::Real("hb_shape");
@@ -602,23 +563,11 @@ void InstallAtLoad()
     // left standing and its callers are moved onto the replacement instead;
     // the replacement then calls the real hb_shape.
     if (hb.shape_full == nullptr) {
-        const unsigned moved =
-            hb_abi::RedirectCallsTo(at, reinterpret_cast<void*>(&hb_shape));
-        if (moved == 0) {
-            Report("hb_shape %p has no reachable call site, so nothing is swapped", at);
-        } else {
-            Report("hb_shape_full is inlined here, so %u call(s) of hb_shape %p were "
-                   "moved onto the replacement", moved, at);
-        }
+        (void)hb_abi::RedirectCallsTo(at, reinterpret_cast<void*>(&hb_shape));
         return;
     }
     const char* why = nullptr;
-    if (code_patch::WriteDetour(at, reinterpret_cast<void*>(&hb_shape), &why)) {
-        Report("hb_shape %p replaced where it stands%s%s", at,
-               why != nullptr ? ", but " : "", why != nullptr ? why : "");
-    } else {
-        Report("hb_shape %p was not replaced: %s", at, why != nullptr ? why : "");
-    }
+    (void)code_patch::WriteDetour(at, reinterpret_cast<void*>(&hb_shape), &why);
 }
 
 }  // namespace bold_shaping

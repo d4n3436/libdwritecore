@@ -94,9 +94,6 @@ extern "C" __attribute__((visibility("default"))) int __libc_start_main(int (*ma
     // mapped. The tests below need no state of ours.
     if (argv != nullptr && argc > 0 && !dwcft::IsOffValue(std::getenv("CLEARTYPE_CHROMIUM")) &&
         BrowserProcess(argc, argv) && !AlreadyAsked(argc, argv) && HostIsCef()) {
-        if (std::getenv("DWC_CEF_FONT_LOG") != nullptr) {
-            (void)std::fprintf(stderr, "chromium-patch: cef system font: adding %s\n", kSwitch);
-        }
         std::vector<char*>& held = Argv();
         held.assign(argv, argv + argc);
         held.push_back(const_cast<char*>(kSwitch));

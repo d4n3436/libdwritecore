@@ -40,15 +40,6 @@ thread_local bool t_bold = false;
 using QueryFn = bool (*)(int32_t, const char*, void*);
 QueryFn g_query = nullptr;
 
-void Report(const char* what, const unsigned long value)
-{
-    if (std::getenv("DWC_BOLD_WEIGHT_LOG") == nullptr) {
-        return;
-    }
-    (void)std::fprintf(stderr, "chromium-patch: bold weight [%d]: %s 0x%lx\n", getpid(),
-                       what, value);
-}
-
 struct Image
 {
     uintptr_t base = 0;
@@ -203,7 +194,6 @@ bool QueryReplacement(int32_t c, const char* locale, void* out)
         static bool said = false;
         if (!said) {
             said = true;
-            Report("first bold query, character", static_cast<unsigned long>(c));
         }
     }
     return g_query(c, locale, out);
@@ -255,7 +245,6 @@ void InstallAtLoad()
         }
     }
     if (seen != 1) {
-        Report("anchor is not unique, count", seen);
         return;
     }
 
@@ -275,7 +264,6 @@ void InstallAtLoad()
         }
     }
     if (refs != 1) {
-        Report("lea reference is not unique, count", refs);
         return;
     }
 
@@ -288,14 +276,12 @@ void InstallAtLoad()
     const uintptr_t called = CalledEntryBelow(image, ref_addr);
     const uintptr_t start = unwound > called ? unwound : called;
     if (start == 0) {
-        Report("nothing names a function entry in front of the reference at", ref_addr);
         return;
     }
     const auto* entry = reinterpret_cast<const unsigned char*>(start);
     const size_t span = static_cast<size_t>(image.text + image.text_size - entry);
     g_weight_offset = WeightOffset(entry, span < 0x8000 ? span : 0x8000);
     if (g_weight_offset < 0) {
-        Report("no threshold compare inside the function at", start);
         return;
     }
 
@@ -304,12 +290,8 @@ void InstallAtLoad()
     if (moved == 0) {
         g_original = nullptr;
         g_weight_offset = -1;
-        Report("no call site was rewritten for the function at", start);
         return;
     }
-    Report("installed, function at", start);
-    Report("  weight offset", static_cast<unsigned long>(g_weight_offset));
-    Report("  call sites rewritten", moved);
 
     // The query itself. The emoji branch that names the anchor reads
     //
@@ -321,38 +303,27 @@ void InstallAtLoad()
     // arguments in front of it are what says so: the character is a literal
     // and it has to be a code point. GetFontForCharacter carries no unwind
     // entry of its own, so the table cannot confirm it and this does.
-    if (dwcft::IsOffValue(std::getenv("DWC_BOLD_FALLBACK"))) {
-        return;
-    }
     if (ref[7] != 0xBF || ref[12] != 0xE8) {
-        Report("the anchor is not followed by a character and a call at",
-               reinterpret_cast<uintptr_t>(ref));
         return;
     }
     uint32_t character = 0;
     std::memcpy(&character, ref + 8, 4);
     if (character > 0x10FFFF) {
-        Report("the value passed with the anchor is not a code point", character);
         return;
     }
     const unsigned char* call = ref + 12;
     int32_t rel = 0;
     std::memcpy(&rel, call + 1, 4);
     const auto* query = call + 5 + rel;
-    const auto query_addr = reinterpret_cast<uintptr_t>(query);
     if (query < image.text || query >= image.text + image.text_size) {
-        Report("the query is not in the text segment at", query_addr);
         return;
     }
     g_query = reinterpret_cast<QueryFn>(const_cast<unsigned char*>(query));
     const unsigned asked = code_patch::RedirectCalls(image.text, image.text_size, query, reinterpret_cast<void*>(&QueryReplacement));
     if (asked == 0) {
         g_query = nullptr;
-        Report("no call site was rewritten for the query at", query_addr);
         return;
     }
-    Report("the query is at", query_addr);
-    Report("  call sites rewritten", asked);
 }
 
 }  // namespace bold_weight

@@ -201,11 +201,6 @@ void MapAtLoad()
     if (!chromium_patch::ParityWanted()) {
         return;
     }
-    // Nothing is mapped when this is off, so every lookup misses and the run
-    // keeps the synthetic bold Linux gives it.
-    if (const char* off = std::getenv("DWC_BOLD_FALLBACK"); off != nullptr && off[0] == '0') {
-        return;
-    }
     // Straight to the real fontconfig. This library interposes FcFontSort and
     // FcFontMatch, and running the query through its own hooks before it is
     // finished loading would be circular.
@@ -353,19 +348,6 @@ Face RealBoldFor(const std::vector<uint8_t>& font, const bool oblique)
     }
     const std::lock_guard lock(g_mutex);
     const auto named = BoldByFamily().find(Lower(family.c_str()));
-    if (std::getenv("DWC_BOLD_FALLBACK_LOG") != nullptr) {
-        static int said = 0;
-        if (said++ < 12) {
-            (void)std::fprintf(stderr, "[bold] \"%s\" have=%.0f mapped=%d pick=%.0f idx=%u %s\n",
-                         family.c_str(), static_cast<double>(WeightOf(font)),
-                         BoldByFamily().size() > 0 ? 1 : 0,
-                         named == BoldByFamily().end() ? 0.0
-                                                       : static_cast<double>(named->second.weight),
-                         named == BoldByFamily().end() ? 0u : named->second.face_index,
-                         named == BoldByFamily().end() ? "(no family)"
-                                                       : named->second.path.c_str());
-        }
-    }
     // An unknown family says nothing about whether Windows found a bold face
     // for it, so neither substituting nor simulating is warranted.
     if (named == BoldByFamily().end()) {
