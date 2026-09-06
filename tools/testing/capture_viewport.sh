@@ -5,10 +5,12 @@
 #   capture_viewport.sh <backend> <out-prefix> <host> <port> <url> \
 #                       <width> <height> [--wait S] [--scroll Y] [--css RULES]
 #
-# backend is how to photograph the screen the browser is on:
+# backend is how to photograph the screen the browser is on. screen_grab.py
+# reads it, and a sweep reads a screen through the same three:
 #
-#   x11:<display>       ImageMagick `import -window root` on that X display
-#   libvirt:<domain>    `virsh screenshot` of that guest's display
+#   x11:<display>       the root window of that X display
+#   libvirt:<domain>    that guest's display, through QEMU's screendump
+#   guest:<host>[:port] a window inside a Windows guest, over TCP from wincap
 #
 # Writes <out-prefix>_marked.png and <out-prefix>_clean.png. The marked one
 # locates the viewport, the clean one is what gets compared -
@@ -43,6 +45,9 @@ DRIVER="marionette"
 if [ "$1" = "--driver" ]; then DRIVER="$2"; shift 2; fi
 
 BACKEND="$1"; OUT="$2"; shift 2
+# The browser's own port. The guest backend reaches its capture server by it,
+# and shoot() is called from too deep to see the arguments.
+PORT="$2"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAG="$(mktemp -u "${TMPDIR:-/tmp}/dwc-capture-XXXXXX")"
 
@@ -53,38 +58,13 @@ ATTEMPTS="${CAPTURE_ATTEMPTS:-60}"
 
 
 case "$BACKEND" in
-    x11:*)     DISPLAY_NAME="${BACKEND#x11:}" ;;
-    libvirt:*) DOMAIN="${BACKEND#libvirt:}" ;;
-    *) echo "backend must be x11:<display> or libvirt:<domain>"; exit 2 ;;
+    x11:*|libvirt:*|guest:*) ;;
+    *) echo "backend must be x11:<display>, libvirt:<domain> or guest:<host>[:port]" >&2
+       exit 2 ;;
 esac
 
-# ImageMagick 7 renamed the tools, convert to magick and import to
-# magick import. Both generations are still shipped, and mixing the two
-# spellings works only where the newer one was installed with its legacy
-# links, so which is present is settled once here.
-if command -v magick > /dev/null 2>&1; then
-    IM_IMPORT=(magick import)
-    IM_CONVERT=(magick)
-elif command -v import > /dev/null 2>&1 && command -v convert > /dev/null 2>&1; then
-    IM_IMPORT=(import)
-    IM_CONVERT=(convert)
-else
-    echo "ImageMagick not found: need magick, or both import and convert" >&2
-    exit 2
-fi
-
 shoot() {                                  # shoot <path.png>
-    case "$BACKEND" in
-        x11:*)
-            DISPLAY="$DISPLAY_NAME" "${IM_IMPORT[@]}" -window root "$1"
-            ;;
-        libvirt:*)
-            virsh --connect "${LIBVIRT_URI:-qemu:///system}" screenshot \
-                  "$DOMAIN" "$1.ppm" >/dev/null
-            "${IM_CONVERT[@]}" "$1.ppm" "$1"
-            rm -f "$1.ppm"
-            ;;
-    esac
+    python3 "$HERE/screen_grab.py" "$BACKEND" "$1" --port "$PORT"
 }
 
 # Retake until the frame shows what this stage is waiting for, and has stopped
@@ -138,16 +118,19 @@ capture_until() {                 # capture_until <path.png> <want> [steady?]
 # retry starts.
 RETRIES="${CAPTURE_RETRIES:-2}"
 
+case "$DRIVER" in
+    marionette|cdp) ;;
+    *) echo "unknown driver: $DRIVER" >&2; exit 2 ;;
+esac
+
 attempt() {
 rm -f "$TAG.marked" "$TAG.clean"
-case "$DRIVER" in
-    marionette) DRIVER_SCRIPT="capture_viewport.py" ;;
-    cdp)        DRIVER_SCRIPT="capture_viewport_cdp.py" ;;
-    *)          echo "unknown driver: $DRIVER" >&2; exit 2 ;;
-esac
-python3 "$HERE/$DRIVER_SCRIPT" "$1" "$2" "$3" "$4" "$5" "$TAG" "${@:6}" &
-DRIVER=$!
-trap 'kill $DRIVER 2>/dev/null; rm -f "$TAG.marked" "$TAG.clean"' EXIT
+# attempt runs again on a retry, so the pid needs a name of its own; holding it
+# in $DRIVER left the second run reading a process id as a driver name.
+python3 "$HERE/capture_viewport.py" "$1" "$2" "$3" "$4" "$5" "$TAG" \
+        --driver "$DRIVER" "${@:6}" &
+DRIVER_PID=$!
+trap 'kill $DRIVER_PID 2>/dev/null; rm -f "$TAG.marked" "$TAG.clean"' EXIT
 
 for stage in marked clean; do
     # The sentinel is a handshake between two processes on this machine, so
@@ -161,8 +144,8 @@ for stage in marked clean; do
     # driver's status is passed on, so a reflow (3) still retries.
     waited=0
     while [ ! -f "$TAG.$stage" ]; do
-        if ! kill -0 "$DRIVER" 2>/dev/null; then
-            wait "$DRIVER"; dstatus=$?
+        if ! kill -0 "$DRIVER_PID" 2>/dev/null; then
+            wait "$DRIVER_PID"; dstatus=$?
             echo "the driver exited (status $dstatus) before the $stage stage" >&2
             return "$dstatus"
         fi
@@ -182,7 +165,7 @@ for stage in marked clean; do
     rm -f "$TAG.$stage"
 done
 
-wait $DRIVER
+wait $DRIVER_PID
 }
 
 for try in $(seq 0 "$RETRIES"); do
