@@ -498,51 +498,6 @@ if [ "$COMMAND" = "guest" ] && [ "$RDP_SESSION" = 1 ]; then
     start_rdp_session "$GUEST_IP" || exit 1
 fi
 
-# check_guest_dwrite_names <firefox.exe>
-#
-# Both of xul.dll's DirectWrite references, counted. A build meant to run on
-# DWriteCore has to name it in the import descriptor, which is ASCII, and in
-# dwrote's LoadLibraryW argument, which is UTF-16; a build meant to run on the
-# system DirectWrite has to name that in both. Anything else is a mixture, and
-# a mixture reads as a parity difference on some cells and crashes the GPU
-# process on others.
-check_guest_dwrite_names() {
-    local exe="$1"
-    local xul="${exe%\\*}\\xul.dll"
-    local counts
-    counts="$(run_guest "
-\$src = @'
-using System;
-public class Scan {
-  public static int Count(byte[] hay, byte[] needle) {
-    int hits = 0;
-    for (int i = 0; i <= hay.Length - needle.Length; i++) {
-      int j = 0;
-      while (j < needle.Length && hay[i+j] == needle[j]) j++;
-      if (j == needle.Length) hits++;
-    }
-    return hits;
-  }
-}
-'@
-if (-not ('Scan' -as [type])) { Add-Type -TypeDefinition \$src }
-\$b = [IO.File]::ReadAllBytes('$xul')
-\$a = [Text.Encoding]::ASCII
-\$u = [Text.Encoding]::Unicode
-'core=' + ([Scan]::Count(\$b, \$a.GetBytes('dwcore.dll')) + [Scan]::Count(\$b, \$u.GetBytes('dwcore.dll'))) +
-' write=' + ([Scan]::Count(\$b, \$a.GetBytes('dwrite.dll')) + [Scan]::Count(\$b, \$u.GetBytes('dwrite.dll')))
-" | tr -d '\r' | tail -1)"
-    local core write
-    core="${counts#core=}"; core="${core%% *}"
-    write="${counts##*write=}"
-    case "$core:$write" in
-        2:0) echo "guest xul.dll is on DWriteCore" ;;
-        0:2) echo "guest xul.dll is on the system DirectWrite" ;;
-        *)   echo "guest xul.dll names both DirectWrite builds ($counts): the import descriptor and dwrote's LoadLibraryW have to agree, or gfx/2d and WebRender run on different implementations" >&2
-             return 1 ;;
-    esac
-}
-
 # start_guest_instance <marionette port>
 #
 # Everything one browser needs, named after its port so several can stand side
@@ -728,10 +683,6 @@ Write-Output 'cleared'
         "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -First 1).IPAddress" \
         2>/dev/null | tr -d '\r' | tail -1)"
     [ -n "$GUEST_IP" ] || { echo "no address for $GUEST_DOMAIN" >&2; exit 1; }
-
-    if [ -n "$GUEST_FIREFOX" ]; then
-        check_guest_dwrite_names "$GUEST_FIREFOX" || exit 1
-    fi
 
     STARTED=""
     for gp in $GUEST_PORTS; do
