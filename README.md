@@ -10,10 +10,10 @@ that build and makes it usable on Linux.
 
 Two libraries come out of it.
 
-| File                     | What it is                                                                                                                              |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| `build/libdwritecore.so` | DirectWrite itself, as one self-contained file. `include/` mirrors the Windows App SDK headers, so DirectWrite code compiles unchanged. |
-| `build/libcleartype.so`  | The FreeType interposer, which is what lets ordinary Linux applications render through the ClearType rasterizer.                        |
+| File                     | What it is                                                                                                                                                                                     |
+|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `build/libdwritecore.so` | DirectWrite itself, as one self-contained file. `include/` mirrors the Windows App SDK headers, so DirectWrite code compiles unchanged.                                                        |
+| `build/libcleartype.so`  | The FreeType interposer, which is what lets ordinary Linux applications render through the ClearType rasterizer. Also contains the parity code for Firefox and for Chromium, Electron and CEF. |
 
 ## Build
 
@@ -114,14 +114,21 @@ Rasterization alone makes text look like Windows. Parity mode also makes it
 that DirectWrite computes there, along with the preferences the Windows build
 runs with, achieving 100% accuracy versus Windows's own DirectWrite rendering.
 
-Firefox is the only program it currently targets. The library decides at run time
-and applies parity behavior to a Gecko process and to nothing else, so one file
-is a Firefox parity shim under Firefox and a plain interposer everywhere else.
+Parity mode currently targets Gecko (Firefox), Chromium and the applications
+built on Electron and CEF. The library works out which one it is running under
+and applies that engine's parity behavior and nothing else, so one file is a
+Firefox parity shim under Firefox, a Chromium parity shim under an Electron
+application, and a plain interposer everywhere else.
+
+It is verified against Firefox, Electron 43 in both its statically and
+dynamically linked builds, and CEF 144, each measured against a Windows machine
+running the same build.
 
 ### Prerequisites
 
-**The Windows fonts.** Firefox asks for 23 specific families by name, and without them,
-it substitutes whatever is installed and the text will not match Windows.
+**The Windows fonts.** Both paths ask for 23 specific families by name, and
+without them, the browser substitutes whatever is installed and the text will
+not match Windows.
 Plain interposition needs none of this and works with the fonts you may already have.
 
 You can auto-install them with the following command:
@@ -146,12 +153,15 @@ Needs `curl`, `od`, `awk`, `wimlib-imagex` (packaged as `wimtools`,
 # Close Firefox first. Launching a second copy hands the window to the
 # already running one, which has no preload, and nothing changes.
 LD_PRELOAD=$PWD/build/libcleartype.so firefox
+
+LD_PRELOAD=$PWD/build/libcleartype.so chromium
+LD_PRELOAD=$PWD/build/libcleartype.so ./my-electron-app
 ```
 
-The ~150 preferences this needs travel in `MOZ_DEFAULT_PREFS`, which Firefox
-reads as pref data and not as a file name, so no profile is touched and no
-`user.js` is needed. They arrive as defaults, so anything you have already set
-yourself is not overridden.
+Under Firefox, the ~150 preferences this needs travel in `MOZ_DEFAULT_PREFS`,
+which Firefox reads as pref data and not as a file name, so no profile is
+touched and no `user.js` is needed. They arrive as defaults, so anything you
+have already set yourself is not overridden.
 
 Two things sit outside it. DWriteCore matches DirectWrite's rasterization up to
 Windows 11 22H2, and Microsoft changed that in 24H2, so a diagonal can land a
@@ -209,7 +219,7 @@ Compile-time, given to `cmake` as `-D<name>=<value>`:
 |------------------------------|-----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
 | `DWRITECORE_BUILD_CLEARTYPE` | `ON`                                          | Build `libcleartype.so`. Needs FreeType.                                                                                                    |
 | `CLEARTYPE_FIREFOX_PARITY`   | `ON`                                          | Compile the Gecko parity path in.                                                                                                           |
-| `CLEARTYPE_CHROMIUM_PARITY`  | `ON`                                          | Compile the Chromium patch in.                                                                                                              |
+| `CLEARTYPE_CHROMIUM_PARITY`  | `ON`                                          | Compile the Chromium, Electron and CEF parity path in. Needs an assembler for its vtable thunks.                                            |
 | `DWRITECORE_EMBED_IMPL`      | `ON`                                          | Carry the implementation and the Bionic stubs inside `libdwritecore.so`. `OFF` leaves them beside it, which is friendlier while developing. |
 | `DWRITECORE_ORIGINAL`        | `third_party/office-android/libdwritecore.so` | The stock implementation to build against.                                                                                                  |
 | `DWRITECORE_INSTALL_DIR`     | `${CMAKE_INSTALL_LIBDIR}/dwritecore`          | Where `cmake --install` puts both libraries.                                                                                                |
@@ -217,22 +227,26 @@ Compile-time, given to `cmake` as `-D<name>=<value>`:
 
 Read from the environment by `libcleartype.so` at startup:
 
-| Variable                           | Default                        | Effect                                                                                                                                                                               |
-|------------------------------------|--------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `CLEARTYPE=0`                      | on                             | Disable entirely; every call goes to FreeType.                                                                                                                                       |
-| `CLEARTYPE_FIREFOX=0`              | on                             | Leave a Gecko process's advances and metrics alone. Rasterization is unaffected; that is `CLEARTYPE` above. Inert outside Gecko either way.                                          |
-| `CLEARTYPE_CHROMIUM=0`             | on                             | Leave a Chromium process alone. When on, the resource bundle, render params, font fallback and glyph rasterization are made to answer as they do on Windows.                         |
-| `CLEARTYPE_RENDERING_MODE`         | `auto`                         | `auto` asks DirectWrite per font and size. `gdi-classic`, `gdi-natural`, `natural`, `natural-symmetric` and `aliased` pin one mode for everything.                                   |
-| `CLEARTYPE_MEASURING_MODE`         | follows the rendering mode     | `natural`, `gdi-classic`, `gdi-natural`.                                                                                                                                             |
-| `CLEARTYPE_GRID_FIT`               | unset                          | `enabled`, `disabled`, `default`.                                                                                                                                                    |
-| `CLEARTYPE_SUBPIXEL_POSITIONING=0` | on                             | Ignore the caller's fractional pen position.                                                                                                                                         |
-| `CLEARTYPE_WINDOWS_METRICS=0`      | on                             | Leave FreeType's metrics and advances alone, for rasterization parity only. Inert outside a Gecko process.                                                                           |
-| `CLEARTYPE_ALPHA_GAMMA`            | `1.0` (off)                    | Reshape the coverage curve, for a caller with no preblend of its own. Not for Firefox.                                                                                               |
-| `CLEARTYPE_FONTCONFIG`             | on in parity mode, off outside | Answer fontconfig's rendering queries from this library. The default differs because parity mode's answers describe Windows, while outside it they would overrule your own settings. |
-| `CLEARTYPE_LIBXUL_PATCH=0`         | on                             | Leave libxul's own code alone. Inert outside a Gecko process.                                                                                                                        |
-| `CLEARTYPE_PREFS=0`                | on                             | Do not set `MOZ_DEFAULT_PREFS`; Firefox starts on its own Linux prefs. Inert outside a Gecko process.                                                                                |
-| `CLEARTYPE_LOG`                    | unset                          | Append diagnostics to `<path>.<pid>`, one file per process. `-` writes to stderr, which is what a sandboxed content process can reach.                                               |
-| `CLEARTYPE_CENSUS_SECONDS`         | `10`                           | How often the log gets a census of every table this library keeps. Only written while `CLEARTYPE_LOG` is set.                                                                        |
+| Variable                           | Default                       | Effect                                                                                                                                                                                                                                             |
+|------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `CLEARTYPE=0`                      | on                            | Disable entirely; every call goes to FreeType.                                                                                                                                                                                                     |
+| `CLEARTYPE_FIREFOX=0`              | on                            | Leave a Gecko process's advances and metrics alone. Rasterization is unaffected; that is `CLEARTYPE` above. Inert outside Gecko either way.                                                                                                        |
+| `CLEARTYPE_CHROMIUM=0`             | on                            | Leave a Chromium process alone. Inert outside Chromium either way.                                                                                                                                                                                 |
+| `CLEARTYPE_RENDERING_MODE`         | `auto`                        | `auto` asks DirectWrite per font and size. `gdi-classic`, `gdi-natural`, `natural`, `natural-symmetric` and `aliased` pin one mode for everything.                                                                                                 |
+| `CLEARTYPE_MEASURING_MODE`         | follows the rendering mode    | `natural`, `gdi-classic`, `gdi-natural`.                                                                                                                                                                                                           |
+| `CLEARTYPE_GRID_FIT`               | unset                         | `enabled`, `disabled`, `default`.                                                                                                                                                                                                                  |
+| `CLEARTYPE_SUBPIXEL_POSITIONING=0` | on                            | Ignore the caller's fractional pen position.                                                                                                                                                                                                       |
+| `CLEARTYPE_WINDOWS_METRICS=0`      | on                            | Leave FreeType's metrics and advances alone, for rasterization parity only. Inert outside a Gecko process.                                                                                                                                         |
+| `CLEARTYPE_ALPHA_GAMMA`            | `1.0` (off)                   | Reshape the coverage curve, for a caller with no preblend of its own. Not for Firefox.                                                                                                                                                             |
+| `CLEARTYPE_FONTCONFIG`             | on under Gecko, off elsewhere | Answer fontconfig's rendering queries from this library. The default differs because parity mode's answers describe Windows, while outside it they would overrule your own settings. Chromium states its own render params and does not need this. |
+| `CLEARTYPE_LIBXUL_PATCH=0`         | on                            | Leave libxul's own code alone. Inert outside a Gecko process.                                                                                                                                                                                      |
+| `CLEARTYPE_CHROMIUM_PATCH=0`       | on                            | Leave Skia's scaler context alone, for the parity work that reaches Chromium by other routes only. Inert outside Chromium.                                                                                                                         |
+| `CLEARTYPE_PREFS=0`                | on                            | Do not set `MOZ_DEFAULT_PREFS`; Firefox starts on its own Linux prefs. Inert outside a Gecko process.                                                                                                                                              |
+| `CLEARTYPE_FORCE_FALLBACK=1`       | off                           | Send every glyph down the FreeType fallback path, on input DirectWrite would have handled. For the interposer's own tests.                                                                                                                         |
+| `CLEARTYPE_LOG`                    | unset                         | Append diagnostics to `<path>.<pid>`, one file per process. `-` writes to stderr, which is what a sandboxed content process can reach.                                                                                                             |
+| `CLEARTYPE_LOG_FAMILY`             | unset                         | Restrict the log to one family name.                                                                                                                                                                                                               |
+| `CLEARTYPE_CENSUS_SECONDS`         | `10`                          | How often the log gets a census of every table this library keeps. Only written while `CLEARTYPE_LOG` is set.                                                                                                                                      |
+| `DWC_FAULT_REPORT=1`               | off                           | Print a stack for a renderer fault, for a crash a core dump cannot explain. Chromium only.                                                                                                                                                         |
 
 Read by `libdwritecore.so` at startup:
 
@@ -327,6 +341,7 @@ LD_PRELOAD=$PWD/build/libcleartype.so ./build/cleartype/cleartype_sample $FONT d
 ```
 cleartype/         the FreeType LD_PRELOAD interposer
   src/             the interposer itself, built into libcleartype.so
+    chromium/      the Chromium, Electron and CEF parity path
   probes/          logging-only libraries, for checking what an application does
   tests/           run by hand under a real LD_PRELOAD, not by ctest
 third_party/       vendored Microsoft material - see third_party/README.md
