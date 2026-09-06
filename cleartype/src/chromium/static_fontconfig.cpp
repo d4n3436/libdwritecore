@@ -78,10 +78,6 @@ void Say(const char* fmt, ...)
     (void)std::fprintf(stderr, "chromium-patch: static fontconfig: %s\n", buf);
 }
 
-// An order written down in the table outranks one inferred from what a family
-// happens to cover, so a cycle gives up the inference first.
-constexpr uint64_t kWrittenOrder = 1ULL << 32;
-
 // How many code points stand for a range when asking whether a family covers
 // it. Enough to tell a family that has the script from one holding a few
 // borrowed letters.
@@ -144,7 +140,7 @@ Installed Survey(const fallback_order::ScriptRow* rows, const unsigned row_count
     Installed out;
     std::unordered_map<std::string, bool> seen;
     const auto note = [&seen, &out](const char* name) {
-        if (name == nullptr || seen.count(name) != 0 || !ShipsWithWindows(name)) {
+        if (name == nullptr || seen.contains(name) || !ShipsWithWindows(name)) {
             return;
         }
         seen.emplace(name, true);
@@ -175,14 +171,14 @@ Installed Survey(const fallback_order::ScriptRow* rows, const unsigned row_count
     row_start.push_back(static_cast<unsigned>(points.size()));
 
     std::vector<std::string> present;
-    auto answers = std::make_unique<bool[]>(points.size());
+    const auto answers = std::make_unique<bool[]>(points.size());
     for (const std::string& family : out.families) {
         if (!dwrite_raster::FamilyCoverage(family.c_str(), points.data(),
                                            static_cast<unsigned>(points.size()),
                                            answers.get())) {
             continue;
         }
-        std::vector<bool> covered(row_count, false);
+        std::vector covered(row_count, false);
         for (unsigned r = 0; r < row_count; ++r) {
             for (unsigned i = row_start[r]; i < row_start[r + 1]; ++i) {
                 if (answers[i]) {
@@ -212,7 +208,7 @@ std::vector<std::string> TopoSort(const std::vector<std::string>& nodes,
         for (const auto& [edge, weight] : edges) {
             (void)weight;
             auto& list = after[edge.first];
-            if (std::find(list.begin(), list.end(), edge.second) == list.end()) {
+            if (std::ranges::find(list, edge.second) == list.end()) {
                 list.push_back(edge.second);
                 ++indegree[edge.second];
             }
@@ -239,12 +235,12 @@ std::vector<std::string> TopoSort(const std::vector<std::string>& nodes,
         // Whatever is left sits in a cycle. Drop its lightest edge and retry.
         std::vector<std::string> stuck;
         for (const std::string& n : nodes) {
-            if (std::find(out.begin(), out.end(), n) == out.end()) {
+            if (std::ranges::find(out, n) == out.end()) {
                 stuck.push_back(n);
             }
         }
         const auto in_stuck = [&stuck](const std::string& n) {
-            return std::find(stuck.begin(), stuck.end(), n) != stuck.end();
+            return std::ranges::find(stuck, n) != stuck.end();
         };
         auto weakest = edges.end();
         for (auto it = edges.begin(); it != edges.end(); ++it) {
@@ -307,7 +303,7 @@ const std::vector<std::string>& Order()
             std::vector<std::string> row;
             for (unsigned f = 0; f < rows[r].count; ++f) {
                 const char* name = rows[r].families[f];
-                if (name != nullptr && have.covers.count(name) != 0) {
+                if (name != nullptr && have.covers.contains(name)) {
                     row.emplace_back(name);
                 }
             }
@@ -324,8 +320,7 @@ const std::vector<std::string>& Order()
                 if (other == row[0]) {
                     continue;
                 }
-                const auto seen = have.covers.find(other);
-                if (seen != have.covers.end() && seen->second[r]) {
+                if (const auto seen = have.covers.find(other); seen != have.covers.end() && seen->second[r]) {
                     want(row[0], other, weight);
                 }
             }
@@ -356,9 +351,9 @@ struct LangHan
 
 constexpr size_t kLangHanCount = 9;
 const LangHan kLangHan[] = {
-    {"zh-hant", "zh-Hant"}, {"zh-tw", "zh-TW"}, {"zh-hk", "zh-HK"},
-    {"zh-mo", "zh-MO"},     {"zh-hans", "zh-Hans"}, {"zh-cn", "zh-CN"},
-    {"zh-sg", "zh-SG"},     {"ja", "ja"},       {"ko", "ko"},
+    {.tag = "zh-hant", .locale = "zh-Hant"}, {.tag = "zh-tw", .locale = "zh-TW"}, {.tag = "zh-hk", .locale = "zh-HK"},
+    {.tag = "zh-mo", .locale = "zh-MO"},     {.tag = "zh-hans", .locale = "zh-Hans"}, {.tag = "zh-cn", .locale = "zh-CN"},
+    {.tag = "zh-sg", .locale = "zh-SG"},     {.tag = "ja", .locale = "ja"},       {.tag = "ko", .locale = "ko"},
 };
 
 // The surveyed spelling of a family, or null when this machine has no such
@@ -429,7 +424,7 @@ std::string WeightRanges(const std::string& family, const int style, const int s
             runs.back().italic == a.italic && runs.back().hi + 1 == lo) {
             runs.back().hi = hi;
         } else {
-            runs.push_back({lo, hi, a.weight, a.italic});
+            runs.push_back({.lo = lo, .hi = hi, .weight = a.weight, .italic = a.italic});
         }
     };
     // An explicit stack, walked low to high so the runs come out in order.
@@ -473,6 +468,7 @@ std::string WeightRanges(const std::string& family, const int style, const int s
     int start = 0;
     for (int v = 0; v <= kMaxFcWeight; ++v) {
         const auto at = [&runs](const int fc) {
+            // NOLINTNEXTLINE(bugprone-incorrect-roundings)
             const int ot = static_cast<int>(family_match::OpenTypeWeight(fc) + 0.5f);
             for (const Run& run : runs) {
                 if (ot >= run.lo && ot <= run.hi) {
@@ -482,8 +478,7 @@ std::string WeightRanges(const std::string& family, const int style, const int s
             return static_cast<const Run*>(nullptr);
         };
         const Run* here = at(v);
-        const Run* next = v < kMaxFcWeight ? at(v + 1) : nullptr;
-        if (here != nullptr && next == here) {
+        if (const Run* next = v < kMaxFcWeight ? at(v + 1) : nullptr; here != nullptr && next == here) {
             continue;
         }
         if (here != nullptr) {
@@ -563,7 +558,7 @@ std::string RulesBlock()
     // the symbol blocks as well, which is far worse than the four cells it
     // buys.
     std::string latin;
-    if (have.covers.count("Times New Roman") != 0) {
+    if (have.covers.contains("Times New Roman")) {
         latin = "    <edit name=\"family\" mode=\"append\" binding=\"weak\">"
                 "<string>Times New Roman</string></edit>\n";
     }
@@ -691,7 +686,7 @@ std::string RulesBlock()
             const char* first = nullptr;
             if (candidates != nullptr) {
                 for (unsigned i = 0; i < count && first == nullptr; ++i) {
-                    if (candidates[i] != nullptr && have.covers.count(candidates[i]) != 0) {
+                    if (candidates[i] != nullptr && have.covers.contains(candidates[i])) {
                         first = candidates[i];
                     }
                 }
@@ -714,7 +709,7 @@ std::string RulesBlock()
         }
         const char* first = nullptr;
         for (unsigned i = 0; i < count && first == nullptr; ++i) {
-            if (candidates[i] != nullptr && have.covers.count(candidates[i]) != 0) {
+            if (candidates[i] != nullptr && have.covers.contains(candidates[i])) {
                 first = candidates[i];
             }
         }
@@ -826,7 +821,7 @@ std::vector<std::string> FontDirectories()
         if (!dwrite_raster::FamilyDirectory(family.c_str(), path, sizeof(path))) {
             continue;
         }
-        if (std::find(dirs.begin(), dirs.end(), path) == dirs.end()) {
+        if (std::ranges::find(dirs, path) == dirs.end()) {
             dirs.emplace_back(path);
         }
     }
@@ -876,7 +871,7 @@ int TagFor(const char* family)
     }
     const std::vector<std::string>& order = Order();
     for (size_t i = 0; i < order.size() && i < kMaxTaggedFamilies; ++i) {
-        if (::strcasecmp(order[i].c_str(), family) == 0) {
+        if (strcasecmp(order[i].c_str(), family) == 0) {
             return static_cast<int>(i);
         }
     }
@@ -894,9 +889,9 @@ const char* ScriptLocale(const char* locale)
         const char* locale;
     };
     static const Named kNamed[] = {
-        {"hant", "zh-hant"}, {"hans", "zh-hans"}, {"jpan", "ja"},
-        {"kana", "ja"},      {"hira", "ja"},      {"kore", "ko"},
-        {"hang", "ko"},
+        {.subtag = "hant", .locale = "zh-hant"}, {.subtag = "hans", .locale = "zh-hans"}, {.subtag = "jpan", .locale = "ja"},
+        {.subtag = "kana", .locale = "ja"},      {.subtag = "hira", .locale = "ja"},      {.subtag = "kore", .locale = "ko"},
+        {.subtag = "hang", .locale = "ko"},
     };
     for (const char* p = locale; *p != '\0' && *p != '.' && *p != '@';) {
         if (*p != '-' && *p != '_') {
@@ -912,7 +907,7 @@ const char* ScriptLocale(const char* locale)
             ++k;
         }
         for (const Named& n : kNamed) {
-            if (::strcmp(sub, n.subtag) == 0) {
+            if (strcmp(sub, n.subtag) == 0) {
                 return n.locale;
             }
         }
@@ -928,7 +923,7 @@ int HanLocaleIndex(const char* locale)
     }
     if (const char* named = ScriptLocale(locale); named != nullptr) {
         for (size_t i = 0; i < kLangHanCount; ++i) {
-            if (::strcasecmp(named, kLangHan[i].locale) == 0) {
+            if (strcasecmp(named, kLangHan[i].locale) == 0) {
                 return static_cast<int>(i);
             }
         }
@@ -938,8 +933,8 @@ int HanLocaleIndex(const char* locale)
     int best = -1;
     size_t longest = 0;
     for (size_t i = 0; i < kLangHanCount; ++i) {
-        const size_t len = ::strlen(kLangHan[i].locale);
-        if (len > longest && ::strncasecmp(locale, kLangHan[i].locale, len) == 0) {
+        const size_t len = strlen(kLangHan[i].locale);
+        if (len > longest && strncasecmp(locale, kLangHan[i].locale, len) == 0) {
             longest = len;
             best = static_cast<int>(i);
         }
@@ -1027,7 +1022,7 @@ __attribute__((constructor)) void SettleAtLoad()
 extern "C" {
 
 __attribute__((visibility("default")))
-int open(const char* path, int flags, ...)
+int open(const char* path, const int flags, ...)
 {
     static const auto real = Next<OpenFn>("open");
     mode_t mode = 0;
@@ -1046,7 +1041,7 @@ int open(const char* path, int flags, ...)
 }
 
 __attribute__((visibility("default")))
-int open64(const char* path, int flags, ...)
+int open64(const char* path, const int flags, ...)
 {
     static const auto real = Next<OpenFn>("open64");
     mode_t mode = 0;
@@ -1065,7 +1060,7 @@ int open64(const char* path, int flags, ...)
 }
 
 __attribute__((visibility("default")))
-int openat(int dirfd, const char* path, int flags, ...)
+int openat(const int dirfd, const char* path, const int flags, ...)
 {
     static const auto real = Next<OpenAtFn>("openat");
     mode_t mode = 0;
@@ -1084,7 +1079,7 @@ int openat(int dirfd, const char* path, int flags, ...)
 }
 
 __attribute__((visibility("default")))
-int openat64(int dirfd, const char* path, int flags, ...)
+int openat64(const int dirfd, const char* path, const int flags, ...)
 {
     static const auto real = Next<OpenAtFn>("openat64");
     mode_t mode = 0;

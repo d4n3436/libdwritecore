@@ -86,8 +86,7 @@ inline int NoteSpanFor(dl_phdr_info* info, size_t, void* out)
         if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0) {
             continue;
         }
-        const uintptr_t base = info->dlpi_addr + ph.p_vaddr;
-        if (at >= base && at < base + ph.p_memsz) {
+        if (const uintptr_t base = info->dlpi_addr + ph.p_vaddr; at >= base && at < base + ph.p_memsz) {
             span->text = reinterpret_cast<const unsigned char*>(base);
             span->size = ph.p_memsz;
             return 1;
@@ -118,14 +117,14 @@ inline void* NearbyPage(const unsigned char* near, const long page)
             if (want < 0x10000u) {
                 continue;
             }
-            void* got = ::mmap(reinterpret_cast<void*>(want), static_cast<size_t>(page),
+            void* got = mmap(reinterpret_cast<void*>(want), static_cast<size_t>(page),
                                PROT_READ | PROT_WRITE | PROT_EXEC,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
             if (got == reinterpret_cast<void*>(want)) {
                 return got;
             }
             if (got != MAP_FAILED) {
-                (void)::munmap(got, static_cast<size_t>(page));
+                (void)munmap(got, static_cast<size_t>(page));
             }
         }
     }
@@ -175,10 +174,10 @@ inline unsigned CallSitesOf(const unsigned char* text, const size_t text_size,
 // image with dladdr,
 // which does not answer for a stripped main executable, so the segment is
 // passed in here instead.
-inline unsigned RedirectCalls(const unsigned char* text, size_t text_size,
+inline unsigned RedirectCalls(const unsigned char* text, const size_t text_size,
                               const unsigned char* target, void* to)
 {
-    const long page = ::sysconf(_SC_PAGESIZE);
+    const long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) {
         return 0;
     }
@@ -201,7 +200,7 @@ inline unsigned RedirectCalls(const unsigned char* text, size_t text_size,
             // replacement with the ABI exactly as the caller left it.
             static const unsigned char kJump[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
             std::memcpy(hop, kJump, sizeof(kJump));
-            std::memcpy(hop + sizeof(kJump), &to, sizeof(to));
+            std::memcpy(hop + sizeof(kJump), static_cast<const void*>(&to), sizeof(to));
         }
         const auto want = reinterpret_cast<intptr_t>(hop) - reinterpret_cast<intptr_t>(at + 5);
         if (want > INT32_MAX || want < INT32_MIN) {
@@ -210,12 +209,12 @@ inline unsigned RedirectCalls(const unsigned char* text, size_t text_size,
         auto* start = reinterpret_cast<unsigned char*>(
             reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1));
         const size_t span = static_cast<size_t>(at + 5 - start);
-        if (::mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        if (mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
             continue;
         }
         const auto rel32 = static_cast<int32_t>(want);
         std::memcpy(at + 1, &rel32, 4);
-        (void)::mprotect(start, span, PROT_READ | PROT_EXEC);
+        (void)mprotect(start, span, PROT_READ | PROT_EXEC);
         ++moved;
     }
     return moved;

@@ -57,7 +57,7 @@ void Say(const char* fmt, ...)
     va_start(ap, fmt);
     (void)std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    (void)std::fprintf(stderr, "chromium-patch: fallback hook [%d]: %s\n", ::getpid(), buf);
+    (void)std::fprintf(stderr, "chromium-patch: fallback hook [%d]: %s\n", getpid(), buf);
 }
 
 // The trace event CachedFontSet::GetFallbackFontForChar opens with. It is
@@ -122,7 +122,7 @@ Layout LayoutOf(const void* at)
 }
 
 // Settled once, since a build has one layout.
-Layout g_layout = Layout::kUnknown;
+auto g_layout = Layout::kUnknown;
 
 // The text of a short std::string, for reading the locale back out. Empty for
 // anything not in the short form, which a locale never is.
@@ -317,7 +317,7 @@ int NoteImage(dl_phdr_info* info, size_t, void* data)
 {
     static const uintptr_t self = [] {
         Dl_info me{};
-        return dladdr(reinterpret_cast<const void*>(kAnchor), &me) != 0
+        return dladdr(kAnchor, &me) != 0
                    ? reinterpret_cast<uintptr_t>(me.dli_fbase)
                    : 0;
     }();
@@ -344,7 +344,7 @@ int NoteImage(dl_phdr_info* info, size_t, void* data)
         }
         if (found == nullptr) {
             found = static_cast<const unsigned char*>(
-                ::memmem(from, header.p_filesz, kAnchor, sizeof(kAnchor)));
+                memmem(from, header.p_filesz, kAnchor, sizeof(kAnchor)));
         }
         (void)to;
     }
@@ -373,8 +373,7 @@ const unsigned char* AnchorSite(const Image& image, const unsigned char* anchor)
         if (next == image.text_begin) {
             continue;
         }
-        const unsigned char rex = next[-1];
-        if ((rex & 0xF9) != 0x48 || (next[1] & 0xC7) != 0x05) {
+        if (const unsigned char rex = next[-1]; (rex & 0xF9) != 0x48 || (next[1] & 0xC7) != 0x05) {
             continue;
         }
         int32_t disp = 0;
@@ -428,6 +427,7 @@ size_t RelocatableBytes(const unsigned char* at, const size_t least)
     size_t taken = 0;
     while (taken < least) {
         const unsigned char* p = at + taken;
+        // NOLINTNEXTLINE(bugprone-branch-clone)
         if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) {
             taken += 4;              // endbr64
         } else if (p[0] >= 0x50 && p[0] <= 0x57) {

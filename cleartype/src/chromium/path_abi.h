@@ -111,9 +111,9 @@ struct Point
 inline int PointsForVerb(const uint8_t verb)
 {
     switch (verb) {
-        case kMove: return 1;
+        case kMove:
         case kLine: return 1;
-        case kQuad: return 2;
+        case kQuad:
         case kConic: return 2;
         case kCubic: return 3;
         case kClose: return 0;
@@ -126,7 +126,7 @@ inline int PointsForVerb(const uint8_t verb)
 // The header's comment says the low two bits, which the code does not do.
 inline bool PlausibleUniqueID(const uint32_t id)
 {
-    return id != 0 && (id >> 30) == 0;
+    return id != 0 && id >> 30 == 0;
 }
 
 }  // namespace path_abi

@@ -58,16 +58,12 @@ extern "C" void chromium_system_size_thunk();
 
 namespace {
 
-void Say(const char* what, const void* at = nullptr)
+void Say(const char* what)
 {
     if (std::getenv("DWC_SYSTEM_FONTS_LOG") == nullptr) {
         return;
     }
-    if (at != nullptr) {
-        (void)std::fprintf(stderr, "chromium-patch: system fonts: %s %p\n", what, at);
-    } else {
-        (void)std::fprintf(stderr, "chromium-patch: system fonts: %s\n", what);
-    }
+    (void)std::fprintf(stderr, "chromium-patch: system fonts: %s\n", what);
 }
 
 // CSSValueID, from core/css/css_value_keywords.json5 in declaration order.
@@ -148,6 +144,8 @@ const void* UiFamilyAtom()
 // Runs in place of the inlined read in ConvertFontFamily's system-font
 // branch, with the keyword in edi. The answer is the string an AtomicString
 // holds, which is what the branch went on to store.
+// ReSharper disable once CppDeclaratorNeverUsed
+// Called from hook_thunk.S.
 extern "C" const void* DwcSystemFamilyString(unsigned id);
 const void* DwcSystemFamilyString(const unsigned id)
 {
@@ -205,8 +203,7 @@ bool WriteBytes(unsigned char* at, const unsigned char* code, const size_t len)
 extern "C" float DwcSystemFontSize(const void* document, unsigned biased);
 float DwcSystemFontSize(const void* document, const unsigned biased)
 {
-    const unsigned id = biased + 18;
-    if (id >= kCaption && id <= kStatusBar && WindowsUiKeyword(id)) {
+    if (const unsigned id = biased + 18; id >= kCaption && id <= kStatusBar && WindowsUiKeyword(id)) {
         // The adjustment that follows the call subtracts two points only when
         // the biased keyword is below three unsigned, which none of these is.
         return kUiFontSize;
@@ -465,7 +462,7 @@ unsigned RetargetSizeCalls(const Region& text, const unsigned char* default_size
 
 const unsigned char* FindArial(const Region* rodata, const unsigned count)
 {
-    static const char kNeeded[] = "\0Arial";
+    static constexpr char kNeeded[] = "\0Arial";
     for (unsigned i = 0; i < count; ++i) {
         for (const unsigned char* p = rodata[i].begin; p + 7 < rodata[i].end; ++p) {
             if (std::memcmp(p, kNeeded, sizeof(kNeeded) - 1) == 0 && p[6] == '\0') {
@@ -538,7 +535,7 @@ void ApplyToImage(const uintptr_t base, const ElfW(Phdr)* phdr, const ElfW(Half)
         return;
     }
     const auto* default_size = reinterpret_cast<const unsigned char*>(g_found.default_size);
-    unsigned char* stub = WriteSizeStub(text);
+    const unsigned char* stub = WriteSizeStub(text);
     if (stub == nullptr) {
         Say("no room in the image for the size stub");
         return;

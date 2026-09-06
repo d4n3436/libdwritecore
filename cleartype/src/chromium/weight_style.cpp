@@ -30,6 +30,7 @@ constexpr int32_t kRegular = 400;
 constexpr int32_t kReported = 399;
 
 // fontations_ffi::BridgeFontStyle.
+// ReSharper disable once CppDeclaratorNeverUsed
 struct FontStyle
 {
     int32_t weight;
@@ -58,6 +59,7 @@ FcGetStringFn g_fc_string = nullptr;
 FcGetFontsFn g_fc_fonts = nullptr;
 
 // FcFontSet's first two fields, which is all the walk needs.
+// ReSharper disable once CppDeclaratorNeverUsed
 struct FontSetHead
 {
     int nfont;
@@ -82,7 +84,7 @@ bool FamilyHasBold(const void* pattern)
     const std::lock_guard lock(mutex);
     if (bold == nullptr) {
         bold = new std::vector<std::string>();
-        if (auto* all = static_cast<FontSetHead*>(g_fc_fonts(nullptr, kFcSetSystem));
+        if (const auto* all = static_cast<FontSetHead*>(g_fc_fonts(nullptr, kFcSetSystem));
             all != nullptr) {
             for (int i = 0; all->fonts != nullptr && i < all->nfont; ++i) {
                 int weight = 0;
@@ -102,7 +104,7 @@ bool FamilyHasBold(const void* pattern)
         }
     }
     const auto* name = reinterpret_cast<const char*>(family);
-    return std::find(bold->begin(), bold->end(), name) != bold->end();
+    return std::ranges::find(*bold, name) != bold->end();
 }
 
 int FcIntegerReplacement(const void* pattern, const char* object, const int n, int* value)
@@ -126,7 +128,7 @@ bool Replacement(const void* font_ref, const void* coords, FontStyle* style)
             (void)std::fprintf(stderr,
                                "chromium-patch: weight style [%d]: regular face #%d now "
                                "reports %d\n",
-                               ::getpid(), said, kReported);
+                               getpid(), said, kReported);
         }
     }
     return ok;
@@ -152,7 +154,7 @@ void InstallAtLoad()
         if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
             (void)std::fprintf(stderr,
                                "chromium-patch: weight style [%d]: no %s in this process\n",
-                               ::getpid(), kEntryTail);
+                               getpid(), kEntryTail);
         }
         return;
     }
@@ -169,13 +171,13 @@ void InstallAtLoad()
         if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
             (void)std::fprintf(stderr,
                                "chromium-patch: weight style [%d]: no call site for %p\n",
-                               ::getpid(), entry);
+                               getpid(), entry);
         }
         return;
     }
     if (std::getenv("DWC_WEIGHT_LOG") != nullptr) {
         (void)std::fprintf(stderr, "chromium-patch: weight style [%d]: %u call site(s)\n",
-                           ::getpid(), moved);
+                           getpid(), moved);
     }
 }
 
@@ -222,7 +224,7 @@ void InstallFontconfig()
         (void)std::fprintf(stderr,
                            "chromium-patch: weight style [%d]: fontconfig weight, %u call "
                            "site(s)\n",
-                           ::getpid(), moved);
+                           getpid(), moved);
     }
 }
 

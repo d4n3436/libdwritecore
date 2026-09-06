@@ -47,6 +47,10 @@
 #include <unistd.h>
 
 #include "bold_fallback.h"
+// The scan looks for an exact float sentinel in memory, so equality is the
+// question being asked.
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+
 #include "bold_shaping.h"
 #include "code_patch.h"
 #include "parity_gate.h"
@@ -55,6 +59,8 @@ namespace {
 
 void Report(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// A parameter pack would give up the printf format checking above.
+// NOLINTNEXTLINE(cert-dcl50-cpp)
 void Report(const char* fmt, ...)
 {
     static const bool on = std::getenv("DWC_BOLD_SHAPING_LOG") != nullptr;
@@ -63,9 +69,9 @@ void Report(const char* fmt, ...)
     }
     va_list args;
     va_start(args, fmt);
-    std::fprintf(stderr, "[hbbold] ");
-    std::vfprintf(stderr, fmt, args);
-    std::fprintf(stderr, "\n");
+    (void)std::fprintf(stderr, "[hbbold] ");
+    (void)std::vfprintf(stderr, fmt, args);
+    (void)std::fprintf(stderr, "\n");
     va_end(args);
 }
 
@@ -90,7 +96,7 @@ template <typename T>
 T ReadAt(const void* base, const size_t offset)
 {
     T value;
-    std::memcpy(&value, static_cast<const unsigned char*>(base) + offset,
+    std::memcpy(static_cast<void*>(&value), static_cast<const unsigned char*>(base) + offset,
                 sizeof(T));
     return value;
 }
@@ -223,7 +229,7 @@ const Funcs& Real()
 // hb_shape_full is what HarfBuzz would have done and, where hb_shape has been
 // replaced in place, the only way past the replacement.
 void Shape(const Funcs& hb, hb_font_t* font, hb_buffer_t* buffer,
-           const hb_feature_t* features, unsigned int num_features)
+           const hb_feature_t* features, const unsigned int num_features)
 {
     if (hb.shape_full != nullptr) {
         (void)hb.shape_full(font, buffer, features, num_features, nullptr);
@@ -282,7 +288,7 @@ struct Substitute
 
 std::unordered_map<hb_font_t*, Substitute>& Substitutes()
 {
-    static thread_local std::unordered_map<hb_font_t*, Substitute> map;
+    thread_local std::unordered_map<hb_font_t*, Substitute> map;
     return map;
 }
 
@@ -440,8 +446,6 @@ bool g_layout_known = false;
 // neither of the two reads.
 size_t g_scale_offset = 0;
 size_t g_ptem_offset = 0;
-bool g_scale_known = false;
-bool g_ptem_known = false;
 
 // How far into an hb_font_t to look. Past both fields, and clamped to the end
 // of the page so a short allocation is never read past.
@@ -475,7 +479,7 @@ void LearnFontLayout()
     const auto at = reinterpret_cast<uintptr_t>(font);
     const uintptr_t page_end =
         page > 0 ? (at + static_cast<uintptr_t>(page)) & ~static_cast<uintptr_t>(page - 1) : at;
-    const size_t room = page_end > at ? static_cast<size_t>(page_end - at) : 0;
+    const size_t room = page_end > at ? page_end - at : 0;
     const size_t limit = room < kFontScan ? room : kFontScan;
 
     size_t klass_at = 0;
@@ -483,8 +487,7 @@ void LearnFontLayout()
     unsigned klass_seen = 0;
     unsigned data_seen = 0;
     for (size_t off = 0; off + sizeof(void*) <= limit; off += sizeof(void*)) {
-        const void* held = ReadAt<void*>(font, off);
-        if (held == klass) {
+        if (const void* held = ReadAt<void*>(font, off); held == klass) {
             klass_at = off;
             ++klass_seen;
         } else if (held == &sentinel) {
@@ -496,24 +499,18 @@ void LearnFontLayout()
     // for at its own alignment rather than the pointer's.
     size_t scale_at = 0;
     size_t ptem_at = 0;
-    unsigned scale_seen = 0;
-    unsigned ptem_seen = 0;
     for (size_t off = 0; off + 2 * sizeof(int) <= limit; off += sizeof(int)) {
         if (ReadAt<int>(font, off) == kScaleX &&
             ReadAt<int>(font, off + sizeof(int)) == kScaleY) {
             scale_at = off;
-            ++scale_seen;
         }
     }
     for (size_t off = 0; off + sizeof(float) <= limit; off += sizeof(float)) {
         if (ReadAt<float>(font, off) == kPtem) {
             ptem_at = off;
-            ++ptem_seen;
         }
     }
     hb.font_destroy(font);
-    g_scale_known = scale_seen == 1;
-    g_ptem_known = ptem_seen == 1;
     g_scale_offset = scale_at;
     g_ptem_offset = ptem_at;
 
@@ -606,7 +603,7 @@ void InstallAtLoad()
     // the replacement then calls the real hb_shape.
     if (hb.shape_full == nullptr) {
         const unsigned moved =
-            hb_abi::RedirectCallsTo(at, reinterpret_cast<void*>(&::hb_shape));
+            hb_abi::RedirectCallsTo(at, reinterpret_cast<void*>(&hb_shape));
         if (moved == 0) {
             Report("hb_shape %p has no reachable call site, so nothing is swapped", at);
         } else {
@@ -616,7 +613,7 @@ void InstallAtLoad()
         return;
     }
     const char* why = nullptr;
-    if (code_patch::WriteDetour(at, reinterpret_cast<void*>(&::hb_shape), &why)) {
+    if (code_patch::WriteDetour(at, reinterpret_cast<void*>(&hb_shape), &why)) {
         Report("hb_shape %p replaced where it stands%s%s", at,
                why != nullptr ? ", but " : "", why != nullptr ? why : "");
     } else {
@@ -630,7 +627,7 @@ void InstallAtLoad()
 // HarfBuzzFontData at shaping time.
 extern "C" __attribute__((visibility("default")))
 void hb_font_set_funcs(hb_font_t* font, hb_font_funcs_t* klass, void* font_data,
-                       hb_destroy_func_t destroy)
+                       const hb_destroy_func_t destroy)
 {
     const auto real = Real().font_set_funcs;
     if (real == nullptr) {
@@ -644,7 +641,7 @@ void hb_font_set_funcs(hb_font_t* font, hb_font_funcs_t* klass, void* font_data,
     if (chromium_patch::ParityWanted() && font != nullptr &&
         hb_abi::Where() != hb_abi::Linkage::kInImage) {
         const std::lock_guard lock(g_bound_mutex);
-        Bounds()[font] = {klass, font_data};
+        Bounds()[font] = {.klass = klass, .data = font_data};
     }
 }
 
@@ -664,7 +661,7 @@ void hb_font_destroy(hb_font_t* font)
 }
 
 void hb_shape(hb_font_t* font, hb_buffer_t* buffer, const hb_feature_t* features,
-              unsigned int num_features)
+              const unsigned int num_features)
 {
     const Funcs& hb = Real();
     if (hb.shape_full == nullptr && hb.shape == nullptr) {

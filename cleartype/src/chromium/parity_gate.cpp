@@ -34,7 +34,7 @@ bool ChromiumHost()
         const void* self_base;
         bool found;
     };
-    Ask ask{SelfBase(), false};
+    Ask ask{.self_base = SelfBase(), .found = false};
     dl_iterate_phdr(
         [](dl_phdr_info* info, size_t, void* data) {
             auto* a = static_cast<Ask*>(data);
@@ -106,7 +106,7 @@ int MilestoneFromImages()
         const void* self_base;
         int milestone;
     };
-    Ask ask{SelfBase(), 0};
+    Ask ask{.self_base = SelfBase(), .milestone = 0};
     dl_iterate_phdr(
         [](dl_phdr_info* info, size_t, void* data) {
             auto* a = static_cast<Ask*>(data);

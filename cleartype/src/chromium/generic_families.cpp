@@ -57,29 +57,29 @@ struct Substitution
 };
 
 constexpr Substitution kSubstitutions[] = {
-    {"Latin Modern Math", ",Cambria Math", {}},
+    {.platform = "Latin Modern Math", .windows = ",Cambria Math", .prefs = {}},
     // Windows swaps the fixed family for IDS_FIXED_FONT_FAMILY_ALT_WIN when the
     // shipped one is Courier and ClearType smoothing is on (font_defaults.cc).
-    {"Monospace", ",Consolas", {}},
-    {"Noto Sans Devanagari", ",Nirmala UI", {}},
+    {.platform = "Monospace", .windows = ",Consolas", .prefs = {}},
+    {.platform = "Noto Sans Devanagari", .windows = ",Nirmala UI", .prefs = {}},
     // The fixed rows Windows compiles for Arabic, Cyrillic and Greek all carry
     // Courier New, so one rewritten resource answers for all three. Blink
     // keys the map on the element's locale, so Latin text inside such an
     // element takes it as well.
-    {"Noto Serif Devanagari", ",Courier New",
-     {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
+    {.platform = "Noto Serif Devanagari", .windows = ",Courier New",
+     .prefs = {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
       "webkit.webprefs.fonts.fixed.Grek"}},
 
     // Windows gives standard and sansserif the same value for every CJK
     // script, so one rewritten resource seats both rows and leaves the other
     // resource free for a row that had none.
-    {",Noto Sans JP,Noto Sans CJK JP,Arial", ",Meiryo,Yu Gothic",
-     {"webkit.webprefs.fonts.sansserif.Jpan",
+    {.platform = ",Noto Sans JP,Noto Sans CJK JP,Arial", .windows = ",Meiryo,Yu Gothic",
+     .prefs = {"webkit.webprefs.fonts.sansserif.Jpan",
       "webkit.webprefs.fonts.standard.Jpan"}},
     // The standard row's resource carries the fixed family instead. Only one
     // of the two fits, and the fixed family is the one whose absence shows.
-    {",Noto Sans JP,Noto Sans CJK JP,Times New Roman", ",BIZ UDGothic,MS Gothic",
-     {"webkit.webprefs.fonts.fixed.Jpan"}},
+    {.platform = ",Noto Sans JP,Noto Sans CJK JP,Times New Roman", .windows = ",BIZ UDGothic,MS Gothic",
+     .prefs = {"webkit.webprefs.fonts.fixed.Jpan"}},
     // The serif families Windows names for the CJK scripts ship with neither
     // platform, so the whole list misses there and the script's standard
     // family answers. This platform would fall through to fontconfig's serif,
@@ -87,33 +87,33 @@ constexpr Substitution kSubstitutions[] = {
     // face. The Noto entries are dropped for the same reason. What mirrors
     // Windows is the value that resolves to the face Windows resolves to, not
     // the string it stores.
-    {",Noto Serif JP,Noto Serif CJK JP,Times New Roman",
-     ",Yu Mincho,MS PMincho,Yu Gothic",
-     {"webkit.webprefs.fonts.serif.Jpan"}},
+    {.platform = ",Noto Serif JP,Noto Serif CJK JP,Times New Roman",
+     .windows = ",Yu Mincho,MS PMincho,Yu Gothic",
+     .prefs = {"webkit.webprefs.fonts.serif.Jpan"}},
 
     // The fixed row joins them. Windows names Gulimche, which ships with
     // neither platform, so that row lands on the standard family too.
-    {",Noto Sans KR,Noto Sans CJK KR,Arial", ",Malgun Gothic",
-     {"webkit.webprefs.fonts.sansserif.Hang",
+    {.platform = ",Noto Sans KR,Noto Sans CJK KR,Arial", .windows = ",Malgun Gothic",
+     .prefs = {"webkit.webprefs.fonts.sansserif.Hang",
       "webkit.webprefs.fonts.standard.Hang",
       "webkit.webprefs.fonts.fixed.Hang"}},
-    {",Noto Sans KR,Noto Sans CJK KR,Times New Roman", ",Gungsuh",
-     {"webkit.webprefs.fonts.cursive.Hang"}},
-    {",Noto Serif KR,Noto Serif CJK KR,Times New Roman",
-     ",Batang,Malgun Gothic",
-     {"webkit.webprefs.fonts.serif.Hang"}},
+    {.platform = ",Noto Sans KR,Noto Sans CJK KR,Times New Roman", .windows = ",Gungsuh",
+     .prefs = {"webkit.webprefs.fonts.cursive.Hang"}},
+    {.platform = ",Noto Serif KR,Noto Serif CJK KR,Times New Roman",
+     .windows = ",Batang,Malgun Gothic",
+     .prefs = {"webkit.webprefs.fonts.serif.Hang"}},
 
     // Arabic has no sans-serif family on Linux to rewrite, so the Japanese
     // fixed one carries Segoe UI for the row below.
-    {"Noto Sans Mono CJK JP", ",Segoe UI", {"webkit.webprefs.fonts.sansserif.Arab"}},
+    {.platform = "Noto Sans Mono CJK JP", .windows = ",Segoe UI", .prefs = {"webkit.webprefs.fonts.sansserif.Arab"}},
 
-    {",Noto Sans SC,Noto Sans CJK SC,Arial", ",Microsoft YaHei",
-     {"webkit.webprefs.fonts.sansserif.Hans",
+    {.platform = ",Noto Sans SC,Noto Sans CJK SC,Arial", .windows = ",Microsoft YaHei",
+     .prefs = {"webkit.webprefs.fonts.sansserif.Hans",
       "webkit.webprefs.fonts.standard.Hans"}},
-    {",Noto Sans SC,Noto Sans CJK SC,Times New Roman", ",KaiTi",
-     {"webkit.webprefs.fonts.cursive.Hans"}},
-    {",Noto Serif SC,Noto Serif CJK SC,Times New Roman", ",Simsun",
-     {"webkit.webprefs.fonts.serif.Hans"}},
+    {.platform = ",Noto Sans SC,Noto Sans CJK SC,Times New Roman", .windows = ",KaiTi",
+     .prefs = {"webkit.webprefs.fonts.cursive.Hans"}},
+    {.platform = ",Noto Serif SC,Noto Serif CJK SC,Times New Roman", .windows = ",Simsun",
+     .prefs = {"webkit.webprefs.fonts.serif.Hans"}},
 
     // Windows differentiates the fixed family per script too;
     // IDS_FIXED_FONT_FAMILY_SIMPLIFIED_HAN is NSimsun, and Blink keys the map
@@ -121,18 +121,18 @@ constexpr Substitution kSubstitutions[] = {
     // well. The Devanagari fixed resource carries it, since no table row
     // reads that one. A list, because a plain name is dropped between the
     // table and the renderer while the list form resolves to the same face.
-    {"Noto Sans Mono", ",NSimsun", {"webkit.webprefs.fonts.fixed.Hans"}},
+    {.platform = "Noto Sans Mono", .windows = ",NSimsun", .prefs = {"webkit.webprefs.fonts.fixed.Hans"}},
 
     // Same for MingLiU, which Windows names for the Traditional Han fixed row.
-    {",Noto Sans TC,Noto Sans CJK TC,Arial", ",Microsoft JhengHei",
-     {"webkit.webprefs.fonts.sansserif.Hant",
+    {.platform = ",Noto Sans TC,Noto Sans CJK TC,Arial", .windows = ",Microsoft JhengHei",
+     .prefs = {"webkit.webprefs.fonts.sansserif.Hant",
       "webkit.webprefs.fonts.standard.Hant",
       "webkit.webprefs.fonts.fixed.Hant"}},
-    {",Noto Sans TC,Noto Sans CJK TC,Times New Roman", ",DFKai-SB",
-     {"webkit.webprefs.fonts.cursive.Hant"}},
-    {",Noto Serif TC,Noto Serif CJK TC,Times New Roman",
-     ",PMingLiU,Microsoft JhengHei",
-     {"webkit.webprefs.fonts.serif.Hant"}},
+    {.platform = ",Noto Sans TC,Noto Sans CJK TC,Times New Roman", .windows = ",DFKai-SB",
+     .prefs = {"webkit.webprefs.fonts.cursive.Hant"}},
+    {.platform = ",Noto Serif TC,Noto Serif CJK TC,Times New Roman",
+     .windows = ",PMingLiU,Microsoft JhengHei",
+     .prefs = {"webkit.webprefs.fonts.serif.Hant"}},
 };
 
 // A value no resource in the bundle can carry, added as a resource of its own.
@@ -145,10 +145,10 @@ struct Minted
 };
 
 constexpr Minted kMinted[] = {
-    {",Courier New",
-     {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
+    {.windows = ",Courier New",
+     .prefs = {"webkit.webprefs.fonts.fixed.Arab", "webkit.webprefs.fonts.fixed.Cyrl",
       "webkit.webprefs.fonts.fixed.Grek"}},
-    {",NSimsun", {"webkit.webprefs.fonts.fixed.Hans"}},
+    {.windows = ",NSimsun", .prefs = {"webkit.webprefs.fonts.fixed.Hans"}},
 };
 
 // Which resource carries each per-script list, learned while patching.
@@ -236,7 +236,7 @@ void Mint(unsigned char* bytes, const size_t length, const size_t count,
         return;
     }
 
-    unsigned char* const table = bytes + kHeaderLengthV5;
+    const unsigned char* table = bytes + kHeaderLengthV5;
     const size_t grown = kHeaderLengthV5 + (count + 1 + want) * kEntrySize +
                          aliases * kAliasSize;
     size_t total = grown;
@@ -296,7 +296,7 @@ void Mint(unsigned char* bytes, const size_t length, const size_t count,
         at += static_cast<uint32_t>(size);
         for (const char* pref : wanted[i]->prefs) {
             if (pref != nullptr && g_learned_count < kLearnedMax) {
-                g_learned[g_learned_count++] = {pref, id};
+                g_learned[g_learned_count++] = {.pref = pref, .resource = id};
             }
         }
         if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
@@ -365,7 +365,7 @@ unsigned PatchBundle(void* base, const size_t length)
             // non-empty pieces, so trailing commas name nothing.
             std::memset(bytes + start + wanted, ',', size - wanted);
             if (shrunk_count < kShrunkMax) {
-                shrunk[shrunk_count++] = {i, static_cast<uint32_t>(wanted)};
+                shrunk[shrunk_count++] = {.entry = i, .size = static_cast<uint32_t>(wanted)};
             }
             if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
                 (void)std::fprintf(stderr,
@@ -376,7 +376,7 @@ unsigned PatchBundle(void* base, const size_t length)
             }
             for (const char* pref : s.prefs) {
                 if (pref != nullptr && g_learned_count < kLearnedMax) {
-                    g_learned[g_learned_count++] = {pref, ReadU16(entry)};
+                    g_learned[g_learned_count++] = {.pref = pref, .resource = ReadU16(entry)};
                 }
             }
             ++patched;
@@ -427,9 +427,9 @@ constexpr const char* kWindowsRows[] = {
 };
 
 // The row the array is found by. Its value is one no other table holds.
-constexpr const char* kAnchorPref = "webkit.webprefs.fonts.fantasy.Zyyy";
+constexpr auto* kAnchorPref = "webkit.webprefs.fonts.fantasy.Zyyy";
 
-constexpr const char* kPrefPrefix = "webkit.webprefs.fonts.";
+constexpr auto* kPrefPrefix = "webkit.webprefs.fonts.";
 constexpr size_t kRowSize = 16;   // const char* then int, padded
 
 struct Image
@@ -477,7 +477,7 @@ bool HoldsTable(const dl_phdr_info* info)
     // This library writes the anchor down too, so its own image never counts.
     static const uintptr_t self = [] {
         Dl_info me{};
-        return dladdr(reinterpret_cast<const void*>(kAnchorPref), &me) != 0
+        return dladdr(kAnchorPref, &me) != 0
                    ? reinterpret_cast<uintptr_t>(me.dli_fbase)
                    : 0;
     }();
@@ -492,7 +492,7 @@ bool HoldsTable(const dl_phdr_info* info)
         }
         const auto* from = reinterpret_cast<const unsigned char*>(info->dlpi_addr +
                                                                  header.p_vaddr);
-        if (::memmem(from, header.p_filesz, kAnchorPref, length) != nullptr) {
+        if (memmem(from, header.p_filesz, kAnchorPref, length) != nullptr) {
             return true;
         }
     }
@@ -520,15 +520,15 @@ int NoteImage(dl_phdr_info* info, size_t, void* data)
             image->end = to;
         }
         if (header.p_type == PT_GNU_RELRO) {
-            g_relro = {from, from + header.p_memsz};
+            g_relro = {.begin = from, .end = from + header.p_memsz};
             continue;
         }
         if ((header.p_flags & PF_X) == 0) {
             if (g_data_count < kMaxSegments) {
-                g_data[g_data_count++] = {from, to};
+                g_data[g_data_count++] = {.begin = from, .end = to};
             }
         } else if (g_text_count < kMaxSegments) {
-            g_text[g_text_count++] = {from, to};
+            g_text[g_text_count++] = {.begin = from, .end = to};
         }
     }
     return 1;
@@ -548,7 +548,7 @@ const unsigned char* FindBytes(const unsigned char* from, const unsigned char* t
         return nullptr;
     }
     const auto* found = static_cast<const unsigned char*>(
-        ::memmem(from, static_cast<size_t>(to - from), what, length));
+        memmem(from, static_cast<size_t>(to - from), what, length));
     return found;
 }
 
@@ -733,7 +733,7 @@ bool IsRow(const unsigned char* at)
         return false;
     }
     const char* name = nullptr;
-    std::memcpy(&name, at, sizeof(name));
+    std::memcpy(static_cast<void*>(&name), at, sizeof(name));
     if (!InImage(name) ||
         std::strncmp(name, kPrefPrefix, std::strlen(kPrefPrefix)) != 0) {
         return false;
@@ -800,9 +800,9 @@ void PatchFontDefaults()
         for (const unsigned char* anchor = FindInData(kAnchorPref, length);
              anchor != nullptr && first == nullptr;
              anchor = FindInData(kAnchorPref, length, anchor + 1)) {
-            for (const unsigned char* row = FindInData(&anchor, sizeof(anchor));
+            for (const unsigned char* row = FindInData(static_cast<const void*>(&anchor), sizeof(anchor));
                  row != nullptr;
-                 row = FindInData(&anchor, sizeof(anchor), row + 1)) {
+                 row = FindInData(static_cast<const void*>(&anchor), sizeof(anchor), row + 1)) {
                 // A row of kFontDefaults, not a bare pointer in some other
                 // table.
                 if (!IsRow(row) || !IsRow(row - kRowSize) ||
@@ -856,7 +856,7 @@ void PatchFontDefaults()
         bool present = false;
         for (unsigned i = 0; i < rows && !present; ++i) {
             const char* held = nullptr;
-            std::memcpy(&held, table + i * kRowSize, sizeof(held));
+            std::memcpy(static_cast<void*>(&held), table + i * kRowSize, sizeof(held));
             present = held == reinterpret_cast<const char*>(name);
         }
         if (present) {
@@ -876,7 +876,7 @@ void PatchFontDefaults()
         }
         const auto* pref = reinterpret_cast<const char*>(name);
         unsigned char* at = table + rows * kRowSize;
-        std::memcpy(at, &pref, sizeof(pref));
+        std::memcpy(at, static_cast<const void*>(&pref), sizeof(pref));
         const int id = resource;
         std::memcpy(at + sizeof(pref), &id, sizeof(id));
         std::memset(at + sizeof(pref) + sizeof(id), 0,
@@ -898,7 +898,7 @@ void PatchFontDefaults()
     if (std::getenv("DWC_GENERIC_LOG") != nullptr) {
         for (unsigned i = 0; i < rows; ++i) {
             const char* held = nullptr;
-            std::memcpy(&held, table + i * kRowSize, sizeof(held));
+            std::memcpy(static_cast<void*>(&held), table + i * kRowSize, sizeof(held));
             int id = 0;
             std::memcpy(&id, table + i * kRowSize + sizeof(held), sizeof(id));
             (void)std::fprintf(stderr,
@@ -939,7 +939,7 @@ void* MapAndPatch(const MmapFn real, void* addr, const size_t length, const int 
     // One map at a time: PatchBundle appends to the learned list and the row
     // patch reads it, and two packs can arrive on two threads.
     static std::mutex patch_mutex;
-    const std::lock_guard<std::mutex> lock(patch_mutex);
+    const std::lock_guard lock(patch_mutex);
     if (generic_families::PatchBundle(mapped, length) > 0) {
         PatchFontDefaults();
     }
@@ -959,7 +959,7 @@ void* MmapImpl(const char* name, void* addr, const size_t length, const int prot
     }
     // dlsym and the parity gate both allocate, and an allocator that reaches
     // mmap would come back through here.
-    static thread_local bool inside = false;
+    thread_local bool inside = false;
     if (inside || fd < 0 || offset != 0 || (prot & PROT_WRITE) != 0 ||
         (flags & MAP_SHARED) == 0) {
         return real(addr, length, prot, flags, fd, offset);
@@ -974,13 +974,13 @@ void* MmapImpl(const char* name, void* addr, const size_t length, const int prot
 }  // namespace
 
 extern "C" __attribute__((visibility("default")))
-void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+void* mmap(void* addr, const size_t length, const int prot, const int flags, const int fd, const off_t offset)
 {
     return MmapImpl("mmap", addr, length, prot, flags, fd, offset);
 }
 
 extern "C" __attribute__((visibility("default")))
-void* mmap64(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+void* mmap64(void* addr, const size_t length, const int prot, const int flags, const int fd, const off_t offset)
 {
     return MmapImpl("mmap64", addr, length, prot, flags, fd, offset);
 }

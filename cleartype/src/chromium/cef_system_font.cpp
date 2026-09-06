@@ -25,7 +25,7 @@
 
 namespace {
 
-const char kSwitch[] = "--system-font-family=Segoe UI";
+constexpr char kSwitch[] = "--system-font-family=Segoe UI";
 
 // Whether libcef.so is in the link map. It is a DT_NEEDED of the executable,
 // so it is mapped before control reaches here, and neither Electron build
@@ -80,7 +80,7 @@ std::vector<char*>& Argv()
 using StartFn = int (*)(int (*)(int, char**, char**), int, char**, int (*)(int, char**, char**),
                         void (*)(), void (*)(), void*);
 
-extern "C" __attribute__((visibility("default"))) int __libc_start_main(int (*main_fn)(int, char**, char**), int argc, char** argv,
+extern "C" __attribute__((visibility("default"))) int __libc_start_main(int (*main_fn)(int, char**, char**), const int argc, char** argv,
                                  int (*init)(int, char**, char**), void (*fini)(),
                                  void (*rtld_fini)(), void* stack_end)
 {

@@ -68,18 +68,18 @@ struct WeightPair
 };
 
 constexpr WeightPair kWeights[] = {
-    {0, 100},     // THIN
-    {40, 200},    // EXTRALIGHT
-    {50, 300},    // LIGHT
-    {55, 350},    // DEMILIGHT
-    {75, 380},    // BOOK
-    {80, 400},    // REGULAR
-    {100, 500},   // MEDIUM
-    {180, 600},   // DEMIBOLD
-    {200, 700},   // BOLD
-    {205, 800},   // EXTRABOLD
-    {210, 900},   // BLACK
-    {215, 1000},  // EXTRABLACK
+    {.fc = 0, .open_type = 100},     // THIN
+    {.fc = 40, .open_type = 200},    // EXTRALIGHT
+    {.fc = 50, .open_type = 300},    // LIGHT
+    {.fc = 55, .open_type = 350},    // DEMILIGHT
+    {.fc = 75, .open_type = 380},    // BOOK
+    {.fc = 80, .open_type = 400},    // REGULAR
+    {.fc = 100, .open_type = 500},   // MEDIUM
+    {.fc = 180, .open_type = 600},   // DEMIBOLD
+    {.fc = 200, .open_type = 700},   // BOLD
+    {.fc = 205, .open_type = 800},   // EXTRABOLD
+    {.fc = 210, .open_type = 900},   // BLACK
+    {.fc = 215, .open_type = 1000},  // EXTRABLACK
 };
 
 // map_ranges, on the fontconfig column.
@@ -89,7 +89,7 @@ float OpenTypeWeightImpl(const int fc_weight)
     if (value < kWeights[0].fc) {
         return kWeights[0].open_type;
     }
-    constexpr int last = static_cast<int>(sizeof(kWeights) / sizeof(kWeights[0])) - 1;
+    constexpr int last = static_cast<int>(std::size(kWeights)) - 1;
     for (int i = 0; i < last; ++i) {
         if (value < kWeights[i + 1].fc) {
             const WeightPair& lo = kWeights[i];
@@ -169,7 +169,7 @@ int DWriteWantsUpright(const char* family, const int weight, const int style)
                            family, weight, style, got_weight,
                            got_italic ? "italic" : "upright", upright);
     }
-    if (count < sizeof(seen) / sizeof(seen[0]) &&
+    if (count < std::size(seen) &&
         std::strlen(family) < sizeof(seen[0].family)) {
         (void)std::snprintf(seen[count].family, sizeof(seen[count].family), "%s", family);
         seen[count].weight = weight;
@@ -202,13 +202,14 @@ int FontconfigWeightNear(const int open_type)
     if (value <= kWeights[0].open_type) {
         return static_cast<int>(kWeights[0].fc);
     }
-    constexpr int last = static_cast<int>(sizeof(kWeights) / sizeof(kWeights[0])) - 1;
+    constexpr int last = static_cast<int>(std::size(kWeights)) - 1;
     for (int i = 0; i < last; ++i) {
         if (value <= kWeights[i + 1].open_type) {
             const WeightPair& lo = kWeights[i];
             const WeightPair& hi = kWeights[i + 1];
             const float fc = lo.fc + (value - lo.open_type) * (hi.fc - lo.fc) /
                                          (hi.open_type - lo.open_type);
+            // NOLINTNEXTLINE(bugprone-incorrect-roundings)
             return static_cast<int>(fc + 0.5f);
         }
     }
@@ -222,7 +223,7 @@ bool BeatsForWindows(const float candidate, const float best, const float wanted
 
 void ReorderForWindows(const void* pattern, void* sorted)
 {
-    auto* set = static_cast<FcFontSet*>(sorted);
+    const auto* set = static_cast<FcFontSet*>(sorted);
     if (!chromium_patch::ParityWanted() || set == nullptr || set->nfont <= 1 ||
         pattern == nullptr) {
         return;
@@ -289,7 +290,7 @@ void ReorderForWindows(const void* pattern, void* sorted)
     int winner = -1;
     float best = 0;
     for (int i = 0; i < set->nfont; ++i) {
-        void* font = set->fonts[i];
+        const void* font = set->fonts[i];
         int font_slant = 0;
         int font_weight = 0;
         unsigned char* file = nullptr;
@@ -317,7 +318,7 @@ void ReorderForWindows(const void* pattern, void* sorted)
         unsigned char* now = nullptr;
         get_string(set->fonts[0], "file", 0, &was);
         get_string(set->fonts[winner], "file", 0, &now);
-        std::fprintf(stderr, "[family_match] %s fc_weight=%d wanted=%.1f  %s -> %s\n",
+        (void)std::fprintf(stderr, "[family_match] %s fc_weight=%d wanted=%.1f  %s -> %s\n",
                      family, fc_weight, static_cast<double>(wanted),
                      was ? reinterpret_cast<const char*>(was) : "?",
                      now ? reinterpret_cast<const char*>(now) : "?");

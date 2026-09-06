@@ -45,7 +45,7 @@ void Report(const char* what, const unsigned long value)
     if (std::getenv("DWC_BOLD_WEIGHT_LOG") == nullptr) {
         return;
     }
-    (void)std::fprintf(stderr, "chromium-patch: bold weight [%d]: %s 0x%lx\n", ::getpid(),
+    (void)std::fprintf(stderr, "chromium-patch: bold weight [%d]: %s 0x%lx\n", getpid(),
                        what, value);
 }
 
@@ -145,6 +145,7 @@ long WeightOffset(const unsigned char* at, const size_t span)
         long disp = 0;
         size_t next = 0;
         if ((modrm & 0xC0) == 0x40) {
+            // NOLINTNEXTLINE
             disp = static_cast<signed char>(at[o + 3]);
             next = o + 4;
         } else if ((modrm & 0xC0) == 0x80) {
@@ -197,8 +198,8 @@ int NoteImage(dl_phdr_info* info, size_t, void* out)
 // the mark also keeps a bold answer from overwriting the regular one.
 bool QueryReplacement(int32_t c, const char* locale, void* out)
 {
-    if (t_bold && c > 0 && (c & bold_weight::kBoldMark) == 0) {
-        c |= bold_weight::kBoldMark;
+    if (t_bold && c > 0 && (c & kBoldMark) == 0) {
+        c |= kBoldMark;
         static bool said = false;
         if (!said) {
             said = true;
@@ -214,7 +215,7 @@ bool QueryReplacement(int32_t c, const char* locale, void* out)
 const void* Replacement(void* self, const void* description, const int32_t c,
                         const void* substitute, const int priority)
 {
-    bool was = t_bold;
+    const bool was = t_bold;
     if (description != nullptr && g_weight_offset >= 0) {
         int16_t backing = 0;
         std::memcpy(&backing,

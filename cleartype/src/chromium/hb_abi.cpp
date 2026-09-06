@@ -74,8 +74,8 @@ int Note(dl_phdr_info* info, size_t, void* out)
     // The main executable comes through with an empty name.
     const char* name = info->dlpi_name;
     const bool main_image = name == nullptr || name[0] == '\0';
-    images->push_back({main_image ? "/proc/self/exe" : name,
-                       static_cast<uintptr_t>(info->dlpi_addr), main_image});
+    images->push_back({.path = main_image ? "/proc/self/exe" : name,
+                       .bias = info->dlpi_addr, .main = main_image});
     return 0;
 }
 
@@ -92,8 +92,7 @@ class Mapping
         struct stat st = {};
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             size_ = static_cast<size_t>(st.st_size);
-            void* at = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (at != MAP_FAILED) {
+            if (const void* at = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0); at != MAP_FAILED) {
                 base_ = static_cast<const unsigned char*>(at);
             } else {
                 size_ = 0;
@@ -203,7 +202,7 @@ Table Collect(const char* prefix, const bool main_only)
 
 // Skia's Fontations typeface, which every Chromium carries and which names the
 // library Blink was linked into.
-constexpr const char* kSkiaWitness = "_ZTV21SkTypeface_Fontations";
+constexpr auto* kSkiaWitness = "_ZTV21SkTypeface_Fontations";
 
 // The same scan over the library that holds Blink, for a build whose
 // executable is only a launcher. CEF is that shape: cefsimple names no
@@ -224,6 +223,7 @@ Table CollectFromBlinkLibrary(const char* prefix, std::string* which)
         }
         Table out;
         ReadImage(image, prefix, prefix_len, &out);
+        // ReSharper disable once CppDFAConstantConditions
         if (!out.empty() && which != nullptr) {
             *which = image.path;
         }
@@ -254,7 +254,7 @@ bool ImageImports(const char* symbol)
     {
         const char* symbol;
         bool found;
-    } ask{symbol, false};
+    } ask{.symbol = symbol, .found = false};
 
     dl_iterate_phdr(
         [](dl_phdr_info* info, size_t, void* data) {
@@ -319,9 +319,9 @@ bool ImageImports(const char* symbol)
 
 // A build either has HarfBuzz or does not, so one name settles the question
 // and nothing else is looked up until it is found.
-constexpr const char* kWitness = "hb_shape";
+constexpr auto* kWitness = "hb_shape";
 
-Linkage g_where = Linkage::kAbsent;
+auto g_where = Linkage::kAbsent;
 bool g_resolved = false;
 
 // A copy already in the process, which RTLD_NEXT misses when this library was
@@ -378,7 +378,7 @@ void ResolveAtLoad()
     // same symbols, and detouring one of those patches a copy Blink never
     // calls.
     Symbols() = Collect("hb_", true);
-    if (Symbols().count(kWitness) != 0) {
+    if (Symbols().contains(kWitness)) {
         g_where = Linkage::kInImage;
         Say("HarfBuzz is compiled into the binary and its symbol table names "
             "it, so hb_shape is replaced where it stands");
@@ -391,7 +391,7 @@ void ResolveAtLoad()
     // exists to prevent.
     std::string library;
     if (Table found = CollectFromBlinkLibrary("hb_", &library);
-        found.count(kWitness) != 0) {
+        found.contains(kWitness)) {
         Symbols() = std::move(found);
         g_where = Linkage::kInImage;
         char line[512];
@@ -426,7 +426,7 @@ unsigned RedirectCallsTo(void* target, void* to)
         size_t size;
         bool found;
     };
-    Span span = {reinterpret_cast<uintptr_t>(info.dli_fbase), nullptr, 0, false};
+    Span span = {.base = reinterpret_cast<uintptr_t>(info.dli_fbase), .begin = nullptr, .size = 0, .found = false};
     dl_iterate_phdr(
         [](dl_phdr_info* image, size_t, void* out) {
             auto* want = static_cast<Span*>(out);
@@ -475,7 +475,7 @@ unsigned RedirectCallsTo(void* target, void* to)
         }
         auto* at = const_cast<unsigned char*>(span.begin + i + 1);
         const auto start = reinterpret_cast<uintptr_t>(at) & ~static_cast<uintptr_t>(page - 1);
-        const uintptr_t last = (reinterpret_cast<uintptr_t>(at) + sizeof(rel) - 1) &
+        const uintptr_t last = reinterpret_cast<uintptr_t>(at) + sizeof(rel) - 1 &
                                ~static_cast<uintptr_t>(page - 1);
         const size_t len = last - start + static_cast<size_t>(page);
         auto* base = reinterpret_cast<void*>(start);

@@ -90,16 +90,16 @@ Matrix2x2 GivensRotation(const float a, const float b)
         c = 1.0f / u;
         s = -c * t;
     }
-    return Matrix2x2{c, -s, s, c};
+    return Matrix2x2{.scale_x = c, .skew_x = -s, .skew_y = s, .scale_y = c};
 }
 
 // Left-multiply, the 2x2 of SkMatrix::preConcat on a rotation.
 Matrix2x2 Concat(const Matrix2x2& l, const Matrix2x2& r)
 {
-    return Matrix2x2{l.scale_x * r.scale_x + l.skew_x * r.skew_y,
-                     l.scale_x * r.skew_x + l.skew_x * r.scale_y,
-                     l.skew_y * r.scale_x + l.scale_y * r.skew_y,
-                     l.skew_y * r.skew_x + l.scale_y * r.scale_y};
+    return Matrix2x2{.scale_x = l.scale_x * r.scale_x + l.skew_x * r.skew_y,
+                     .skew_x = l.scale_x * r.skew_x + l.skew_x * r.scale_y,
+                     .skew_y = l.skew_y * r.scale_x + l.scale_y * r.skew_y,
+                     .scale_y = l.skew_y * r.skew_x + l.scale_y * r.scale_y};
 }
 
 }  // namespace
@@ -140,7 +140,7 @@ bool ComputeMatrices(const skia_abi::Rec& rec, float* scale_y, Matrix2x2* remain
         !std::isfinite(ga.scale_x) || !std::isfinite(ga.scale_y) ||
         !std::isfinite(ga.skew_x) || !std::isfinite(ga.skew_y)) {
         *scale_y = 1.0f;
-        *remaining = Matrix2x2{0, 0, 0, 0};
+        *remaining = Matrix2x2{.scale_x = 0, .skew_x = 0, .skew_y = 0, .scale_y = 0};
         return false;
     }
 
@@ -151,11 +151,11 @@ bool ComputeMatrices(const skia_abi::Rec& rec, float* scale_y, Matrix2x2* remain
     if (!skewed_or_flipped && a.scale_x == a.scale_y) {
         *remaining = Matrix2x2{};
     } else if (!skewed_or_flipped) {
-        *remaining = Matrix2x2{a.scale_x / y, 0, 0, 1};
+        *remaining = Matrix2x2{.scale_x = a.scale_x / y, .skew_x = 0, .skew_y = 0, .scale_y = 1};
     } else {
         // sA = A with the scale taken out, preScale(1/s.fX, 1/s.fY), and
         // kVertical made both components y.
-        *remaining = Matrix2x2{a.scale_x / y, a.skew_x / y, a.skew_y / y, a.scale_y / y};
+        *remaining = Matrix2x2{.scale_x = a.scale_x / y, .skew_x = a.skew_x / y, .skew_y = a.skew_y / y, .scale_y = a.scale_y / y};
     }
     return true;
 }

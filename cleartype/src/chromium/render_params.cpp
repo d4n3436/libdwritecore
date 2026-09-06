@@ -5,6 +5,12 @@
 // ReSharper disable CppUseStructuredBinding
 // ReSharper disable CppVariableCanBeMadeConstexpr
 
+// The rec size is pinned to the canonical value exactly; a tolerance would
+// match a nearby size and take a branch Windows does not.
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+
+#include <ranges>
+
 #include "render_params.h"
 
 #include <algorithm>
@@ -258,6 +264,7 @@ QueryFn g_query = nullptr;
 extern "C" void* ChromiumQuery(void* out, const void* query, void* family_out)
 {
     void* result = g_query(out, query, family_out);
+    // ReSharper disable once CppDFAConstantConditions
     if (out != nullptr) {
         ChromiumFontRenderParams(nullptr, out);
         static_cast<unsigned char*>(out)[kFieldSubpixelPositioning] = 0;
@@ -354,7 +361,7 @@ void AnswerTheQuery(const Image& image, const std::vector<uintptr_t>& starts,
     FindStrings(image, kQueryName, 0, &named);
     uintptr_t site = 0;
     unsigned sites = 0;
-    for (const auto& [address, which] : named) {
+    for (const auto& address : std::views::keys(named)) {
         uintptr_t one = 0;
         if (const unsigned n = LeaSites(image, address, &one, 1); n != 0) {
             sites += n;

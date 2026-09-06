@@ -857,7 +857,7 @@ struct DWriteFallback
     // list also covers the character; the family is then walked ahead of the
     // list. The halfwidth katakana marks answer from MS PGothic, which Yu
     // Gothic in the list also covers.
-    bool ahead;
+    bool ahead = false;
 };
 
 constexpr DWriteFallback kDWriteFallback[] = {
@@ -990,7 +990,7 @@ int MoveToFront(FcFontSet* set, const char* family, int front)
             continue;
         }
         void* moved = set->fonts[i];
-        std::memmove(&set->fonts[front + 1], &set->fonts[front],
+        std::memmove(static_cast<void*>(&set->fonts[front + 1]), static_cast<const void*>(&set->fonts[front]),
                      static_cast<size_t>(i - front) * sizeof(set->fonts[0]));
         set->fonts[front] = moved;
         ++front;
@@ -1124,9 +1124,9 @@ int FcCharSetHasChar(const void* charset, unsigned codepoint)
          (codepoint >= 0x31A0 && codepoint <= 0x31BF)) &&
         HasFamily(charset, "Microsoft JhengHei") &&
         HasFamily(charset, "Microsoft JhengHei UI")) {
-        static thread_local unsigned seen_cp = 0;
-        static thread_local const void* seen[8] = {};
-        static thread_local unsigned seen_count = 0;
+        thread_local unsigned seen_cp = 0;
+        thread_local const void* seen[8] = {};
+        thread_local unsigned seen_count = 0;
         if (seen_cp != codepoint) {
             seen_cp = codepoint;
             seen_count = 0;

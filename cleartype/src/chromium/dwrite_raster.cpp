@@ -273,13 +273,13 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
     std::vector<DWRITE_FONT_AXIS_VALUE> values;
     values.reserve(coords->size());
     for (const VariationCoord& c : *coords) {
-        values.push_back({static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(c.axis)),
-                          c.value});
+        values.push_back({.axisTag = static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(c.axis)),
+                          .value = c.value});
     }
     if (std::getenv("DWC_VAR_LOG") != nullptr) {
-        (void)std::fprintf(stderr, "chromium-patch: var [%d]: passing:", ::getpid());
+        (void)std::fprintf(stderr, "chromium-patch: var [%d]: passing:", getpid());
         for (const DWRITE_FONT_AXIS_VALUE& v : values) {
-            const uint32_t t = __builtin_bswap32(static_cast<uint32_t>(v.axisTag));
+            const uint32_t t = __builtin_bswap32(v.axisTag);
             (void)std::fprintf(stderr, " %c%c%c%c=%g", t >> 24, (t >> 16) & 0xff,
                                (t >> 8) & 0xff, t & 0xff, static_cast<double>(v.value));
         }
@@ -308,8 +308,8 @@ FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
     // other face of a collection, whose bytes are the whole file and therefore
     // the same for all of them.
     static std::unordered_map<FaceKey, std::unique_ptr<FaceSlot>, KeyHash> faces;
-    const FaceKey key{bytes.data(), CoordsHashFor(typeface), face_index, simulate_bold,
-                      simulate_oblique};
+    const FaceKey key{.bytes = bytes.data(), .coords = CoordsHashFor(typeface), .face_index = face_index, .simulate_bold = simulate_bold,
+                      .simulate_oblique = simulate_oblique};
     const std::lock_guard lock(g_faces_mutex);
     if (!EnsureFactory()) {
         return nullptr;
@@ -459,11 +459,11 @@ private:
         return current_.x != pt.x || current_.y != pt.y;
     }
 
-    void Emit(const uint8_t verb, const std::initializer_list<D2D1_POINT_2F> pts)
+    void Emit(const uint8_t verb, const std::initializer_list<D2D1_POINT_2F> pts) const
     {
         verbs_->push_back(verb);
         for (const D2D1_POINT_2F& p : pts) {
-            points_->push_back({p.x, p.y});
+            points_->push_back({.x = p.x, .y = p.y});
         }
     }
 
@@ -502,7 +502,7 @@ private:
         if (!AlmostEquals(mid_y, dy23 * 3 / 2 + b.point3.y)) {
             return false;
         }
-        *control = {mid_x, mid_y};
+        *control = {.x = mid_x, .y = mid_y};
         return true;
     }
 
@@ -528,7 +528,7 @@ IDWriteFont* RegularFace(IDWriteFontCollection* collection, const char* family)
     // is the whole conversion.
     std::u16string wide;
     for (const char* p = family; *p != '\0'; ++p) {
-        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+        wide.push_back(static_cast<unsigned char>(*p));
     }
     UINT32 index = 0;
     BOOL exists = FALSE;
@@ -655,7 +655,7 @@ bool FamilyMatchFace(const char* family, const int weight, const int style,
     }
     std::u16string wide;
     for (const char* p = family; *p != '\0'; ++p) {
-        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+        wide.push_back(static_cast<unsigned char>(*p));
     }
     UINT32 index = 0;
     BOOL exists = FALSE;
@@ -706,7 +706,7 @@ int FamilyMatchWeight(const char* family, const int weight)
     }
     std::u16string wide;
     for (const char* p = family; *p != '\0'; ++p) {
-        wide.push_back(static_cast<char16_t>(static_cast<unsigned char>(*p)));
+        wide.push_back(static_cast<unsigned char>(*p));
     }
     UINT32 index = 0;
     BOOL exists = FALSE;
@@ -835,7 +835,7 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     DWRITE_MATRIX transform{};
     float scale_y = 0;
     windows_path::Matrix2x2 remaining;
-    if (!windows_path::ComputeMatrices(rec, &scale_y, &remaining)) {
+    if (!ComputeMatrices(rec, &scale_y, &remaining)) {
         return false;
     }
     transform.m11 = remaining.scale_x;
@@ -845,9 +845,9 @@ bool GlyphBounds(const void* typeface, const std::vector<uint8_t>& font_bytes,
     transform.dx = static_cast<float>(glyph.SubX()) / 4.0f;
     transform.dy = static_cast<float>(glyph.SubY()) / 4.0f;
 
-    FLOAT advance = 0.0f;
-    UINT16 index = glyph.GlyphId();
-    DWRITE_GLYPH_OFFSET offset{};
+    constexpr FLOAT advance = 0.0f;
+    const UINT16 index = glyph.GlyphId();
+    constexpr DWRITE_GLYPH_OFFSET offset{};
     DWRITE_GLYPH_RUN run{};
     run.glyphCount = 1;
     run.glyphAdvances = &advance;
@@ -961,7 +961,7 @@ bool GlyphAdvance(const void* typeface, const std::vector<uint8_t>& font_bytes,
     // glyph in the wrong place.
     float scale_y = 0;
     windows_path::Matrix2x2 remaining;
-    windows_path::ComputeMatrices(rec, &scale_y, &remaining);
+    ComputeMatrices(rec, &scale_y, &remaining);
     *advance_x = remaining.scale_x * x;
     *advance_y = remaining.skew_y * x;
     return true;
@@ -1070,7 +1070,7 @@ bool GlyphOutline(const void* typeface, const std::vector<uint8_t>& font_bytes,
     verbs->clear();
     points->clear();
     Sink sink(verbs, points);
-    UINT16 id = glyph_id;
+    const UINT16 id = glyph_id;
     if (FAILED(face->GetGlyphRunOutline(size, &id, nullptr, nullptr, 1, FALSE, FALSE, &sink))) {
         return false;
     }
@@ -1111,7 +1111,7 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     DWRITE_MATRIX transform{};
     float scale_y = 0;
     windows_path::Matrix2x2 remaining;
-    windows_path::ComputeMatrices(rec, &scale_y, &remaining);
+    ComputeMatrices(rec, &scale_y, &remaining);
     transform.m11 = remaining.scale_x;
     transform.m12 = remaining.skew_y;
     transform.m21 = remaining.skew_x;

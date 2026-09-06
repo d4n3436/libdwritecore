@@ -78,12 +78,12 @@ bool Readable(const void* at, const size_t n)
     if (g_probe[1] < 0) {
         return false;
     }
-    const ssize_t wrote = ::write(g_probe[1], at, n);
+    const ssize_t wrote = write(g_probe[1], at, n);
     if (wrote <= 0) {
         return false;
     }
     char drain[64];
-    (void)::read(g_probe[0], drain, static_cast<size_t>(wrote));
+    (void)read(g_probe[0], drain, static_cast<size_t>(wrote));
     return static_cast<size_t>(wrote) == n;
 }
 
@@ -144,7 +144,7 @@ void Say(const char* line, const size_t n)
 {
     size_t done = 0;
     while (done < n) {
-        const ssize_t wrote = ::write(2, line + done, n - done);
+        const ssize_t wrote = write(2, line + done, n - done);
         if (wrote <= 0) {
             return;
         }
@@ -173,7 +173,7 @@ void Handler(const int signal_number, siginfo_t* info, void* context)
     // A fault inside the report would recurse forever, so the second one goes
     // straight to whoever handled these before.
     if (g_reporting != 0) {
-        (void)::sigaction(signal_number, &g_previous, nullptr);
+        (void)sigaction(signal_number, &g_previous, nullptr);
         return;
     }
     g_reporting = 1;
@@ -187,7 +187,7 @@ void Handler(const int signal_number, siginfo_t* info, void* context)
     char line[1024];
     char* p = line;
     p = Text(p, "chromium-patch: fault [");
-    p = Decimal(p, static_cast<unsigned>(::getpid()));
+    p = Decimal(p, static_cast<unsigned>(getpid()));
     p = Text(p, "] signal ");
     p = Decimal(p, static_cast<unsigned>(signal_number));
     p = Text(p, " at ");
@@ -228,7 +228,7 @@ void Handler(const int signal_number, siginfo_t* info, void* context)
         p = Frame(p, ret);
         p = Text(p, "\n");
         Say(line, static_cast<size_t>(p - line));
-        if (next <= rbp || next - rbp > (1u << 22)) {
+        if (next <= rbp || next - rbp > 1u << 22) {
             break;
         }
         rbp = next;
@@ -236,7 +236,7 @@ void Handler(const int signal_number, siginfo_t* info, void* context)
 
     // Behavior is preserved by letting the fault happen again with whoever was
     // handling it before back in place.
-    (void)::sigaction(signal_number, &g_previous, nullptr);
+    (void)sigaction(signal_number, &g_previous, nullptr);
     g_reporting = 0;
 }
 
@@ -248,7 +248,7 @@ void Arm()
     action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     (void)sigemptyset(&action.sa_mask);
     struct sigaction was{};
-    (void)::sigaction(SIGSEGV, &action, &was);
+    (void)sigaction(SIGSEGV, &action, &was);
     if (was.sa_sigaction != &Handler) {
         g_previous = was;
     }
@@ -256,7 +256,7 @@ void Arm()
 
 bool Wanted()
 {
-    const char* v = ::getenv("DWC_FAULT_REPORT");
+    const char* v = getenv("DWC_FAULT_REPORT");
     return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 &&
            std::strcmp(v, "off") != 0;
 }
@@ -269,14 +269,14 @@ void InstallAtLoad()
         return;
     }
     dl_iterate_phdr(&NoteModule, nullptr);
-    if (::pipe2(g_probe, O_CLOEXEC | O_NONBLOCK) != 0) {
+    if (pipe2(g_probe, O_CLOEXEC | O_NONBLOCK) != 0) {
         g_probe[0] = -1;
         g_probe[1] = -1;
     }
     stack_t alt{};
     alt.ss_sp = g_stack;
     alt.ss_size = sizeof(g_stack);
-    (void)::sigaltstack(&alt, nullptr);
+    (void)sigaltstack(&alt, nullptr);
     g_armed = true;
     Arm();
 }
@@ -286,7 +286,7 @@ void Ensure()
     // Settled once the handler has been found to be ours a few times running,
     // since the host installs its crash handling during startup and never
     // again. Until then this costs one sigaction query per call.
-    static std::atomic<int> settled{0};
+    static std::atomic settled{0};
     if (!g_armed || settled.load(std::memory_order_relaxed) >= 8) {
         return;
     }
@@ -294,18 +294,18 @@ void Ensure()
     // and a renderer is forked from a process that had already done so, which
     // is why this is asked again from a path that runs once the browser is up.
     struct sigaction now{};
-    if (::sigaction(SIGSEGV, nullptr, &now) == 0 && now.sa_sigaction == &Handler) {
+    if (sigaction(SIGSEGV, nullptr, &now) == 0 && now.sa_sigaction == &Handler) {
         settled.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     settled.store(0, std::memory_order_relaxed);
     // The altstack belongs to the thread, so a thread that has none gets one.
     stack_t current{};
-    if (::sigaltstack(nullptr, &current) == 0 && (current.ss_flags & SS_DISABLE) != 0) {
+    if (sigaltstack(nullptr, &current) == 0 && (current.ss_flags & SS_DISABLE) != 0) {
         stack_t alt{};
         alt.ss_sp = g_stack;
         alt.ss_size = sizeof(g_stack);
-        (void)::sigaltstack(&alt, nullptr);
+        (void)sigaltstack(&alt, nullptr);
     }
     Arm();
 }

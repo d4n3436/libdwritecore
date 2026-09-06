@@ -273,8 +273,7 @@ static std::string WindowsFamilyName(const std::vector<uint8_t>& font,
         }
         const uint16_t platform = Be16(name.data + at);
         const uint16_t encoding = Be16(name.data + at + 2);
-        const uint16_t id = Be16(name.data + at + 6);
-        if (platform != 3 || encoding != 1 || id != 1) {
+        if (const uint16_t id = Be16(name.data + at + 6); platform != 3 || encoding != 1 || id != 1) {
             continue;
         }
         const uint16_t length = Be16(name.data + at + 8);

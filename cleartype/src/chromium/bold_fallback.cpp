@@ -146,7 +146,7 @@ std::string FamilyName(const std::vector<uint8_t>& font)
         return {};
     }
     for (unsigned i = 0; i < count; ++i) {
-        const uint8_t* rec = p + 6 + i * 12;
+        const uint8_t* rec = p + 6 + static_cast<size_t>(i) * 12;
         if (Be16(rec) != 3 || Be16(rec + 6) != 1) {
             continue;
         }
@@ -166,7 +166,7 @@ std::string FamilyName(const std::vector<uint8_t>& font)
 
 void MapFile(const std::string& path)
 {
-    if (Files().count(path) != 0) {
+    if (Files().contains(path)) {
         return;
     }
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -176,7 +176,7 @@ void MapFile(const std::string& path)
     struct stat st{};
     Mapped entry;
     if (fstat(fd, &st) == 0 && st.st_size > 0) {
-        void* m = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        const void* m = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
         if (m != MAP_FAILED) {
             entry.base = static_cast<const unsigned char*>(m);
             entry.size = static_cast<size_t>(st.st_size);
@@ -234,7 +234,7 @@ void MapAtLoad()
     objectset_add(objects, "file");
     objectset_add(objects, "index");
 
-    FcFontSet* set = font_list(config, pattern, objects);
+    const FcFontSet* set = font_list(config, pattern, objects);
     if (set == nullptr) {
         return;
     }
@@ -270,17 +270,16 @@ void MapAtLoad()
         if (get_integer(font, "index", 0, &face_index) != kFcResultMatch) {
             face_index = 0;
         }
-        const Pick pick{std::string(reinterpret_cast<const char*>(file)),
-                        static_cast<uint32_t>(face_index),
-                        family_match::OpenTypeWeight(fc_weight)};
+        const Pick pick{.path = std::string(reinterpret_cast<const char*>(file)),
+                        .face_index = static_cast<uint32_t>(face_index),
+                        .weight = family_match::OpenTypeWeight(fc_weight)};
         for (int n = 0; n < 255; ++n) {
             unsigned char* name = nullptr;
             if (get_string(font, "family", n, &name) != kFcResultMatch) {
                 break;
             }
             const std::string key = Lower(reinterpret_cast<const char*>(name));
-            const auto seen = best.find(key);
-            if (seen == best.end()) {
+            if (const auto seen = best.find(key); seen == best.end()) {
                 best.emplace(key, pick);
             } else if (family_match::BeatsForWindows(pick.weight, seen->second.weight,
                                                      kAssumedWeight)) {
@@ -324,8 +323,8 @@ bool ClearSyntheticBold(void* rec, const std::vector<uint8_t>& font)
     // with the family's Bold Italic face; only upright faces are mapped here,
     // so the run keeps the synthetic bold rather than taking an upright Bold.
     const bool oblique = IsOblique(skia_abi::Read<float>(rec, skia_abi::kRecPreSkewX));
-    const Face bold = RealBoldFor(font, oblique);
-    if (bold.bytes == nullptr && !bold.simulate) {
+    // ReSharper disable once CppDFAConstantConditions
+    if (const Face bold = RealBoldFor(font, oblique); bold.bytes == nullptr && !bold.simulate) {
         return false;
     }
     const auto cleared = static_cast<uint16_t>(flags & ~skia_abi::kEmbolden);
@@ -357,7 +356,7 @@ Face RealBoldFor(const std::vector<uint8_t>& font, const bool oblique)
     if (std::getenv("DWC_BOLD_FALLBACK_LOG") != nullptr) {
         static int said = 0;
         if (said++ < 12) {
-            std::fprintf(stderr, "[bold] \"%s\" have=%.0f mapped=%d pick=%.0f idx=%u %s\n",
+            (void)std::fprintf(stderr, "[bold] \"%s\" have=%.0f mapped=%d pick=%.0f idx=%u %s\n",
                          family.c_str(), static_cast<double>(WeightOf(font)),
                          BoldByFamily().size() > 0 ? 1 : 0,
                          named == BoldByFamily().end() ? 0.0
@@ -377,7 +376,7 @@ Face RealBoldFor(const std::vector<uint8_t>& font, const bool oblique)
     // bitmap strikes, which is the one case FirstMatchingFontWithoutSimulations
     // leaves DirectWrite's own bold simulation on.
     if (named->second.weight <= WeightOf(font)) {
-        return HasBitmapStrikes(font) ? Face{nullptr, 0, true} : Face{};
+        return HasBitmapStrikes(font) ? Face{.bytes = nullptr, .face_index = 0, .simulate = true} : Face{};
     }
     // An oblique run whose family has an italic face. Windows draws it with
     // that face, so the upright bold mapped here is the wrong answer. A family
@@ -394,7 +393,7 @@ Face RealBoldFor(const std::vector<uint8_t>& font, const bool oblique)
         mapped.loaded = true;
         mapped.bytes.assign(mapped.base, mapped.base + mapped.size);
     }
-    return Face{&mapped.bytes, named->second.face_index};
+    return Face{.bytes = &mapped.bytes, .face_index = named->second.face_index};
 }
 
 
@@ -406,7 +405,7 @@ bool BoldFileFor(const char* family, const bool oblique, const char** path,
     }
     std::string key(family);
     for (char& c : key) {
-        c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     }
     const auto& by_family = BoldByFamily();
     const auto found = by_family.find(key);
