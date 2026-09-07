@@ -402,4 +402,24 @@ bool BoldFileFor(const char* family, const bool oblique, const char** path,
     return true;
 }
 
+void CensusCounts(size_t* files, size_t* families, size_t* mapped_bytes)
+{
+    const std::lock_guard lock(g_mutex);
+    if (files != nullptr) {
+        *files = Files().size();
+    }
+    if (families != nullptr) {
+        *families = BoldByFamily().size();
+    }
+    if (mapped_bytes != nullptr) {
+        // Only the copies count. The mapping itself is file-backed and the
+        // kernel can drop it; the vector is what the process holds.
+        size_t held = 0;
+        for (const auto& [name, mapped] : Files()) {
+            held += mapped.bytes.capacity();
+        }
+        *mapped_bytes = held;
+    }
+}
+
 }  // namespace bold_fallback

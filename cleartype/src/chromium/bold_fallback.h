@@ -82,6 +82,10 @@ Face RealBoldFor(const std::vector<uint8_t>& font, bool oblique);
 // italic face, which Windows would reach instead.
 bool BoldFileFor(const char* family, bool oblique, const char** path, uint32_t* face_index);
 
+// Live entries in the fallback side tables and the bytes the mapped files
+// hold, for the census.
+void CensusCounts(size_t* files, size_t* families, size_t* mapped_bytes);
+
 }  // namespace bold_fallback
 
 #endif  // CHROMIUM_BOLD_FALLBACK_H_INCLUDED

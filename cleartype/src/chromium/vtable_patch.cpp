@@ -57,6 +57,7 @@
 #include "path_abi.h"
 #include "typeface_bridge.h"
 #include "font_facts.h"
+#include "../shim_exports.h"
 #include "bold_fallback.h"
 #include "bold_shaping.h"
 #include "bold_weight.h"
@@ -70,6 +71,7 @@
 #include "windows_path.h"
 
 #include <algorithm>
+#include <deque>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
@@ -2175,20 +2177,42 @@ std::mutex g_font_mutex;
 // to tens of megabytes; copying one per glyph is what the cache exists to
 // avoid.
 using FontBytes = std::shared_ptr<const std::vector<uint8_t>>;
-std::unordered_map<const void*, FontBytes> g_fonts;
-std::unordered_map<const void*, std::vector<dwrite_raster::VariationCoord>> g_var_coords;
+// SkTypeface::fUniqueID, which SkTypefaceCache::NewTypefaceID hands out from a
+// counter and never reuses. SkTypeface derives from SkWeakRefCnt, so the field
+// sits after the vtable pointer, SkRefCntBase::fRefCnt and
+// SkWeakRefCnt::fWeakCnt. Zero is never a valid id.
+constexpr size_t kTypefaceUniqueID = sizeof(void*) + 2 * sizeof(int32_t);
+
+uint32_t TypefaceKey(const void* typeface)
+{
+    if (typeface == nullptr) {
+        return 0;
+    }
+    uint32_t id = 0;
+    std::memcpy(&id, static_cast<const unsigned char*>(typeface) + kTypefaceUniqueID,
+                sizeof(id));
+    return id;
+}
+
+// Keyed on that id. Skia frees a typeface and the allocator hands the address
+// back, so an address identifies a font only while the object behind it lives.
+// An id outlives the object it named, and nothing has to be kept alive to keep
+// a key honest.
+std::unordered_map<uint32_t, FontBytes> g_fonts;
+std::unordered_map<uint32_t, std::vector<dwrite_raster::VariationCoord>> g_var_coords;
 
 // Typefaces Windows itself hands to Fontations rather than DirectWrite; see
 // font_facts::FontationsPreferred. Cached beside the bytes so every hook
 // answers alike for a typeface.
-std::unordered_map<const void*, bool> g_plain_fontations;
+std::unordered_map<uint32_t, bool> g_plain_fontations;
 
 // Read under g_font_mutex like everything beside the bytes.
 bool PlainFontationsLocked(void* typeface, const std::vector<uint8_t>& font)
 {
-    auto found = g_plain_fontations.find(typeface);
+    const uint32_t key = TypefaceKey(typeface);
+    auto found = g_plain_fontations.find(key);
     if (found == g_plain_fontations.end()) {
-        found = g_plain_fontations.emplace(typeface,
+        found = g_plain_fontations.emplace(key,
                                            font_facts::FontationsPreferred(font)).first;
         if (found->second) {
             Report("typeface %p renders through Fontations on Windows; parity "
@@ -2365,14 +2389,14 @@ std::vector<uint32_t> FvarAxes(const std::vector<uint8_t>& font)
 void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
 {
     const unsigned index = g_variation_index.load(std::memory_order_relaxed);
-    if (index == 0 || g_var_coords.contains(typeface)) {
+    if (index == 0 || g_var_coords.contains(TypefaceKey(typeface))) {
         return;
     }
     // Only a variable font has anything to ask for, and on a build where the
     // slot is unconfirmed this keeps the call off every other font.
     const std::vector<uint32_t> axes = FvarAxes(font);
     if (axes.empty()) {
-        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+        g_var_coords.emplace(TypefaceKey(typeface), std::vector<dwrite_raster::VariationCoord>{});
         return;
     }
     const auto fn = reinterpret_cast<VariationPositionFn>(
@@ -2383,14 +2407,14 @@ void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
         g_variation_index.store(0, std::memory_order_relaxed);
         Report("slot %u %s, so it is not onGetVariationDesignPosition; variable fonts "
                "will draw at their default instance", index, why);
-        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+        g_var_coords.emplace(TypefaceKey(typeface), std::vector<dwrite_raster::VariationCoord>{});
     };
     if (unconfirmed && count != static_cast<int>(axes.size())) {
         give_up("does not answer the font's axis count");
         return;
     }
     if (count <= 0 || count > 64) {
-        g_var_coords.emplace(typeface, std::vector<dwrite_raster::VariationCoord>{});
+        g_var_coords.emplace(TypefaceKey(typeface), std::vector<dwrite_raster::VariationCoord>{});
         return;
     }
     std::vector<dwrite_raster::VariationCoord> coords(static_cast<size_t>(count));
@@ -2411,25 +2435,7 @@ void ReadVariationCoords(void* typeface, const std::vector<uint8_t>& font)
         Report("slot %u answers the font's axes, so it is "
                "onGetVariationDesignPosition", index);
     }
-    g_var_coords.emplace(typeface, std::move(coords));
-}
-
-// The caches below are keyed on the typeface pointer, which only identifies a
-// font while that address still belongs to the same object. Skia frees
-// typefaces and the allocator hands the address back, and the entry then
-// answers for the wrong font. One reference is taken so a cached typeface
-// outlives its cache entry. SkTypeface derives from SkRefCntBase, whose only
-// field is the count, so it sits one pointer into the object.
-void HoldTypeface(void* typeface)
-{
-    auto* count = reinterpret_cast<std::atomic<int32_t>*>(
-        static_cast<unsigned char*>(typeface) + sizeof(void*));
-    // A live typeface holds a small positive count. Anything else is not the
-    // field this expects, and is left alone.
-    if (const int32_t now = count->load(std::memory_order_relaxed);
-        now > 0 && now < (1 << 20)) {
-        (void)count->fetch_add(1, std::memory_order_relaxed);
-    }
+    g_var_coords.emplace(TypefaceKey(typeface), std::move(coords));
 }
 
 // Distinguishes candidate copies cheaply; equality is decided by comparing
@@ -2455,6 +2461,26 @@ uint64_t QuickHash(const std::vector<uint8_t>& bytes)
 // which is what keeps the pointers ChromiumFontBytes hands out valid, and
 // what makes a vector's address identify its content for every cache
 // downstream.
+// Mirrored out for the census, since the table is local to this function.
+// Under g_font_mutex like the table itself.
+size_t g_content_copies = 0;
+size_t g_content_bytes = 0;
+
+// What font_facts::Describe answered for a typeface at one pair of sizes.
+// Beside the caches above and evicted with them.
+struct CachedFacts
+{
+    int gasp_ppem;
+    int bitmap_ppem;
+    windows_path::FontFacts facts;
+};
+std::unordered_map<uint32_t, CachedFacts> g_facts;
+
+void ForgetFactsLocked(const uint32_t key)
+{
+    g_facts.erase(key);
+}
+
 FontBytes SharedByContentLocked(std::vector<uint8_t>&& raw)
 {
     static std::unordered_map<uint64_t, std::vector<FontBytes>> by_content;
@@ -2465,14 +2491,37 @@ FontBytes SharedByContentLocked(std::vector<uint8_t>&& raw)
         }
     }
     bucket.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(raw)));
+    ++g_content_copies;
+    g_content_bytes += bucket.back()->size();
     return bucket.back();
+}
+
+// Blink mints a fresh typeface every time it uses the same font, so the caches
+// take one entry per use where a page has only a handful of distinct fonts.
+// The bytes behind them are shared by content and cost nothing extra; the
+// entries themselves do, and an evicted one is rebuilt from a typeface that is
+// still perfectly readable. Oldest first, since an id nothing has asked for
+// lately belongs to a typeface Blink has usually already dropped.
+constexpr size_t kMaxCachedTypefaces = 2048;
+std::deque<uint32_t> g_font_order;
+
+void ForgetOldestTypefacesLocked()
+{
+    while (g_font_order.size() > kMaxCachedTypefaces) {
+        const uint32_t oldest = g_font_order.front();
+        g_font_order.pop_front();
+        g_fonts.erase(oldest);
+        g_var_coords.erase(oldest);
+        g_plain_fontations.erase(oldest);
+        ForgetFactsLocked(oldest);
+    }
 }
 
 FontBytes FontBytesLocked(void* typeface)
 {
-    auto font = g_fonts.find(typeface);
+    const uint32_t key = TypefaceKey(typeface);
+    auto font = g_fonts.find(key);
     if (font == g_fonts.end()) {
-        HoldTypeface(typeface);
         FontBytes bytes = SharedByContentLocked(typeface_bridge::ReadFontFile(typeface));
         if (bytes->empty()) {
             Report("typeface %p: no font (its onGetTableTags/onGetTableData could not be "
@@ -2482,32 +2531,120 @@ FontBytes FontBytesLocked(void* typeface)
                    bytes->size());
         }
         ReadVariationCoords(typeface, *bytes);
-        font = g_fonts.emplace(typeface, std::move(bytes)).first;
+        font = g_fonts.emplace(key, std::move(bytes)).first;
+        g_font_order.push_back(key);
+        ForgetOldestTypefacesLocked();
+        // The eviction may have taken the entry just made, when the cap is
+        // smaller than one page's worth of typefaces.
+        font = g_fonts.find(key);
+        if (font == g_fonts.end()) {
+            return SharedByContentLocked({});
+        }
     }
     return font->second;
 }
 
 windows_path::FontFacts FactsFor(void* typeface, const int gasp_ppem, const int bitmap_ppem)
 {
-    struct Cached
-    {
-        int gasp_ppem;
-        int bitmap_ppem;
-        windows_path::FontFacts facts;
-    };
-    static std::unordered_map<const void*, Cached> cache;
-
+    const uint32_t key = TypefaceKey(typeface);
     const std::lock_guard lock(g_font_mutex);
-    if (const auto cached = cache.find(typeface);
-        cached != cache.end() && cached->second.gasp_ppem == gasp_ppem &&
+    if (const auto cached = g_facts.find(key);
+        cached != g_facts.end() && cached->second.gasp_ppem == gasp_ppem &&
         cached->second.bitmap_ppem == bitmap_ppem) {
         return cached->second.facts;
     }
 
     const windows_path::FontFacts facts =
         font_facts::Describe(*FontBytesLocked(typeface), gasp_ppem, bitmap_ppem);
-    cache[typeface] = {.gasp_ppem = gasp_ppem, .bitmap_ppem = bitmap_ppem, .facts = facts};
+    g_facts[key] = {.gasp_ppem = gasp_ppem, .bitmap_ppem = bitmap_ppem, .facts = facts};
     return facts;
+}
+
+// ---------------------------------------------------------------------------
+// The side-table census. freetype.cpp has one for the Gecko path; this is the
+// same idea for the Chromium one, which shares none of those tables.
+//
+// It says whether what the patch keeps is bounded. Every table below is keyed
+// on a typeface or a font face, and the caches that are not capped are only
+// ever added to, so the numbers are expected to rise and then stop. One that
+// does not stop is the thing to look at.
+// ---------------------------------------------------------------------------
+
+void LogTableCensus(const char* when)
+{
+    size_t fonts = 0;
+    size_t var_coords = 0;
+    size_t fontations = 0;
+    size_t content = 0;
+    size_t content_kb = 0;
+    size_t facts = 0;
+    size_t held_kb = 0;
+    {
+        const std::lock_guard lock(g_font_mutex);
+        fonts = g_fonts.size();
+        var_coords = g_var_coords.size();
+        fontations = g_plain_fontations.size();
+        content = g_content_copies;
+        content_kb = g_content_bytes >> 10;
+        facts = g_facts.size();
+        // What the byte vectors hold, counted once per distinct vector. The
+        // map has one entry per typeface and several of them share a vector,
+        // so summing the map would count the same bytes many times over.
+        std::vector<const void*> seen;
+        seen.reserve(fonts);
+        for (const auto& [typeface, bytes] : g_fonts) {
+            const void* at = static_cast<const void*>(bytes.get());
+            if (std::find(seen.begin(), seen.end(), at) == seen.end()) {
+                seen.push_back(at);
+                held_kb += bytes->size() >> 10;
+            }
+        }
+    }
+    size_t bounds = 0;
+    size_t substitutes = 0;
+    bold_shaping::CensusCounts(&bounds, &substitutes);
+    size_t files = 0;
+    size_t families = 0;
+    size_t mapped = 0;
+    bold_fallback::CensusCounts(&files, &families, &mapped);
+
+    char line[512];
+    (void)std::snprintf(line, sizeof(line),
+                        "chromium table census %s: fonts=%zu var_coords=%zu "
+                        "fontations=%zu facts=%zu content=%zu content_kb=%zu "
+                        "held_kb=%zu dwrite_faces=%zu hb_bounds=%zu "
+                        "hb_substitutes=%zu bold_files=%zu bold_families=%zu "
+                        "bold_kb=%zu",
+                        when, fonts, var_coords, fontations, facts, content,
+                        content_kb, held_kb, dwrite_raster::CensusFaces(), bounds,
+                        substitutes, files, families, mapped >> 10);
+    CleartypeLogLine(line);
+}
+
+// A census every so often, for a renderer that lives as long as its tab.
+// Gated on a counter first so the clock is not read per glyph.
+std::atomic<unsigned> g_census_ticks{0};
+std::atomic<long> g_census_last{0};
+
+void MaybeLogTableCensus()
+{
+    if ((g_census_ticks.fetch_add(1, std::memory_order_relaxed) & 0xFF) != 0) {
+        return;
+    }
+    // CLEARTYPE_CENSUS_SECONDS sets the interval, as it does on the Gecko
+    // side; 10 by default.
+    static const long interval = [] {
+        const char* value = std::getenv("CLEARTYPE_CENSUS_SECONDS");
+        return value != nullptr ? std::strtol(value, nullptr, 10) : 10L;
+    }();
+    timespec now = {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const long previous = g_census_last.load(std::memory_order_relaxed);
+    if (previous != 0 && now.tv_sec - previous < interval) {
+        return;
+    }
+    g_census_last.store(now.tv_sec, std::memory_order_relaxed);
+    LogTableCensus("periodic");
 }
 
 }  // namespace
@@ -2527,7 +2664,7 @@ const std::vector<dwrite_raster::VariationCoord>* ChromiumVariationCoords(
     const void* typeface)
 {
     const std::lock_guard lock(g_font_mutex);
-    const auto found = g_var_coords.find(typeface);
+    const auto found = g_var_coords.find(TypefaceKey(typeface));
     if (found == g_var_coords.end() || found->second.empty()) {
         return nullptr;
     }
@@ -2537,7 +2674,7 @@ const std::vector<dwrite_raster::VariationCoord>* ChromiumVariationCoords(
 const std::vector<uint8_t>* ChromiumFontBytes(void* typeface)
 {
     const std::lock_guard lock(g_font_mutex);
-    const auto font = g_fonts.find(typeface);
+    const auto font = g_fonts.find(TypefaceKey(typeface));
     if (font == g_fonts.end() || font->second->empty()) {
         return nullptr;
     }
@@ -3443,6 +3580,9 @@ bool OnChromiumGenerateImage(void* context, const void* glyph, void* image_buffe
     const bool drawn =
         dwrite_raster::RenderGlyph(face_key, *use, flat, g, preblend, d, image_buffer,
                                    face_index, simulate_bold, simulate_oblique);
+    // Where a glyph is drawn is where the tables have just been consulted, so
+    // it is the cheapest place to notice they have grown.
+    MaybeLogTableCensus();
     static std::atomic<uint64_t> drawn_count{0};
     static std::atomic<uint64_t> declined_count{0};
     const uint64_t seen =

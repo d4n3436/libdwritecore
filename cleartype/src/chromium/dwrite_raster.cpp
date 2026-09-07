@@ -15,6 +15,7 @@
 #include "dwrite_3.h"
 #include "dwrite_core.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -291,6 +292,8 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
 // One font face per typeface, built from the bytes typeface_bridge rebuilt,
 // so DirectWrite never touches the filesystem. That is what makes this work in
 // a sandboxed renderer.
+std::atomic<size_t> g_census_faces{0};
+
 FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
                   const uint32_t face_index, const bool simulate_bold,
                   const bool simulate_oblique)
@@ -337,6 +340,8 @@ FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
     slot->face = face;
     FaceSlot* held = slot.get();
     faces.emplace(key, std::move(slot));
+    // Mirrored out, since the table itself is local to this function.
+    g_census_faces.store(faces.size(), std::memory_order_relaxed);
     return held;
 }
 
@@ -1266,5 +1271,10 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
     return true;
 }
 
+
+size_t CensusFaces()
+{
+    return g_census_faces.load(std::memory_order_relaxed);
+}
 
 }  // namespace dwrite_raster

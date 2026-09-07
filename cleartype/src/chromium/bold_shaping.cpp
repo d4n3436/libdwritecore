@@ -570,6 +570,19 @@ void InstallAtLoad()
     (void)code_patch::WriteDetour(at, reinterpret_cast<void*>(&hb_shape), &why);
 }
 
+void CensusCounts(size_t* bounds, size_t* substitutes)
+{
+    // Bounds is shared and Substitutes is thread_local, so this reports all of
+    // the first and the calling thread's share of the second.
+    if (bounds != nullptr) {
+        const std::lock_guard lock(g_bound_mutex);
+        *bounds = Bounds().size();
+    }
+    if (substitutes != nullptr) {
+        *substitutes = Substitutes().size();
+    }
+}
+
 }  // namespace bold_shaping
 
 // Records what Blink bound to the font, which is the only way back to the

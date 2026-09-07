@@ -132,6 +132,9 @@ bool RenderGlyph(const void* typeface, const std::vector<uint8_t>& font_bytes,
                  void* image_buffer, uint32_t face_index = 0, bool simulate_bold = false,
                  bool simulate_oblique = false);
 
+// Live entries in the face slot table, for the census.
+size_t CensusFaces();
+
 }  // namespace dwrite_raster
 
 #endif  // CHROMIUM_DWRITE_RASTER_H_INCLUDED

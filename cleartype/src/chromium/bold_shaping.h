@@ -44,6 +44,10 @@ namespace bold_shaping {
 // beside the rest of the load-time work.
 void InstallAtLoad();
 
+// Live entries in the shaping side tables, for the census. Substitutes is
+// thread_local, so this reports the calling thread's own.
+void CensusCounts(size_t* bounds, size_t* substitutes);
+
 }  // namespace bold_shaping
 
 // The interposed HarfBuzz entry points. Declared so each definition is checked
