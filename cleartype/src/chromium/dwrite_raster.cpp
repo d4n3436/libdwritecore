@@ -294,6 +294,30 @@ IDWriteFontFace* ApplyVariations(IDWriteFontFace* face, const void* typeface,
 // a sandboxed renderer.
 std::atomic<size_t> g_census_faces{0};
 
+// Given no owner the loader copies the font data, so every face slot holds a
+// second copy of its whole file and a collection pays that once per face. The
+// bytes come from the by-content cache in vtable_patch.cpp, whose vectors are
+// never freed, so an owner that outlives every face states what is already
+// true and the loader keeps a pointer to them.
+class ByteOwner final : public IUnknown
+{
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** object) override
+    {
+        *object = this;
+        return S_OK;
+    }
+    // One static instance for the process, so the count is never read.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+};
+
+IUnknown* SharedByteOwner()
+{
+    static ByteOwner owner;
+    return &owner;
+}
+
 FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
                   const uint32_t face_index, const bool simulate_bold,
                   const bool simulate_oblique)
@@ -322,7 +346,8 @@ FaceSlot* SlotFor(const void* typeface, const std::vector<uint8_t>& bytes,
     IDWriteFontFile* file = nullptr;
     if (!bytes.empty() &&
         SUCCEEDED(g_dw.loader->CreateInMemoryFontFileReference(
-            g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()), nullptr, &file)) &&
+            g_dw.factory5, bytes.data(), static_cast<UINT32>(bytes.size()),
+            SharedByteOwner(), &file)) &&
         file != nullptr) {
         const auto sims = static_cast<DWRITE_FONT_SIMULATIONS>(
             (simulate_bold ? DWRITE_FONT_SIMULATIONS_BOLD : 0) |
