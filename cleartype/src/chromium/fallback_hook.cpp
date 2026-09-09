@@ -65,7 +65,7 @@ void Say(const char* fmt, ...)
 // function.
 constexpr char kAnchor[] = "gfx::CachedFontSet::GetFallbackFontForChar";
 
-using FallbackFn = bool (*)(int, const void*, void*);
+using FallbackFn = bool (*)(uintptr_t, const void*, void*);
 FallbackFn g_original = nullptr;
 
 // libc++ lays std::string out one of two ways and the builds differ, so which
@@ -163,18 +163,34 @@ bool WriteShortString(void* at, const char* text, const Layout layout)
     return true;
 }
 
-bool Hook(const int marked, const void* locale, void* out)
+bool Hook(const uintptr_t marked, const void* locale, void* out)
 {
     if (g_original == nullptr) {
         return false;
     }
+    // The first argument is a character in the function this patches. A build
+    // whose fallback answer comes back some other way puts a pointer in that
+    // register, so the value is carried whole and a call that does not look
+    // like a character is handed on as it arrived. Taking it as an int would
+    // forward the low half of such a pointer, and the callee would then write
+    // its answer through the truncated address.
+    if (marked > (static_cast<uintptr_t>(bold_weight::kBoldMark) | 0x10FFFFu)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Say("the first argument is not a character, so this build states "
+                "its fallback some other way; every call is passed on as it "
+                "arrived");
+        }
+        return g_original(marked, locale, out);
+    }
     // The renderer marks the character when the run asking is bold, since the
     // weight does not survive the mojo call and the character is the only
     // thing that reaches here per query. See bold_weight.cpp.
-    const bool bold = (marked & bold_weight::kBoldMark) != 0;
-    const int c = marked & ~bold_weight::kBoldMark;
+    const bool bold = (marked & static_cast<uintptr_t>(bold_weight::kBoldMark)) != 0;
+    const int c = static_cast<int>(marked & ~static_cast<uintptr_t>(bold_weight::kBoldMark));
     if (!chromium_patch::ParityWanted()) {
-        return g_original(c, locale, out);
+        return g_original(static_cast<uintptr_t>(c), locale, out);
     }
     // No font claims the C1 controls, so the run keeps its own font and draws
     // its .notdef box. Declining here says that: font_cache_linux.cc's
@@ -227,7 +243,7 @@ bool Hook(const int marked, const void* locale, void* out)
             }
         }
         if (han_tag < 0) {
-            return g_original(c, locale, out);
+            return g_original(static_cast<uintptr_t>(c), locale, out);
         }
         char han_tagged[64];
         (void)std::snprintf(han_tagged, sizeof(han_tagged), "%s%02d%s",
@@ -235,9 +251,9 @@ bool Hook(const int marked, const void* locale, void* out)
                             bold ? static_fontconfig::kBoldTag : "");
         alignas(16) unsigned char han_held[kStringSize];
         if (!WriteShortString(han_held, han_tagged, g_layout)) {
-            return g_original(c, locale, out);
+            return g_original(static_cast<uintptr_t>(c), locale, out);
         }
-        return g_original(c, han_held, out);
+        return g_original(static_cast<uintptr_t>(c), han_held, out);
     }
     unsigned count = 0;
     const char* const* families =
@@ -256,7 +272,7 @@ bool Hook(const int marked, const void* locale, void* out)
     if (g_layout == Layout::kUnknown) {
         g_layout = LayoutOf(locale);
         if (g_layout == Layout::kUnknown) {
-            return g_original(c, locale, out);
+            return g_original(static_cast<uintptr_t>(c), locale, out);
         }
     }
     char tagged[64];
@@ -281,9 +297,9 @@ bool Hook(const int marked, const void* locale, void* out)
     }
     alignas(16) unsigned char held[kStringSize];
     if (!WriteShortString(held, tagged, g_layout)) {
-        return g_original(c, locale, out);
+        return g_original(static_cast<uintptr_t>(c), locale, out);
     }
-    return g_original(c, held, out);
+    return g_original(static_cast<uintptr_t>(c), held, out);
 }
 
 struct Image
