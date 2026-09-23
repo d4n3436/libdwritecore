@@ -58,6 +58,7 @@
 #include "family_match.h"
 #include "parity_gate.h"
 #include "static_fontconfig.h"
+#include "../parity_mode.h"
 
 namespace {
 
@@ -993,6 +994,8 @@ int open(const char* path, const int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
+    // libxul_patch.cpp notices libxul through the open of its file.
+    dwcft::NoteOpen(path, __builtin_return_address(0));
     if (IsConfigRead(path, flags)) {
         if (const int fd = ServeConfig(); fd >= 0) {
             return fd;
@@ -1012,6 +1015,7 @@ int open64(const char* path, const int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
+    dwcft::NoteOpen(path, __builtin_return_address(0));
     if (IsConfigRead(path, flags)) {
         if (const int fd = ServeConfig(); fd >= 0) {
             return fd;
@@ -1031,6 +1035,7 @@ int openat(const int dirfd, const char* path, const int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
+    dwcft::NoteOpen(path, __builtin_return_address(0));
     if (IsConfigRead(path, flags)) {
         if (const int fd = ServeConfig(); fd >= 0) {
             return fd;
@@ -1050,6 +1055,7 @@ int openat64(const int dirfd, const char* path, const int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
+    dwcft::NoteOpen(path, __builtin_return_address(0));
     if (IsConfigRead(path, flags)) {
         if (const int fd = ServeConfig(); fd >= 0) {
             return fd;

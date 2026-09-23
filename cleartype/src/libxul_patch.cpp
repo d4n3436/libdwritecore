@@ -113,6 +113,7 @@
 #include <pthread.h>
 #include <link.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -2227,7 +2228,7 @@ bool FunctionsCalling(const Image& image, const FunctionStarts& starts, void* co
 // Rewrite the displacement of every direct call to `from` so it lands on `to`.
 // The only write this file makes into executable memory.
 //
-// This runs whenever libxul arrives, which through the interposed dlopen is
+// This runs whenever libxul arrives, which through the open of its file is
 // after its initializers have run and may have started threads. Refusing then
 // would be the safer-looking choice and the wrong one: it would drop the
 // metrics correction on every Firefox that loads libxul the usual way, and
@@ -4177,16 +4178,21 @@ int LookForLibxul(dl_phdr_info* info, size_t, void* out)
     return 1;
 }
 
+// The scan alone, so a caller can decide what a miss means.
+bool ScanForLibxul(FoundLibxul* found)
+{
+    dl_iterate_phdr(LookForLibxul, found);
+    return found->found;
+}
+
 void ScanLoadedImages(const bool expected)
 {
     FoundLibxul found;
-    dl_iterate_phdr(LookForLibxul, &found);
-    if (!found.found) {
+    if (!ScanForLibxul(&found)) {
         if (expected) {
-            // The handle answered for XRE_GetBootstrap, so libxul is in this
-            // process under a name the link-map scan does not recognize. Said
-            // out loud, because the whole Firefox side is about to do nothing
-            // and the reason would otherwise be invisible.
+            // The open said the image is here, so its name is one this scan
+            // does not recognize; say so, because the Firefox side now does
+            // nothing.
             Report("libxul is loaded but not named libxul.so in the link map; "
                    "the Firefox patches will not be applied");
         }
@@ -4197,81 +4203,169 @@ void ScanLoadedImages(const bool expected)
     // Said before Apply, and whatever Apply then decides: that libxul is here
     // is what the rest of the shim keys its Firefox behavior on, and it is
     // still true if this particular patch refuses or is switched off.
+    fprintf(stderr, "[dbg] ScanLoadedImages found libxul, ra=%p\n",
+            __builtin_return_address(0));
     dwcft::NoteGeckoLoaded();
-    // Nothing here is gated per call - these patches replace Gecko's own
-    // metrics and fallback through its vtable, and once installed they apply
-    // to every line Gecko lays out. So the switches have to be honored before
-    // anything is installed: CLEARTYPE=0 means this library does nothing, and
-    // that has to include not moving anyone's baselines.
+    // Once installed these patches touch every line Gecko lays out, so the
+    // switches are honored before anything is written.
     if (dwcft::ParityActive()) {
         Apply(found.name, found.base, found.phdr, found.phnum);
     }
 }
 
+// libxul's arrival is noticed through the open of its file, not through
+// dlopen: an interposed dlopen makes the shim the caller, and glibc then
+// searches with the shim's empty DT_RUNPATH instead of the application's
+// ($ORIGIN). The application's own open of the file is the hook; it only
+// records, because the image is mapped only once the dlopen is done.
+std::atomic<bool> g_libxul_open{false};
+std::atomic<int> g_libxul_misses{0};
+// Probing stops after this many scans, about thirty seconds: a process that
+// loads libxul does it during startup.
+constexpr int kMaxProbes = 120;
+std::atomic<int> g_probes{0};
+std::atomic<long long> g_last_probe{0};
+uintptr_t g_libc_lo = 0;
+uintptr_t g_libc_hi = 0;
+
+// Monotonic milliseconds, the rate limit's clock.
+long long NowMs()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+// A scan for the not-yet-arrived image.
+void ProbeForLibxul()
+{
+    FoundLibxul found;
+    if (ScanForLibxul(&found)) {
+        dwcft::NoteGeckoLoaded();
+        if (dwcft::ParityActive()) {
+            Apply(found.name, found.base, found.phdr, found.phnum);
+        }
+    }
+}
+
+// The dynamic loader's own image, named for the file it was opened by.
+bool IsLibc(const char* name)
+{
+    if (name == nullptr || *name == '\0') {
+        return false;
+    }
+    const char* slash = std::strrchr(name, '/');
+    const char* base = slash != nullptr ? slash + 1 : name;
+    return std::strcmp(base, "libc.so.6") == 0;
+}
+
+struct LibcSpan
+{
+    uintptr_t lo = 0;
+    uintptr_t hi = 0;
+};
+
+int LookForLibc(dl_phdr_info* info, size_t, void* out)
+{
+    if (!IsLibc(info->dlpi_name)) {
+        return 0;
+    }
+    auto* span = static_cast<LibcSpan*>(out);
+    span->lo = info->dlpi_addr;
+    span->hi = info->dlpi_addr;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const uintptr_t end = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr +
+                              info->dlpi_phdr[i].p_memsz;
+        if (end > span->hi) {
+            span->hi = end;
+        }
+    }
+    return 1;
+}
+
+bool InLoader(const void* at)
+{
+    const uintptr_t where = reinterpret_cast<uintptr_t>(at);
+    return g_libc_lo != 0 && where >= g_libc_lo && where < g_libc_hi;
+}
+
+void NoteOpenImpl(const char* path, void* caller)
+{
+    if (g_done.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!g_libxul_open.load(std::memory_order_relaxed)) {
+        // The open of libxul itself. Record it; the image is in the link map
+        // only once the dlopen that mapped it is done.
+        if (IsLibxul(path)) {
+            g_libxul_open.store(true, std::memory_order_relaxed);
+            return;
+        }
+        // No open of the file was seen, so this is only a probe, rate-limited
+        // and capped, for a build that never opens libxul itself.
+        const long long now = NowMs();
+        long long last = g_last_probe.load(std::memory_order_relaxed);
+        if (g_probes.load(std::memory_order_relaxed) < kMaxProbes &&
+            now - last >= 250 &&
+            g_last_probe.compare_exchange_strong(last, now,
+                                                 std::memory_order_relaxed)) {
+            ++g_probes;
+            ProbeForLibxul();
+        }
+        return;
+    }
+    if (InLoader(caller)) {
+        return;
+    }
+    // The recorded open, answered from outside the loader. A miss re-arms a
+    // few times, in case the dlopen is mid-flight on another thread.
+    g_libxul_open.store(false, std::memory_order_relaxed);
+    FoundLibxul found;
+    if (ScanForLibxul(&found)) {
+        dwcft::NoteGeckoLoaded();
+        if (dwcft::ParityActive()) {
+            Apply(found.name, found.base, found.phdr, found.phnum);
+        }
+        return;
+    }
+    if (g_libxul_misses.fetch_add(1, std::memory_order_relaxed) + 1 < 3) {
+        g_libxul_open.store(true, std::memory_order_relaxed);
+        return;
+    }
+    Report("libxul was opened but is not named libxul.so in the link map; "
+           "the Firefox patches will not be applied");
+}
+
 __attribute__((constructor)) void AtLoad()
 {
-    // Only for the case where libxul is already mapped. The firefox binary has
-    // no DT_NEEDED on it and dlopens it after this runs, which the interposed
-    // dlopen below catches. Nothing is expected here, so a miss says nothing.
+    // Where libc lives. NoteOpen refuses to scan when its caller is in the
+    // loader, which holds the lock dl_iterate_phdr needs.
+    LibcSpan span;
+    dl_iterate_phdr(LookForLibc, &span);
+    if (span.lo == 0) {
+        // Without a span every caller is believed to be in the loader, and
+        // the scan is refused.
+        Report("libxul: libc has no span in the link map, so the open that "
+               "brings in libxul will not lead to a scan");
+    } else {
+        g_libc_lo = span.lo;
+        g_libc_hi = span.hi;
+    }
+    // Catches libxul already mapped; a miss says nothing.
     ScanLoadedImages(/*expected=*/false);
 }
 
 }  // namespace
 
-// Whether a dlopen just brought in libxul, asked of the object rather than of
-// the string the caller passed. libxul exports two dynamic symbols and
-// XRE_GetBootstrap is one of them, so a handle that answers for it is libxul
-// whatever the file was called - and a handle that does not is not, since
-// dlsym on a handle searches that object and its dependencies rather than the
-// global scope. dlopen(NULL) is the one handle that does see the global scope,
-// and there the answer is still right: libxul really is loaded.
-//
-// Safe to call from the interposer below, which runs after the real dlopen has
-// returned and released the loader's locks. LookForLibxul, which runs inside
-// dl_iterate_phdr with one of them held, cannot do this; see IsLibxul.
-namespace
+namespace dwcft
 {
 
-bool HandleIsLibxul(void* handle)
+// Told by the open and FreeType interposers on every open and face.
+void NoteOpen(const char* path, void* caller)
 {
-    if (handle == nullptr) {
-        return false;
-    }
-    const bool is_libxul = dlsym(handle, "XRE_GetBootstrap") != nullptr;
-    // A miss leaves an error behind that the caller would read back as its own
-    // dlopen's.
-    (void)dlerror();
-    return is_libxul;
+    NoteOpenImpl(path, caller);
 }
 
-}  // namespace
-
-// dlopen is interposed for one reason: to be told when libxul arrives. The
-// real call is made first and its result handed back untouched, so a process
-// that never loads libxul cannot tell this is here.
-extern "C" __attribute__((visibility("default")))
-void* dlopen(const char* file, const int mode)
-{
-    // Never remembered as null. dlsym can be asked before the loader is in a
-    // state to answer, and a cached null here would make every dlopen in the
-    // process return null for the rest of its life.
-    static std::atomic<void* (*)(const char*, int)> resolved{nullptr};
-    auto real = resolved.load(std::memory_order_acquire);
-    if (real == nullptr) {
-        real = reinterpret_cast<void* (*)(const char*, int)>(dlsym(RTLD_NEXT, "dlopen"));
-        if (real == nullptr) {
-            return nullptr;
-        }
-        resolved.store(real, std::memory_order_release);
-    }
-    void* handle = real(file, mode);
-    if (handle != nullptr && !g_done.load() && HandleIsLibxul(handle)) {
-        ScanLoadedImages(/*expected=*/true);
-        // It resolves symbols on the way, and a failed dlsym leaves an error
-        // the caller would read back as its own dlopen's.
-        (void)dlerror();
-    }
-    return handle;
-}
+}  // namespace dwcft
 
 #endif  // CLEARTYPE_FIREFOX_PARITY

@@ -7309,6 +7309,8 @@ extern "C" {
 
 FT_Error FT_New_Face(FT_Library library, const char* path, const FT_Long face_index, FT_Face* aface)
 {
+    // A face is opened from application context; libxul_patch.cpp keys off it.
+    dwcft::NoteOpen(nullptr, __builtin_return_address(0));
     ft_new_face_fn real = real_FT_New_Face();
     if (real == nullptr) {
         return FT_Err_Invalid_Library_Handle;
@@ -7323,6 +7325,7 @@ FT_Error FT_New_Face(FT_Library library, const char* path, const FT_Long face_in
 FT_Error FT_New_Memory_Face(FT_Library library, const FT_Byte* base, const FT_Long size,
                             const FT_Long face_index, FT_Face* aface)
 {
+    dwcft::NoteOpen(nullptr, __builtin_return_address(0));
     ft_new_memory_face_fn real = real_FT_New_Memory_Face();
     if (real == nullptr) {
         return FT_Err_Invalid_Library_Handle;
@@ -7343,6 +7346,7 @@ FT_Error FT_New_Memory_Face(FT_Library library, const FT_Byte* base, const FT_Lo
 FT_Error FT_Open_Face(FT_Library library, const FT_Open_Args* args, const FT_Long face_index,
                       FT_Face* aface)
 {
+    dwcft::NoteOpen(nullptr, __builtin_return_address(0));
     ft_open_face_fn real = real_FT_Open_Face();
     if (real == nullptr) {
         return FT_Err_Invalid_Library_Handle;

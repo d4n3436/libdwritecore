@@ -46,6 +46,10 @@ bool ParityActive();
 // answer and the one that catches a layout this cannot recognize.
 void NoteGeckoLoaded();
 
+// Told by the open and FreeType interposers; the open of libxul's own
+// file is how its arrival is caught. See libxul_patch.cpp.
+void NoteOpen(const char* path, void* caller);
+
 // The Gecko process that owns the window, and not one of the twenty-odd
 // content, GPU and utility children it starts. Anything that reaches into
 // process-wide state the parent alone owns has to ask this first; a child
@@ -56,6 +60,7 @@ bool GeckoParentProcess();
 
 inline bool ParityActive() { return false; }
 inline void NoteGeckoLoaded() {}
+inline void NoteOpen(const char*, void*) {}
 inline bool GeckoParentProcess() { return false; }
 
 #endif

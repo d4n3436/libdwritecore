@@ -40,14 +40,11 @@
     FT_Request_Size;
     FT_MulFix;
 
-    /* Not FreeType: the hook that notices libxul being loaded. */
-    dlopen;
-
-    /* Not FreeType: how a thread's name is learned, since asking for it with
+    /* How a thread's name is learned, since asking for it with
        prctl(PR_GET_NAME) is a seccomp violation in a content process. */
     pthread_setname_np;
 
-    /* Not FreeType: the rendering settings Windows has no fontconfig for. */
+    /* The rendering settings Windows has no fontconfig for. */
     FcPatternGetInteger;
     FcPatternGetBool;
     FcFontSort;
@@ -55,15 +52,15 @@
     FcConfigSubstitute;
     FcPatternGet;
 
-    /* Not FreeType: the font list itself, so a page cannot name a family a
+    /* The font list itself, so a page cannot name a family a
        stock Windows does not have. */
     FcConfigGetFonts;
 
-    /* Not FreeType: which font covers a character, answered per character so
+    /* Which font covers a character, answered per character so
        Chromium's fallback reaches the family Windows' table names. */
     FcCharSetHasChar;
 
-    /* Not FreeType: a bold fallback run is shaped with the regular face's
+    /* A bold fallback run is shaped with the regular face's
        GPOS unless it is caught here. Exported for a build that links HarfBuzz
        as a shared library; one that compiles it in is patched instead. See
        src/chromium/bold_shaping.cpp. */
@@ -71,14 +68,14 @@
     hb_font_set_funcs;
     hb_font_destroy;
 
-    /* Not FreeType: the per-script generic families are compiled into
+    /* The per-script generic families are compiled into
        Chromium's resource bundle, so the bundle is edited as it is mapped.
        Anything that is not a read-only shared mapping of a .pak passes
        straight through. See src/chromium/generic_families.cpp. */
     mmap;
     mmap64;
 
-    /* Not FreeType: a build that compiled fontconfig in has no symbol to
+    /* A build that compiled fontconfig in has no symbol to
        interpose, so the fallback order is imposed through the configuration
        that fontconfig reads. Every path but its own config file passes
        straight through. See src/chromium/static_fontconfig.cpp. */
@@ -87,7 +84,7 @@
     openat;
     openat64;
 
-    /* Not FreeType: CEF installs no ui::LinuxUi, so its default font stays at
+    /* CEF installs no ui::LinuxUi, so its default font stays at
        the "serif" generic and system-ui answers Times New Roman where Windows
        answers Segoe UI. Chromium reads --system-font-family for this, and the
        browser process is given it here, before it parses argv. Only a host
