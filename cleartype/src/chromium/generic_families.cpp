@@ -668,33 +668,54 @@ bool FollowedByCompare(const unsigned char* at)
 bool PointLoopAt(const unsigned char* first, const unsigned char* end,
                  const unsigned char* table, const unsigned rows)
 {
-    unsigned char* begin_lea = nullptr;
-    unsigned char* end_lea = nullptr;
+    // Arrays sit end to end, so the first row's address also ends the array
+    // before it, and the end's address starts the next. A first-row lea
+    // followed by a compare bounds that earlier array and is skipped.
+    unsigned char* near_begin = nullptr;
+    unsigned char* near_end = nullptr;
+    unsigned char* held = nullptr;
+    unsigned char* tested = nullptr;
+    unsigned holders = 0;
+    unsigned testers = 0;
     for (unsigned i = 0; i < g_text_count; ++i) {
         unsigned char* seen = nullptr;
         for (auto* at = const_cast<unsigned char*>(g_text[i].begin);
              at + kLeaLength <= g_text[i].end; ++at) {
             const unsigned char* target = LeaTarget(at);
             if (target == first) {
-                seen = at;
-                continue;
-            }
-            if (target != end || seen == nullptr || at - seen > kLoopSpan) {
+                if (!FollowedByCompare(at + kLeaLength)) {
+                    seen = at;
+                    held = at;
+                    ++holders;
+                }
                 continue;
             }
             // The end lea is compared against the cursor immediately after
             // it. Without this test a lea of the table's first row anywhere in
             // the image pairs with an unrelated lea of its end and the write
             // lands in code that has nothing to do with the loop.
-            if (!FollowedByCompare(at + kLeaLength)) {
+            if (target != end || !FollowedByCompare(at + kLeaLength)) {
                 continue;
             }
-            if (end_lea != nullptr) {
+            tested = at;
+            ++testers;
+            if (seen == nullptr || at - seen > kLoopSpan) {
+                continue;
+            }
+            if (near_end != nullptr) {
                 return false;
             }
-            begin_lea = seen;
-            end_lea = at;
+            near_begin = seen;
+            near_end = at;
         }
+    }
+    // Some builds set the cursor up far from the loop test, so with none in
+    // range the single setup and single test in the image are the loop.
+    unsigned char* begin_lea = near_begin;
+    unsigned char* end_lea = near_end;
+    if (end_lea == nullptr && testers == 1 && holders == 1) {
+        begin_lea = held;
+        end_lea = tested;
     }
     if (end_lea == nullptr ||
         !WriteLeaTarget(begin_lea, table) ||
