@@ -84,28 +84,24 @@ T ReadAt(const void* base, const size_t offset)
 }
 
 // Whether the bytes at `font` look like an SkFont over a typeface the scaler
-// hooks have already read. Every test is either a table lookup or a field
-// whose range is known, so a wrong offset, or a font Blink did not bind, fails
-// it without anything being dereferenced. That matters: the user_data on a
-// browser-process font is not a HarfBuzzFontData at all, and the pointer this
-// reads out of it is not a typeface.
+// hooks have already read. The user_data on a browser-process font is not a
+// HarfBuzzFontData at all, so the pointer read out of it may not be a typeface.
+// The range tests run first, and ChromiumFontBytes survives what is left.
 bool LooksLikeSkFont(const void* font)
 {
-    auto* typeface = ReadAt<void*>(font, kFontTypeface);
-    if (typeface == nullptr || (reinterpret_cast<uintptr_t>(typeface) & 7) != 0 ||
-        ChromiumFontBytes(typeface) == nullptr) {
+    const float size = ReadAt<float>(font, kFontSize);
+    // Only six PrivFlags are defined, and SkFontHinting and SkFont::Edging
+    // have four and three values.
+    if (!std::isfinite(size) || size <= 0 || size > 4096 ||
+        ReadAt<uint8_t>(font, kFontFlags) > 0x3F ||
+        ReadAt<uint8_t>(font, kFontEdging) > 2 ||
+        ReadAt<uint8_t>(font, kFontHinting) > 3) {
         return false;
     }
 
-    const float size = ReadAt<float>(font, kFontSize);
-    if (!std::isfinite(size) || size <= 0 || size > 4096) {
-        return false;
-    }
-    // Only six PrivFlags are defined, and SkFontHinting and SkFont::Edging
-    // have four and three values.
-    return ReadAt<uint8_t>(font, kFontFlags) <= 0x3F &&
-           ReadAt<uint8_t>(font, kFontEdging) <= 2 &&
-           ReadAt<uint8_t>(font, kFontHinting) <= 3;
+    auto* typeface = ReadAt<void*>(font, kFontTypeface);
+    return typeface != nullptr && (reinterpret_cast<uintptr_t>(typeface) & 7) == 0 &&
+           ChromiumFontBytes(typeface) != nullptr;
 }
 
 // Where font_ sits inside a HarfBuzzFontData. Decided once, on the first

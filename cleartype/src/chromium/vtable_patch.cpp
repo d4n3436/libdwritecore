@@ -2673,8 +2673,22 @@ const std::vector<dwrite_raster::VariationCoord>* ChromiumVariationCoords(
 
 const std::vector<uint8_t>* ChromiumFontBytes(void* typeface)
 {
+    // A general protection fault carries no fault address, so the guard
+    // cannot catch a non-canonical pointer.
+    constexpr int kUserAddressBits = 47;
+    const auto at = reinterpret_cast<uintptr_t>(typeface);
+    uintptr_t word = 0;
+    if (at == 0 || (at >> kUserAddressBits) != 0 ||
+        !ReadWordGuarded(static_cast<const unsigned char*>(typeface) + kTypefaceUniqueID,
+                         &word)) {
+        return nullptr;
+    }
+    const auto key = static_cast<uint32_t>(word);
+    if (key == 0) {
+        return nullptr;
+    }
     const std::lock_guard lock(g_font_mutex);
-    const auto font = g_fonts.find(TypefaceKey(typeface));
+    const auto font = g_fonts.find(key);
     if (font == g_fonts.end() || font->second->empty()) {
         return nullptr;
     }
