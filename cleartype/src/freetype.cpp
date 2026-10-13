@@ -282,6 +282,10 @@ using ft_request_size_fn = FT_Error (*)(FT_Face, FT_Size_Request);
 using ft_get_sfnt_table_fn = void* (*)(FT_Face, FT_Sfnt_Tag);
 using ft_load_sfnt_table_fn = FT_Error (*)(FT_Face, FT_ULong, FT_Long, FT_Byte*, FT_ULong*);
 using ft_mulfix_fn = FT_Long (*)(FT_Long, FT_Long);
+using ft_get_mm_var_fn = FT_Error (*)(FT_Face, FT_MM_Var**);
+using ft_done_mm_var_fn = void (*)(FT_Library, FT_MM_Var*);
+using ft_get_var_design_coords_fn = FT_Error (*)(FT_Face, FT_UInt, FT_Fixed*);
+using ft_get_postscript_name_fn = const char* (*)(FT_Face);
 
 // ---------------------------------------------------------------------------
 // Which FreeType entry points are interposed, and why
@@ -380,6 +384,10 @@ DEFINE_REAL(ft_set_pixel_sizes_fn, FT_Set_Pixel_Sizes)
 DEFINE_REAL(ft_request_size_fn, FT_Request_Size)
 DEFINE_REAL(ft_get_sfnt_table_fn, FT_Get_Sfnt_Table)
 DEFINE_REAL(ft_mulfix_fn, FT_MulFix)
+DEFINE_REAL(ft_get_mm_var_fn, FT_Get_MM_Var)
+DEFINE_REAL(ft_done_mm_var_fn, FT_Done_MM_Var)
+DEFINE_REAL(ft_get_var_design_coords_fn, FT_Get_Var_Design_Coordinates)
+DEFINE_REAL(ft_get_postscript_name_fn, FT_Get_Postscript_Name)
 // Not interposed - only read, to answer the embedded-bitmap question below.
 #if CLEARTYPE_FIREFOX_PARITY
 DEFINE_REAL(ft_load_sfnt_table_fn, FT_Load_Sfnt_Table)
@@ -2881,11 +2889,15 @@ std::vector<DWRITE_FONT_AXIS_VALUE> GetAxisValues(FT_Face face)
     }
 
     FT_MM_Var* mm = nullptr;
-    if (FT_Get_MM_Var(face, &mm) != 0 || mm == nullptr) {
+    ft_get_mm_var_fn get_mm = real_FT_Get_MM_Var();
+    if (get_mm == nullptr || get_mm(face, &mm) != 0 || mm == nullptr) {
         return axes;
     }
     std::vector<FT_Fixed> coords(mm->num_axis);
-    if (FT_Get_Var_Design_Coordinates(face, mm->num_axis, coords.data()) == 0) {
+    ft_get_var_design_coords_fn get_coords =
+        real_FT_Get_Var_Design_Coordinates();
+    if (get_coords != nullptr &&
+        get_coords(face, mm->num_axis, coords.data()) == 0) {
         for (FT_UInt i = 0; i < mm->num_axis; ++i) {
             DWRITE_FONT_AXIS_VALUE value;
             value.axisTag = static_cast<DWRITE_FONT_AXIS_TAG>(__builtin_bswap32(static_cast<uint32_t>(mm->axis[i].tag)));
@@ -2893,7 +2905,10 @@ std::vector<DWRITE_FONT_AXIS_VALUE> GetAxisValues(FT_Face face)
             axes.push_back(value);
         }
     }
-    FT_Done_MM_Var(face->glyph->library, mm);
+    ft_done_mm_var_fn done_mm = real_FT_Done_MM_Var();
+    if (done_mm != nullptr) {
+        done_mm(face->glyph->library, mm);
+    }
     return axes;
 }
 
@@ -4862,7 +4877,8 @@ IDWriteFontCollection* SystemCollectionIfWarm()
 // NORMAL, NORMAL) as the style match. Called with g_faces_mutex held.
 bool WindowsArialBlackMetricsLocked(const FaceEntry* entry, DWRITE_FONT_METRICS* out)
 {
-    const char* ps_name = FT_Get_Postscript_Name(entry->face);
+    ft_get_postscript_name_fn get_ps = real_FT_Get_Postscript_Name();
+    const char* ps_name = get_ps ? get_ps(entry->face) : nullptr;
     if (ps_name == nullptr || std::strcmp(ps_name, "Arial Black") != 0 ||
         entry->memory != nullptr) {
         return false;

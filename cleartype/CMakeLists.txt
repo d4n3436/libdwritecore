@@ -62,13 +62,15 @@ target_compile_definitions(cleartype
   PRIVATE DWRITE_CORE=1)
 
 target_link_libraries(cleartype
-  PRIVATE dwritecore ${DWRITECORE_FREETYPE} Threads::Threads ${CMAKE_DL_LIBS})
+  PRIVATE dwritecore Threads::Threads ${CMAKE_DL_LIBS})
 
 target_include_directories(cleartype
   PRIVATE "${CMAKE_BINARY_DIR}/generated"
   # src/chromium reaches windows_fonts.h and parity_mode.h beside it.
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
-  PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  PRIVATE "${CMAKE_SOURCE_DIR}/include"
+  # FreeType headers only; the library itself is opened at run time.
+  SYSTEM "$<TARGET_PROPERTY:${DWRITECORE_FREETYPE},INTERFACE_INCLUDE_DIRECTORIES>")
 add_dependencies(cleartype dwritecore_version)
 
 set_target_properties(cleartype PROPERTIES
