@@ -4291,7 +4291,7 @@ bool InLoader(const void* at)
 
 void NoteOpenImpl(const char* path, void* caller)
 {
-    if (g_done.load(std::memory_order_acquire)) {
+    if (!dwcft::Enabled() || g_done.load(std::memory_order_acquire)) {
         return;
     }
     if (!g_libxul_open.load(std::memory_order_relaxed)) {
